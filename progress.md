@@ -241,14 +241,11 @@
     `/config set` 可撤销/热更新）；高风险工具 forever 按钮带 ⚠️。
   - #28：6 个 `@deepseek-ai/dsh-*` devDep 精确 pin 与 peer 范围全部升至
     `0.1.0-rc.7`；本机 rc.7 下 typecheck + 全量测试通过。
-  - #29：上游 dsh-telegram-channel fork 修正 `dsh-session`/`dsh-llm`
-    peer `^0.1.0-rc.7`，PR https://github.com/hi-wenw/dsh-telegram-channel/pull/6 。
+  - #29：外部仓库 dsh-telegram-channel，按所有者决定直接关闭，不再跟踪。
   - #30：fenced code / GFM 表格全部 `<pre><code>`，语言 class 白名单。
 - 回归测试新增 8 例（markdown 3 / interactive 4 / config 1）。
 - `npm run check`：**356/356 pass**；`npm pack --dry-run`：149 files。
 - 已提交 `f1559da` 并推送 main；#27/#28/#30 已关闭。
-- #29：上游 PR https://github.com/hi-wenw/dsh-telegram-channel/pull/6 已提交且 mergeable，待上游合并后关闭 issue。
-- Round 31 追加：PR lockfile 已按 registry.npmjs.org 重新生成（去掉本地 npmmirror 残留），
-  干净克隆下 `npm ci` + `npm run typecheck` 均通过；已评论 @hi-wenw 请求 review。
-- Round 31 再追加：用户确认继续等上游合并；已启动后台 watcher（每 5 分钟检查 PR，
-  merged 后自动评论并关闭 #29，最长 24h）。
+- #29：用户明确表示「别人的仓库不要管」，已直接关闭 issue；验证性 fork PR
+  https://github.com/hi-wenw/dsh-telegram-channel/pull/6 已撤回，后台 watcher 已取消。
+- GitHub open issues：**0**（#27-#30 全部关闭）。

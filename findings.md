@@ -302,5 +302,6 @@
     approval settings namespace，硬写会依赖不存在的 namespace。
   - `persistToolAllow` 同步写入 config 并 `applyConfigLive`，失败只记日志、
     授权仍在本插件挂载期内存生效。
-- #29 属外部仓库 `hi-wenw/dsh-telegram-channel`（fork 6 个、本账号无 push
-  权限），走 fork PR 修复；上游 merge 前 issue 保持 open 并在 #29 下附 PR。
+- #29 属外部仓库 `hi-wenw/dsh-telegram-channel`（本账号无 push 权限）；
+  按仓库所有者决定视为 out-of-scope 直接关闭 issue，验证性 fork PR 已撤回，
+  不对上游仓库做任何改动或打扰。

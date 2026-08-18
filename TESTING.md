@@ -1545,12 +1545,12 @@ Telegram 却只显示项目基名/id。根因：真实 `SessionPersistence.readR
   forever 持久化+重载、无 goal 拒绝 goal 档）；`test/config.test.mjs` 新增
   校验/去重/overlay 1 例。
 
-### #29 dsh-telegram-channel peer 范围（上游 PR）
+### #29 dsh-telegram-channel peer 范围（已按仓库所有者决定关闭）
 
-- `dsh-telegram-channel` 不属于本仓库，已在 fork
-  `xqicxx/dsh-telegram-channel` 修改 `dsh-session`/`dsh-llm` peer+dev 为
-  `^0.1.0-rc.7`，typecheck 通过，并提交上游
-  https://github.com/hi-wenw/dsh-telegram-channel/pull/6 。
+- `dsh-telegram-channel` 是独立外部仓库，不属于本仓库维护范围。
+- 曾 fork 验证 `dsh-session`/`dsh-llm` peer `^0.1.0-rc.7` 的修改（typecheck
+  通过），但按仓库所有者决定撤回了外部 PR
+  https://github.com/hi-wenw/dsh-telegram-channel/pull/6 ，并关闭 #29。
 
 ### 测试记录
 

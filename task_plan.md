@@ -208,7 +208,7 @@
 
 ### 目标
 修复 GitHub open issues：#27 审批卡 session/forever 档位、#28 dsh 0.1.0-rc.7
-依赖同步、#29 dsh-telegram-channel peer 范围（上游 PR）、#30 代码块
+依赖同步、#29 dsh-telegram-channel peer 范围（外部仓库，所有者决定关闭）、#30 代码块
 `<pre><code>` 渲染。
 
 ### 步骤
@@ -219,13 +219,12 @@
 3. [x] #27 interactive：session / forever(by tool) 按钮 + 回调解析；
    `interactive.allowByTool` 配置持久化与热更新；高风险工具 ⚠️；
    回归测试 interactive 4 例 + config 1 例。
-4. [x] #29 上游 fork `xqicxx/dsh-telegram-channel` 改 session/llm peer →
-   `^0.1.0-rc.7`，typecheck 通过，PR 提交
-   https://github.com/hi-wenw/dsh-telegram-channel/pull/6 。
+4. [x] #29 按仓库所有者决定关闭（外部仓库不在本仓库范围）；此前验证性
+   fork PR https://github.com/hi-wenw/dsh-telegram-channel/pull/6 已撤回。
 5. [x] 文档同步（CHANGELOG/README/README.zh/TESTING §69）。
 6. [x] `npm run check` 全绿：**356/356 pass**；`npm pack --dry-run` 149 files。
-7. [x] commit/push（`f1559da`）+ 关闭 #27/#28/#30；#29 已提交上游 PR
-   https://github.com/hi-wenw/dsh-telegram-channel/pull/6（mergeable，待上游合并后关 issue）。
+7. [x] commit/push（`f1559da`）+ 关闭 #27/#28/#30；#29 按所有者决定直接
+   关闭，外部 PR 已撤回，不再打扰上游仓库。
 
 ### 约束
 - goal 档语义不回退（仍允许整个 goal）；session 档按「同 session 同工具」；

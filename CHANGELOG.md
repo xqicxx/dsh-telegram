@@ -9,7 +9,7 @@ Issues #7-#13, #14, #15, #16-#21, #22-#26, #27-#30.
 
 - **#27 approval scopes**: approval cards now offer `🟣 Allow for this session` (same tool in the same dsh session) and `🟤 Allow forever (by tool)`, in addition to goal/once/reject. Session grants live in memory for the plugin mount; forever grants persist into `interactive.allowByTool` under `.pi/telegram.json` and survive restarts. High-risk tools (bash/write/delete/…) get a `⚠️` warning on the forever button. Revoke with `/config set interactive.allowByTool []`.
 - **#28 dsh 0.1.0-rc.7 sync**: all `@deepseek-ai/dsh-*` dev dependencies are pinned to `0.1.0-rc.7` and peer ranges start at `^0.1.0-rc.7`, so local builds type-check against the same dsh generation production profiles load.
-- **#29 channel peer ranges**: upstream `dsh-telegram-channel` PR https://github.com/hi-wenw/dsh-telegram-channel/pull/6 bumps `dsh-session`/`dsh-llm` peers from the stale `^0.0.1-rc.1` to `^0.1.0-rc.7`, removing the UNMET PEER DEPENDENCY on dsh 0.1.0-rc.x profiles.
+- **#29 external channel package**: closed as out of scope by the repo owner's decision — the peer-range declaration belongs to the separate `dsh-telegram-channel` repository, and the exploratory fork PR was withdrawn so the upstream repo is left untouched.
 - **#30 real code blocks**: fenced code and GFM table blocks now render as `<pre><code>…</code></pre>` (Telegram requires the inner `<code>` to guarantee the monospace font), and fenced languages become `class="language-*"` after sanitization, matching pi-telegram.
 
 - **#16 bar card Back semantics**: card origins are tracked (`bar` vs `menu`); Back on a bar-opened card now closes it and returns to chat, while menu-opened cards still return to the last menu page.
