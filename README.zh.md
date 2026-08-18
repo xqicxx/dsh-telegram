@@ -136,8 +136,9 @@ export TELEGRAM_BOT_TOKEN='123456:ABC...'
 | `model.provider` / `model.model` | — | Telegram 侧默认模型，`/new` 与 `✨ New` 继承 |
 | `reasoning.effort` | `medium` | `minimal` / `low` / `medium` / `high` / `max` 指令前缀 |
 | `interactive.userQuestions` | `telegram` | `ask_user_question` 归属：`telegram` / `web` / `auto`。`telegram` 在 web profile 下即使 API proxy 已占用 provider seam 也能继续应答；`web` 让给浏览器 UI；`auto` 保留旧的 loader-entry 推断 |
+| `interactive.allowByTool` | `[]` | 用户点按审批卡 `Allow forever (by tool)` 后永久自动放行的工具名（如 `["bash", "web_search"]`）；设为 `[]` 全部撤销 |
 
-热更新：Telegram 侧 `/config get|set <path> [json]` 或 dsh 侧 `/telegram config get|set <path> <json>` 可实时应用并持久化任意配置叶（如 `outbound.sendRatePerSecond`）。`interactive.userQuestions` 在插件挂载时读取，下次重启生效。
+热更新：Telegram 侧 `/config get|set <path> [json]` 或 dsh 侧 `/telegram config get|set <path> <json>` 可实时应用并持久化任意配置叶（如 `outbound.sendRatePerSecond`）。`interactive.userQuestions` 在插件挂载时读取，下次重启生效；`interactive.allowByTool` 即时热生效。
 
 ## 架构
 

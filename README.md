@@ -137,8 +137,9 @@ Send a message. The bot binds the chat to its own dsh session, streams the turn 
 | `model.provider` / `model.model` | — | Telegram-owned default model, inherited by `/new` and `✨ New` |
 | `reasoning.effort` | `medium` | `minimal` / `low` / `medium` / `high` / `max` directive prefix |
 | `interactive.userQuestions` | `telegram` | `ask_user_question` ownership: `telegram` / `web` / `auto`. `telegram` keeps working in the web profile even when the API proxy owns the user-questions provider seam; `web` yields to the browser UI; `auto` keeps the legacy loader-entry inference |
+| `interactive.allowByTool` | `[]` | Tool names permanently auto-allowed after the user taps `Allow forever (by tool)` on an approval card (e.g. `["bash", "web_search"]`); set to `[]` to revoke all |
 
-Live updates: Telegram-side `/config get|set <path> [json]` or dsh-side `/telegram config get|set <path> <json>` hot-apply and persist any leaf (e.g. `outbound.sendRatePerSecond`). `interactive.userQuestions` is read at plugin mount and applies on the next restart.
+Live updates: Telegram-side `/config get|set <path> [json]` or dsh-side `/telegram config get|set <path> <json>` hot-apply and persist any leaf (e.g. `outbound.sendRatePerSecond`). `interactive.userQuestions` is read at plugin mount and applies on the next restart; `interactive.allowByTool` hot-applies immediately.
 
 ## Architecture
 

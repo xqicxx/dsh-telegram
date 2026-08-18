@@ -321,7 +321,8 @@ function applyConfigLive(changed: readonly ConfigSection[]): void {
     }
   }
   if (changed.includes("interactive")) {
-    log("interactive config changed \u2014 question-provider ownership applies on the next plugin restart");
+    state.interactive?.setAllowedTools(state.config.interactive?.allowByTool ?? []);
+    log("interactive config changed \u2014 forever-allow tools applied live; question-provider ownership applies on the next plugin restart");
   }
   refreshAllPanels();
 }
@@ -2214,7 +2215,11 @@ async function dispatchCallback(chatId: number, data: string): Promise<void> {
   if (data.startsWith("ap:")) {
     const parts = data.split(":");
     const answer = parts[2];
-    const outcome = answer === "y" ? "allowed-once" : answer === "g" ? "allowed-goal" : "rejected";
+    const outcome =
+      answer === "y" ? "allowed-once" :
+      answer === "g" ? "allowed-goal" :
+      answer === "s" ? "allowed-session" :
+      answer === "a" ? "allowed-always" : "rejected";
     const accepted = state.interactive?.answerApproval(Number(parts[1]), outcome);
     if (!accepted) await uiSend(chatId, "\u274C That approval is already settled.", { parse_mode: "HTML" });
     return;
@@ -2897,7 +2902,7 @@ async function dispatchCommand(chatId: number, command: string, args: string, me
     case "config": {
       const [op, path, ...rest] = args.trim().split(/\s+/);
       if (!op || !path) {
-        await send("/config get <path> \u00B7 /config set <path> <json> \u2014 hot-applies + persists under .pi/telegram.json");
+        await send("/config get <path> \u00B7 /config set <path> <json> \u2014 hot-applies + persists under .pi/telegram.json\nForever-allow a tool: /config set interactive.allowByTool [\"bash\"] \u00B7 revoke: []");
         return;
       }
       try {
@@ -3806,6 +3811,15 @@ export function apply(ctx: Context, loaderConfig?: unknown): void {
       {
         userQuestions: state.config.interactive?.userQuestions ?? "telegram",
         log,
+        allowedTools: state.config.interactive?.allowByTool,
+        persistToolAllow: (toolName) => {
+          const next = [...new Set([...(state.config.interactive?.allowByTool ?? []), toolName])];
+          const { config, changed } = overlayConfig(state.config, { interactive: { allowByTool: next } });
+          state.config = config;
+          writeConfig(state.configRoot, state.config);
+          applyConfigLive(changed);
+          return true;
+        },
         goalIdForSession: (sessionId) => {
           const agent = requireCtx().agents?.get(sessionId as never);
           if (!agent) return undefined;

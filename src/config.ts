@@ -97,6 +97,10 @@ export interface TelegramConfig {
      *   proxy loader entry is mounted (the legacy inference).
      */
     userQuestions?: QuestionOwnership;
+    /** Tool names permanently auto-allowed after the user taps
+     * "Allow forever (by tool)" on an approval card. Revoke with
+     * `/config set interactive.allowByTool [...]`. */
+    allowByTool?: string[];
   };
   /** Long-task notifications (issue #18): goal completion push + periodic
    * liveness heartbeat while a silent tool keeps running. */
@@ -133,7 +137,7 @@ export const DEFAULT_CONFIG: TelegramConfig = Object.freeze({
   reasoning: { effort: 'medium' as const },
   model: {},
   media: { transcribe: { model: 'whisper-1' } },
-  interactive: { userQuestions: 'telegram' as const },
+  interactive: { userQuestions: 'telegram' as const, allowByTool: [] },
   notify: { onComplete: true, onLongTask: true },
 });
 
@@ -186,6 +190,18 @@ function readIdArray(record: Record<string, unknown>, key: string, path: string)
       throw new ConfigError(`${path}.${key}[${index}]`, 'must be an integer chat id');
     }
     return item;
+  });
+}
+
+function readStringArray(record: Record<string, unknown>, key: string, path: string): string[] | undefined {
+  const value = record[key];
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value)) throw new ConfigError(`${path}.${key}`, 'must be an array of strings');
+  return value.map((item, index) => {
+    if (typeof item !== 'string' || item.trim() === '') {
+      throw new ConfigError(`${path}.${key}[${index}]`, 'must be a non-empty string');
+    }
+    return item.trim();
   });
 }
 
@@ -356,12 +372,14 @@ export function normalizeConfig(raw: unknown): TelegramConfig {
   if (interactive !== undefined) {
     if (!isRecord(interactive)) throw new ConfigError('interactive', 'must be an object');
     const userQuestions = readString(interactive, 'userQuestions', 'interactive');
-    if (userQuestions !== undefined) {
-      if (!QUESTION_OWNERSHIPS.includes(userQuestions as QuestionOwnership)) {
-        throw new ConfigError('interactive.userQuestions', `must be one of ${QUESTION_OWNERSHIPS.join(' | ')}`);
-      }
-      base.interactive = { userQuestions: userQuestions as QuestionOwnership };
+    if (userQuestions !== undefined && !QUESTION_OWNERSHIPS.includes(userQuestions as QuestionOwnership)) {
+      throw new ConfigError('interactive.userQuestions', `must be one of ${QUESTION_OWNERSHIPS.join(' | ')}`);
     }
+    const allowByTool = readStringArray(interactive, 'allowByTool', 'interactive');
+    base.interactive = {
+      userQuestions: (userQuestions ?? base.interactive!.userQuestions) as QuestionOwnership,
+      allowByTool: allowByTool === undefined ? [...base.interactive!.allowByTool!] : [...new Set(allowByTool)],
+    };
   }
 
   const notify = raw['notify'];
@@ -393,7 +411,7 @@ function cloneDefault(): TelegramConfig {
     reasoning: { ...DEFAULT_CONFIG.reasoning },
     model: { ...DEFAULT_CONFIG.model },
     media: { transcribe: { ...DEFAULT_CONFIG.media!.transcribe } },
-    interactive: { ...DEFAULT_CONFIG.interactive },
+    interactive: { userQuestions: DEFAULT_CONFIG.interactive!.userQuestions, allowByTool: [...DEFAULT_CONFIG.interactive!.allowByTool!] },
     notify: { ...DEFAULT_CONFIG.notify },
   };
 }

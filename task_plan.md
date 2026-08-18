@@ -203,3 +203,31 @@
 - 不破坏 #15/#19 已收敛行为：编辑仍走 diff 检查、失败仍指数退避、同消息重试。
 - 新工具只允许白名单 chat + workspace root 内文件；文件发送仍走 SendQueue 全局限速。
 - 测试不依赖真实 Telegram。
+
+## Round 31 任务计划（修复 open issues #27-#30）
+
+### 目标
+修复 GitHub open issues：#27 审批卡 session/forever 档位、#28 dsh 0.1.0-rc.7
+依赖同步、#29 dsh-telegram-channel peer 范围（上游 PR）、#30 代码块
+`<pre><code>` 渲染。
+
+### 步骤
+1. [x] #30 markdown：fenced/表格全部 `<pre><code>`；fence 语言白名单
+   `class="language-*"`；回归测试 3 例。
+2. [x] #28 package.json + lock：6 个 dsh 包 dev pin `0.1.0-rc.7`、peer
+   `^0.1.0-rc.7`；npm install 后 rc.7 typecheck 0 error。
+3. [x] #27 interactive：session / forever(by tool) 按钮 + 回调解析；
+   `interactive.allowByTool` 配置持久化与热更新；高风险工具 ⚠️；
+   回归测试 interactive 4 例 + config 1 例。
+4. [x] #29 上游 fork `xqicxx/dsh-telegram-channel` 改 session/llm peer →
+   `^0.1.0-rc.7`，typecheck 通过，PR 提交
+   https://github.com/hi-wenw/dsh-telegram-channel/pull/6 。
+5. [x] 文档同步（CHANGELOG/README/README.zh/TESTING §69）。
+6. [x] `npm run check` 全绿：**356/356 pass**；`npm pack --dry-run` 149 files。
+7. [ ] commit/push + 关闭 #27/#28/#30；#29 待上游 merge 后关闭。
+
+### 约束
+- goal 档语义不回退（仍允许整个 goal）；session 档按「同 session 同工具」；
+  forever 只持久化工具名，不写 settings 服务（本插件配置在
+  `.pi/telegram.json`，`/config set` 可撤销）。
+- 编辑风暴防线（#15/#24）不因表格 `<code>` 包裹变化。

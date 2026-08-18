@@ -12,6 +12,9 @@ import type { Context } from "@deepseek-ai/cordis";
 import type { QuestionOwnership } from "../../config.js";
 
 export type ApprovalOutcome = "allowed-once" | "rejected" | "cancelled";
+/** What the user tapped. Scoped grants settle the approval as allowed-once
+ * while remembering the wider permission for later requests. */
+export type ApprovalAnswer = ApprovalOutcome | "allowed-goal" | "allowed-session" | "allowed-always";
 
 export interface BroadcastDelivery {
   chatId: number;
@@ -44,7 +47,7 @@ interface PendingApproval {
   reason?: string;
   /** Current goal id, when the chat has one — enables goal-scoped grants. */
   goalId?: string;
-  resolve: (outcome: ApprovalOutcome) => void;
+  resolve: (outcome: ApprovalOutcome, display?: string) => void;
   messageIds: Map<number, number>;
   cardText: string;
 }
@@ -170,7 +173,9 @@ interface CordisEventsLike {
 }
 
 export interface Interactive {
-  answerApproval(id: number, outcome: ApprovalOutcome | "allowed-goal"): boolean;
+  answerApproval(id: number, answer: ApprovalAnswer): boolean;
+  /** Hot-update the persisted forever-allow set (e.g. /config changed it). */
+  setAllowedTools(tools: readonly string[]): void;
   toggleQuestionOption(chatId: number, id: number, questionId: string, optionId: string): Promise<boolean>;
   setQuestionCustom(chatId: number, id: number, questionId: string, text: string): Promise<boolean>;
   submitQuestions(chatId: number, id: number): Promise<boolean>;
@@ -182,7 +187,23 @@ const approvals = new Map<number, PendingApproval>();
 const questions = new Map<number, PendingQuestion>();
 /** Goal ids the user granted: later approvals under the same goal auto-allow. */
 const grantedGoals = new Set<string>();
+/** sessionId -> tool names the user granted for the rest of that session. */
+const grantedSessions = new Map<string, Set<string>>();
+/** Tool names the user granted forever (persisted by the host via options). */
+const grantedTools = new Set<string>();
 let counter = 0;
+
+/** Tools whose irreversible actions deserve a warning on the forever button.
+ * Unknown tools default to normal: showing the option is more useful than
+ * hiding it behind a risk table the plugin cannot keep complete. */
+const HIGH_RISK_TOOLS = new Set(["bash", "shell", "exec", "sudo", "write", "edit", "delete", "remove", "rm", "kill", "stop", "abort", "publish", "uninstall"]);
+
+/** Whether the "Allow forever" button should carry a warning emoji. */
+export function isRiskyTool(toolName: string): boolean {
+  const name = toolName.trim().toLowerCase();
+  if (HIGH_RISK_TOOLS.has(name)) return true;
+  return /\b(bash|shell|exec|delete|remove|rm|kill|abort|uninstall)\b/.test(name);
+}
 
 function mint(): number {
   counter += 1;
@@ -263,16 +284,23 @@ export function questionKeyboard(pendingId: number, chatId: number): unknown {
   return { inline_keyboard: rows };
 }
 
-function approvalKeyboard(id: number, goalId: string | undefined): unknown {
+function approvalKeyboard(id: number, goalId: string | undefined, toolName: string): unknown {
   const rows: { text: string; callback_data: string }[][] = [];
+  const scoped: { text: string; callback_data: string }[] = [];
   if (goalId !== undefined) {
-    rows.push([
-      { text: "\u{1F7E2} Allow for this goal", callback_data: `ap:${id}:g` },
-    ]);
+    scoped.push({ text: "\u{1F7E2} Allow for this goal", callback_data: `ap:${id}:g` });
   }
+  scoped.push({ text: "\u{1F7E3} Allow for this session", callback_data: `ap:${id}:s` });
+  rows.push(scoped);
   rows.push([
     { text: "\u2705 Allow once", callback_data: `ap:${id}:y` },
     { text: "\u274C Reject", callback_data: `ap:${id}:n` },
+  ]);
+  rows.push([
+    {
+      text: isRiskyTool(toolName) ? "\u{1F7E4} Allow forever \u26A0\uFE0F risky" : "\u{1F7E4} Allow forever (by tool)",
+      callback_data: `ap:${id}:a`,
+    },
   ]);
   return { inline_keyboard: rows };
 }
@@ -285,6 +313,11 @@ export interface InteractiveOptions {
   /** Resolve the current goal id for one agent/session. Absent = no
    * goal-scoped approval button. */
   goalIdForSession?: (sessionId: string) => string | undefined;
+  /** Tool names already allowed forever (loaded from persisted config). */
+  allowedTools?: readonly string[];
+  /** Persist a new forever-allow for one tool. Return false when the write
+   * failed; the grant stays live in memory for this plugin mount. */
+  persistToolAllow?: (toolName: string) => boolean;
 }
 
 interface ToolExecutionLike {
@@ -384,6 +417,9 @@ export function attachInteractive(ctx: Context, delivery: InteractiveDelivery, o
   const ownership = options.userQuestions ?? "telegram";
   const log = options.log ?? ((message: string, error?: unknown) => console.error(`[dsh-telegram] ${message}`, error ?? ""));
   const goalIdForSession = options.goalIdForSession;
+  for (const toolName of options.allowedTools ?? []) {
+    if (toolName.trim() !== "") grantedTools.add(toolName.trim());
+  }
 
   if (ctx.get("approval") !== undefined) {
     const events = ctx as unknown as CordisEventsLike;
@@ -395,6 +431,13 @@ export function attachInteractive(ctx: Context, delivery: InteractiveDelivery, o
         // A previous "Allow for this goal" covers the rest of the goal:
         // settle without showing another card.
         if (goalId !== undefined && grantedGoals.has(goalId)) return Promise.resolve("allowed-once");
+        // Session and forever (by-tool) grants cover the same tool without
+        // another card. Session grants die with the plugin mount, matching
+        // the web's per-session permission model.
+        const toolName = req.toolName.trim();
+        if (grantedTools.has(toolName) || grantedSessions.get(String(req.agent.id))?.has(toolName)) {
+          return Promise.resolve("allowed-once");
+        }
         const claimed = new Set([...approvals.values()].map((entry) => entry.approvalId));
         const decided = new Set<string>();
         let approvalId: string | undefined;
@@ -412,7 +455,7 @@ export function attachInteractive(ctx: Context, delivery: InteractiveDelivery, o
         if (approvalId === undefined) return (next as () => Promise<unknown>)();
         const id = mint();
         return new Promise<ApprovalOutcome>((resolve) => {
-          const settle = (outcome: ApprovalOutcome) => {
+          const settle = (outcome: ApprovalOutcome, display: string = outcome) => {
             if (!approvals.delete(id)) return;
             req.signal?.removeEventListener("abort", onAbort);
             // Edit the requested card in place and drop its inline buttons.
@@ -422,7 +465,7 @@ export function attachInteractive(ctx: Context, delivery: InteractiveDelivery, o
               delivery,
               pending.messageIds,
               delivery.chatForSession?.(pending.sessionId),
-              `${pending.cardText}\n\n\u{1F6E1} Approval ${outcome} \u00B7 ${req.toolName}${req.reason ? ` \u00B7 ${req.reason}` : ""}`,
+              `${pending.cardText}\n\n\u{1F6E1} Approval ${display} \u00B7 ${req.toolName}${req.reason ? ` \u00B7 ${req.reason}` : ""}`,
             );
             resolve(outcome);
           };
@@ -431,7 +474,7 @@ export function attachInteractive(ctx: Context, delivery: InteractiveDelivery, o
           const pending: PendingApproval = { id, approvalId, sessionId: req.agent.id, toolName: req.toolName, ...(req.reason === undefined ? {} : { reason: req.reason }), ...(goalId === undefined ? {} : { goalId }), resolve: settle, messageIds: new Map(), cardText };
           approvals.set(id, pending);
           req.signal?.addEventListener("abort", onAbort, { once: true });
-          void broadcastForSession(delivery, req.agent.id, cardText, approvalKeyboard(id, goalId))
+          void broadcastForSession(delivery, req.agent.id, cardText, approvalKeyboard(id, goalId, req.toolName))
             .then((delivered) => {
               for (const entry of delivered) pending.messageIds.set(entry.chatId, entry.messageId);
               // Zero deliveries would block the agent forever on a card no
@@ -498,17 +541,44 @@ export function attachInteractive(ctx: Context, delivery: InteractiveDelivery, o
   }
 
   return {
-    answerApproval(id, outcome) {
+    answerApproval(id, answer) {
       const pending = approvals.get(id);
       if (!pending) return false;
-      if (outcome === "allowed-goal") {
+      const toolName = pending.toolName.trim();
+      if (answer === "allowed-goal") {
         if (pending.goalId === undefined) return false;
         grantedGoals.add(pending.goalId);
-        pending.resolve("allowed-once");
+        pending.resolve("allowed-once", "allowed-goal (this goal)");
         return true;
       }
-      pending.resolve(outcome);
+      if (answer === "allowed-session") {
+        const allowed = grantedSessions.get(pending.sessionId) ?? new Set<string>();
+        allowed.add(toolName);
+        grantedSessions.set(pending.sessionId, allowed);
+        pending.resolve("allowed-once", "allowed-session (this session)");
+        return true;
+      }
+      if (answer === "allowed-always") {
+        grantedTools.add(toolName);
+        let persisted = true;
+        try {
+          persisted = options.persistToolAllow?.(toolName) ?? true;
+        } catch (err) {
+          log("persisting an approval forever-allow failed; grant stays in memory for this plugin mount", err);
+          persisted = false;
+        }
+        if (!persisted) log(`persisting approval forever-allow for ${toolName} failed; grant stays in memory for this plugin mount`);
+        pending.resolve("allowed-once", "allowed-always (by tool)");
+        return true;
+      }
+      pending.resolve(answer);
       return true;
+    },
+    setAllowedTools(tools) {
+      grantedTools.clear();
+      for (const toolName of tools) {
+        if (toolName.trim() !== "") grantedTools.add(toolName.trim());
+      }
     },
     async toggleQuestionOption(chatId, id, questionId, optionToken) {
       const pending = questions.get(id);
@@ -572,6 +642,8 @@ export function attachInteractive(ctx: Context, delivery: InteractiveDelivery, o
       approvals.clear();
       questions.clear();
       grantedGoals.clear();
+      grantedSessions.clear();
+      grantedTools.clear();
     },
   };
 }

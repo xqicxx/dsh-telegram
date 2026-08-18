@@ -63,10 +63,20 @@ function safeHref(href: string): boolean {
   return /^(https?|tg|mailto):\/\/\S+$/i.test(href) || /^mailto:[^@\s]+@[^@\s]+$/i.test(href);
 }
 
+/** Telegram accepts `class="language-X"` on <code>; keep only a conservative
+ * token so model-provided fence info can never leak markup or attributes. */
+function telegramCodeLanguage(raw: string): string | undefined {
+  const language = raw.trim();
+  if (!/^[A-Za-z0-9_+#.-]{1,20}$/.test(language)) return undefined;
+  return language;
+}
+
 
 /** GFM table support (issue #19): Telegram HTML has no <table>, so a pipe
- * table becomes a monospace <pre> block with columns aligned to the widest
- * cell. Cells are escaped text (bold/code inside a table stay readable). */
+ * table becomes a monospace <pre><code> block with columns aligned to the
+ * widest cell. Cells are escaped text (bold/code inside a table stay
+ * readable). The <code> wrapper is required: Telegram only guarantees the
+ * monospace font for <pre><code>, not for a bare <pre> (issue #30). */
 function parseTableRow(line: string): string[] | undefined {
   const trimmed = line.trim();
   if (!trimmed.startsWith("|") || !trimmed.endsWith("|")) return undefined;
@@ -88,7 +98,7 @@ function renderTableBlock(rows: readonly string[]): string | undefined {
   const pad = (cell: string, index: number): string => `${cell}${" ".repeat(Math.max(0, widths[index]! - cell.length))}`;
   const rowText = (cells: string[]): string => `| ${cells.map((cell, index) => pad(escapeHtml(cell), index)).join(" | ")} |`;
   const separator = `| ${header.map((_, index) => "-".repeat(widths[index]!)).join(" | ")} |`;
-  return `<pre>${[rowText(header), separator, ...body.map((row) => rowText([...Array(columns)].map((_, index) => row[index] ?? "")))].join("\n")}</pre>`;
+  return `<pre><code>${[rowText(header), separator, ...body.map((row) => rowText([...Array(columns)].map((_, index) => row[index] ?? "")))].join("\n")}</code></pre>`;
 }
 
 /** First GFM table found anywhere in a text, as an aligned monospace block.
@@ -242,11 +252,12 @@ function blockquoteLine(line: string): string | undefined {
   return match[1] ?? "";
 }
 
-function isFence(line: string): { marker: string; len: number } | undefined {
-  const match = /^\s*(`{3,}|~{3,})/.exec(line);
+function isFence(line: string): { marker: string; len: number; language?: string } | undefined {
+  const match = /^\s*(`{3,}|~{3,})(.*)$/.exec(line);
   if (!match) return undefined;
   const marker = match[1]![0]!;
-  return { marker, len: match[1]!.length };
+  const language = telegramCodeLanguage(match[2] ?? "");
+  return { marker, len: match[1]!.length, ...(language === undefined ? {} : { language }) };
 }
 
 /** Normalize one block line of model Markdown into Telegram HTML. */
@@ -286,7 +297,8 @@ export function markdownToHtml(markdown: string): string {
         index += 1;
       }
       const body = code.join("\n");
-      out.push(`<pre>${escapeHtml(body)}</pre>`);
+      const open = fence.language === undefined ? "<pre><code>" : `<pre><code class="language-${fence.language}">`;
+      out.push(`${open}${escapeHtml(body)}</code></pre>`);
       if (!closed) {
         // Unterminated fence: the rest of the message was consumed as code.
       }

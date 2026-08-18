@@ -285,3 +285,22 @@
 - #26：最终答案路径 #19 已覆盖；缺 openclaw reasoning 路径。新增
   `markdownTablePreBlock`（任意位置首个 GFM 表）并接入 reasoningLineHtml。
 - 提交 `be550f3` 已 push main，issues #22-#26 已关闭。
+
+## Round 31 发现与修复（GitHub issues #27-#30）
+
+- #30 根因确认：Telegram HTML 仅对 `<pre><code>` 保证 monospace；本仓库与
+  openclaw/表格路径全部使用裸 `<pre>`。修复集中在 `markdown.ts` 两处输出 +
+  `isFence` 语言解析；表格 `<pre><code>` 与 splitter 的嵌套 tag 重平衡天然兼容。
+- #28：`^0.1.0-rc.6` 虽能满足 rc.7，但 devDep 精确 pin 会让本地编译停留在
+  rc.6 类型面；同步到 rc.7 后 typecheck 0 error，无行为变化。
+- #27 的实现注意点：
+  - 不能把 `allowed-session`/`allowed-always` 直接 resolve 给 approval
+    协议——协议只认 allowed-once/rejected/cancelled；两个新档位记录授权后
+    仍 resolve `allowed-once`，结算文案显示真实档位。
+  - forever 持久化走本插件自己的 `.pi/telegram.json`（`/config set` 体系），
+    而不是 issue 建议的 `settings.update("approval", …)`：本插件未注册
+    approval settings namespace，硬写会依赖不存在的 namespace。
+  - `persistToolAllow` 同步写入 config 并 `applyConfigLive`，失败只记日志、
+    授权仍在本插件挂载期内存生效。
+- #29 属外部仓库 `hi-wenw/dsh-telegram-channel`（fork 6 个、本账号无 push
+  权限），走 fork PR 修复；上游 merge 前 issue 保持 open 并在 #29 下附 PR。

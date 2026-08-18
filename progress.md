@@ -232,3 +232,18 @@
 - 新增回归：status 2、markdown 2、openclaw 4、telegram-attach 1（总 349）。
 - `npm run check`：**349/349 pass**；`npm pack --dry-run` 通过（149 files）。
 - 已提交 `be550f3` 并推送 main；issues #22-#26 全部关闭，open issues 已清空。
+
+## Round 31（本轮）
+
+- 修复 open issues #27-#30：
+  - #27：审批卡新增 `🟣 Allow for this session`（同 session 同工具）与
+    `🟤 Allow forever (by tool)`（`interactive.allowByTool` 持久化，
+    `/config set` 可撤销/热更新）；高风险工具 forever 按钮带 ⚠️。
+  - #28：6 个 `@deepseek-ai/dsh-*` devDep 精确 pin 与 peer 范围全部升至
+    `0.1.0-rc.7`；本机 rc.7 下 typecheck + 全量测试通过。
+  - #29：上游 dsh-telegram-channel fork 修正 `dsh-session`/`dsh-llm`
+    peer `^0.1.0-rc.7`，PR https://github.com/hi-wenw/dsh-telegram-channel/pull/6 。
+  - #30：fenced code / GFM 表格全部 `<pre><code>`，语言 class 白名单。
+- 回归测试新增 8 例（markdown 3 / interactive 4 / config 1）。
+- `npm run check`：**356/356 pass**；`npm pack --dry-run`：149 files。
+- 待办：commit/push；关闭 #27/#28/#30；#29 待上游 merge。

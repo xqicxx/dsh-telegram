@@ -1508,3 +1508,51 @@ Telegram 却只显示项目基名/id。根因：真实 `SessionPersistence.readR
 
 - 新增/更新：status、markdown、openclaw、telegram-attach。
 - `npm run check`：**349/349 pass**。
+
+## 69. 修复 open issues #27-#30（2026-08-18，356/356）
+
+### #30 代码块不是真等宽
+
+- 根因：`<pre>` 裸块在 Telegram 客户端不保证 monospace，必须
+  `<pre><code>…</code></pre>`。
+- 修复：fenced code 与 GFM 表格均输出 `<pre><code>`；fence 语言经白名单
+  （`[A-Za-z0-9_+#.-]{1,20}`）后输出 `class="language-*"`，非法语言忽略，
+  与 pi-telegram 一致。
+- 回归：`test/markdown.test.mjs` 新增语言 class、无语言包裹、语言注入消毒
+  3 例；表格与 `markdownTablePreBlock` 断言同步到 `<pre><code>`。
+
+### #28 dsh 0.1.0-rc.7 依赖同步
+
+- package.json：6 个 `@deepseek-ai/dsh-*` devDep 精确 pin `0.1.0-rc.7`，
+  peerDep 范围 `^0.1.0-rc.7`。
+- `npm install`（独立 cache）后 node_modules 全部为 rc.7；typecheck 0 error；
+  全套测试在 rc.7 类型/头文件下通过。
+
+### #27 审批卡 session / forever（by tool）档位
+
+- `approvalKeyboard` 新增：
+  - 首行：goal（有 goal 时）+ `🟣 Allow for this session`（`ap:*:s`）
+  - 次行：`✅ Allow once` / `❌ Reject`
+  - 第三行：`🟤 Allow forever (by tool)`（`ap:*:a`）；bash/write/delete 等
+    高风险工具追加 `⚠️ risky`。
+- session 授权：`grantedSessions: Map<sessionId, Set<tool>>`，同 session 同
+  工具后续 approval 直接 `allowed-once`，其他工具/其他 session 仍然弹卡。
+- forever 授权：`grantedTools` 内存集合 + `persistToolAllow` 钩子把工具写入
+  `interactive.allowByTool`（`.pi/telegram.json`）；重启后经 `allowedTools`
+  载入；`/config set interactive.allowByTool [...]` 热更新（`setAllowedTools`）。
+- 配置校验：非空字符串数组、去重、非法项报 `interactive.allowByTool[i]`。
+- 回归：`test/interactive.test.mjs` 新增 4 例（键盘/风险标、session 范围、
+  forever 持久化+重载、无 goal 拒绝 goal 档）；`test/config.test.mjs` 新增
+  校验/去重/overlay 1 例。
+
+### #29 dsh-telegram-channel peer 范围（上游 PR）
+
+- `dsh-telegram-channel` 不属于本仓库，已在 fork
+  `xqicxx/dsh-telegram-channel` 修改 `dsh-session`/`dsh-llm` peer+dev 为
+  `^0.1.0-rc.7`，typecheck 通过，并提交上游
+  https://github.com/hi-wenw/dsh-telegram-channel/pull/6 。
+
+### 测试记录
+
+- 新增/更新：markdown（3）、interactive（4）、config（1），其余全量回归。
+- `npm run check`：**356/356 pass**；`npm pack --dry-run`：149 files。

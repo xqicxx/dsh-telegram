@@ -55,12 +55,21 @@ test('malformed model markup degrades to readable text instead of raw tags', () 
   assert.match(html, /&lt;script&gt;/);
 });
 
-test('fenced code blocks become escaped <pre> blocks', () => {
+test('fenced code blocks become escaped <pre><code> blocks (#30)', () => {
   const html = markdownToHtml('```js\nconst x = "<tag>";\n```');
-  assert.equal(html, '<pre>const x = &quot;&lt;tag&gt;&quot;;</pre>');
+  assert.equal(html, '<pre><code class="language-js">const x = &quot;&lt;tag&gt;&quot;;</code></pre>');
 });
 
-test('GFM tables become aligned monospace blocks instead of raw pipes (#19)', () => {
+test('fenced code without a language still wraps in <pre><code> (#30)', () => {
+  assert.equal(markdownToHtml('```\nplain\n```'), '<pre><code>plain</code></pre>');
+});
+
+test('fence language info is sanitized instead of leaking markup (#30)', () => {
+  const html = markdownToHtml('```"><b onclick="x">\nboom\n```');
+  assert.equal(html, '<pre><code>boom</code></pre>');
+});
+
+test('GFM tables become aligned monospace blocks instead of raw pipes (#19, #30)', () => {
   const html = markdownToHtml([
     '| 消息 | 文件 | 大小 |',
     '|---|---|---|',
@@ -69,9 +78,10 @@ test('GFM tables become aligned monospace blocks instead of raw pipes (#19)', ()
     '',
     '**三个文件已发送**',
   ].join('\n'));
-  assert.match(html, /<pre>\| 消息\s+\| 文件\s+\| 大小\s+\|/);
+  assert.match(html, /<pre><code>\| 消息\s+\| 文件\s+\| 大小\s+\|/);
   assert.match(html, /\| 📌 ① \| `a\.xlsx`\s+\| 26,666B\s+\|/);
   assert.equal(html.includes('|---|'), false, 'separator syntax is replaced');
+  assert.match(html, /<\/code><\/pre>/, 'table block closes both code and pre');
   assert.match(html, /<b>三个文件已发送<\/b>/, 'markdown around the table still renders');
   assert.equal(html.split('<pre>').length, 2, 'exactly one monospace table block');
 });
@@ -91,10 +101,11 @@ test('markdownTablePreBlock finds a table anywhere and renders it as aligned mon
   ].join('\n');
   const html = markdownTablePreBlock(input);
   assert.ok(html, 'a table block was detected');
-  assert.match(html, /^<pre>/);
+  assert.match(html, /^<pre><code>/);
   assert.match(html, /\| col1\s+\| col2\s+\|/);
   assert.match(html, /\| a\s+\| b\s+\|/);
   assert.match(html, /\| long \| text \|/);
+  assert.match(html, /<\/code><\/pre>$/);
   assert.equal(html.includes('------'), false, 'separator syntax is replaced by an aligned rule');
 });
 

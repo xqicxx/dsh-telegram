@@ -168,10 +168,24 @@ test('normalizeConfig validates interactive.userQuestions ownership', () => {
   assert.equal(normalizeConfig({ interactive: { userQuestions: 'auto' } }).interactive.userQuestions, 'auto');
 });
 
+test('normalizeConfig validates and dedupes interactive.allowByTool (#27)', () => {
+  assert.deepEqual(normalizeConfig(undefined).interactive.allowByTool, []);
+  assert.deepEqual(
+    normalizeConfig({ interactive: { allowByTool: [' bash ', 'read', 'bash'] } }).interactive.allowByTool,
+    ['bash', 'read'],
+  );
+  assert.throws(() => normalizeConfig({ interactive: { allowByTool: 'bash' } }), /interactive\.allowByTool/);
+  assert.throws(() => normalizeConfig({ interactive: { allowByTool: ['bash', ''] } }), /interactive\.allowByTool\[1\]/);
+});
+
 test('overlayConfig applies the interactive section live', () => {
   const { config, changed } = overlayConfig(normalizeConfig(undefined), { interactive: { userQuestions: 'web' } });
   assert.ok(changed.includes('interactive'));
   assert.equal(config.interactive.userQuestions, 'web');
+  assert.deepEqual(config.interactive.allowByTool, [], 'partial interactive overlay keeps the allow list');
+  const forever = overlayConfig(normalizeConfig(undefined), { interactive: { allowByTool: ['bash'] } });
+  assert.ok(forever.changed.includes('interactive'));
+  assert.deepEqual(forever.config.interactive.allowByTool, ['bash']);
 });
 
 test('notify switches default on and validate/hot-apply (#18)', () => {
