@@ -250,3 +250,5 @@
 - #29：上游 PR https://github.com/hi-wenw/dsh-telegram-channel/pull/6 已提交且 mergeable，待上游合并后关闭 issue。
 - Round 31 追加：PR lockfile 已按 registry.npmjs.org 重新生成（去掉本地 npmmirror 残留），
   干净克隆下 `npm ci` + `npm run typecheck` 均通过；已评论 @hi-wenw 请求 review。
+- Round 31 再追加：用户确认继续等上游合并；已启动后台 watcher（每 5 分钟检查 PR，
+  merged 后自动评论并关闭 #29，最长 24h）。
