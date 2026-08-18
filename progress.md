@@ -246,4 +246,5 @@
   - #30：fenced code / GFM 表格全部 `<pre><code>`，语言 class 白名单。
 - 回归测试新增 8 例（markdown 3 / interactive 4 / config 1）。
 - `npm run check`：**356/356 pass**；`npm pack --dry-run`：149 files。
-- 待办：commit/push；关闭 #27/#28/#30；#29 待上游 merge。
+- 已提交 `f1559da` 并推送 main；#27/#28/#30 已关闭。
+- #29：上游 PR https://github.com/hi-wenw/dsh-telegram-channel/pull/6 已提交且 mergeable，待上游合并后关闭 issue。

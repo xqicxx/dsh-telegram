@@ -224,7 +224,8 @@
    https://github.com/hi-wenw/dsh-telegram-channel/pull/6 。
 5. [x] 文档同步（CHANGELOG/README/README.zh/TESTING §69）。
 6. [x] `npm run check` 全绿：**356/356 pass**；`npm pack --dry-run` 149 files。
-7. [ ] commit/push + 关闭 #27/#28/#30；#29 待上游 merge 后关闭。
+7. [x] commit/push（`f1559da`）+ 关闭 #27/#28/#30；#29 已提交上游 PR
+   https://github.com/hi-wenw/dsh-telegram-channel/pull/6（mergeable，待上游合并后关 issue）。
 
 ### 约束
 - goal 档语义不回退（仍允许整个 goal）；session 档按「同 session 同工具」；
