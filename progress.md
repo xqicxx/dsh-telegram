@@ -248,3 +248,5 @@
 - `npm run check`：**356/356 pass**；`npm pack --dry-run`：149 files。
 - 已提交 `f1559da` 并推送 main；#27/#28/#30 已关闭。
 - #29：上游 PR https://github.com/hi-wenw/dsh-telegram-channel/pull/6 已提交且 mergeable，待上游合并后关闭 issue。
+- Round 31 追加：PR lockfile 已按 registry.npmjs.org 重新生成（去掉本地 npmmirror 残留），
+  干净克隆下 `npm ci` + `npm run typecheck` 均通过；已评论 @hi-wenw 请求 review。
