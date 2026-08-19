@@ -599,11 +599,8 @@ export function apply(ctx: Context, _config?: unknown): void {
         }
         const finalize = (messageId: number | undefined): void => {
           if (messageId === undefined) return;
-          if (summary !== undefined) {
-            void safeWrap("openclaw-finalize", () => host.editMessage(chatId, messageId, summary, { parse_mode: "HTML" }));
-          } else {
-            void safeWrap("openclaw-cleanup", () => host.deleteMessage(chatId, messageId));
-          }
+          const text = summary ?? goalReceipt ?? "\u{1F937} (empty response)";
+          void safeWrap("openclaw-finalize", () => host.editMessage(chatId, messageId, text, { parse_mode: "HTML" }));
         };
         if (draft.messageId !== undefined) {
           finalize(draft.messageId);
