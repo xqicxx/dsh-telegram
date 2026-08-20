@@ -24,6 +24,7 @@
 - [x] Round 17：Release gate（npm publish dry-run + v0.3.0-rc.1 tag）
 - [x] Round 18：独立审计修复 + 实机冒烟（211/211）
 - [x] Round 27：修复 GitHub issues #14/#15（Todos 卡实时性 + openclaw placeholder storm）
+- [x] Round 32：修复 issues #31-#35/#37-#46（CJK 表格/轨迹视图/空回复/429 分类 + rc.8 升级，379/379，commit `0bfafc3`）
 - [ ] Round 19+：Telegram 客户端完整 §25 checklist + 最终发布决策（见下）
 - [ ] 最终：`npm run check` + `npm pack --dry-run` + 提交
 
@@ -66,8 +67,9 @@
 5. [x] rc.8 升级：peer ^0.1.0-rc.8 + devDep 精确 0.1.0-rc.8，typecheck + 全量测试
    （同时关闭 #45/#46，同为 rc.8 已修上游项）。
 6. [x] 文档：CHANGELOG / README(.zh) / TESTING §70 / 命令描述。
-7. [ ] `npm run check` 全绿 + `npm pack --dry-run`；commit + push；
-   关闭 #31-#33/#37（本仓库修复）、#38-#46（rc.8 升级）、#34/#35（上游范围）。
+7. [x] `npm run check` 全绿（**379/379**）+ `npm pack --dry-run`（152 files）；
+   commit `0bfafc3` 已 push main；关闭 #31-#33/#37（本仓库修复）、#38-#46
+   （rc.8 升级）、#34/#35（上游范围，#29 先例）——open issues 已清空。
 
 ### 约束
 - #15/#23/#24 编辑风暴防线不回退：占位符编辑仍走 editMessage，失败不重发新占位。
