@@ -10,3 +10,6 @@ coverage/
 
 # Local plugin bundles checked out alongside this repo
 dsh-plugins/
+
+# Local deepseek-harness checkout (upstream source reference)
+deepseek-harness/

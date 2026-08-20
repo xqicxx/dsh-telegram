@@ -77,6 +77,69 @@ function telegramCodeLanguage(raw: string): string | undefined {
  * widest cell. Cells are escaped text (bold/code inside a table stay
  * readable). The <code> wrapper is required: Telegram only guarantees the
  * monospace font for <pre><code>, not for a bare <pre> (issue #30). */
+
+/** Ranges that render two columns wide in Telegram's monospace font: CJK
+ * ideographs, kana, Hangul, fullwidth forms, and the CJK extension planes. */
+const CJK_RANGES: readonly (readonly [number, number])[] = [
+  [0x1100, 0x115f], // Hangul Jamo
+  [0x2329, 0x232a], // Angle brackets
+  [0x2e80, 0x9fff], // CJK radicals / kana / unified ideographs
+  [0xa000, 0xa4cf], // Yi
+  [0xac00, 0xd7a3], // Hangul syllables
+  [0xf900, 0xfaff], // CJK compatibility ideographs
+  [0xfe30, 0xfe4f], // CJK compatibility forms
+  [0xff00, 0xff60], // Fullwidth forms
+  [0xffe0, 0xffe6], // Fullwidth signs
+  [0x20000, 0x2ffff], // CJK unified ideographs extensions B-G
+  [0x30000, 0x3ffff], // CJK unified ideographs extensions H+
+];
+
+function isWideCodePoint(codePoint: number): boolean {
+  return CJK_RANGES.some(([low, high]) => codePoint >= low && codePoint <= high);
+}
+
+/** Grapheme segmenter for display-width math; `undefined` on runtimes without
+ * `Intl.Segmenter` (width then degrades to code-point iteration). */
+const graphemeSegmenter: Intl.Segmenter | undefined =
+  typeof Intl !== "undefined" && typeof Intl.Segmenter === "function"
+    ? new Intl.Segmenter("zh-CN", { granularity: "grapheme" })
+    : undefined;
+
+/** Display width of one grapheme cluster in Telegram's monospace font. */
+function graphemeWidth(grapheme: string): number {
+  const codePoints = Array.from(grapheme);
+  // One astral code point (a surrogate pair in UTF-16) is an emoji or a CJK
+  // extension-B ideograph: both render two columns wide.
+  if (codePoints.length === 1 && grapheme.length === 2) return 2;
+  // Multi-code-point graphemes: keycaps, flags, ZWJ emoji sequences render as
+  // one ~2-column glyph; a base plus combining marks keeps the base width.
+  if (codePoints.length > 1) {
+    const emojiSequence =
+      /[\uFE0F\u200D]/.test(grapheme) || codePoints.some((unit) => (unit.codePointAt(0) ?? 0) >= 0x1f000);
+    if (emojiSequence) return 2;
+  }
+  const codePoint = codePoints[0]?.codePointAt(0) ?? 0;
+  return isWideCodePoint(codePoint) ? 2 : 1;
+}
+
+/** Telegram-monospace display width of a cell (issue #31): `String.length`
+ * counts UTF-16 code units, so CJK cells padded by code units misalign
+ * against Latin columns (a CJK char renders ~2 columns in the monospace
+ * font). Width is measured on the RAW cell: escapeHtml entities render as
+ * one character inside <pre><code>, so padding against the escaped length
+ * would under-pad columns containing & < > " characters. */
+export function cellDisplayWidth(text: string): number {
+  let width = 0;
+  if (graphemeSegmenter !== undefined) {
+    for (const { segment } of graphemeSegmenter.segment(text)) width += graphemeWidth(segment);
+  } else {
+    // Code-point iteration (for...of pairs surrogate halves): close enough on
+    // runtimes without Intl.Segmenter, where emoji ZWJ sequences may overcount.
+    for (const grapheme of text) width += graphemeWidth(grapheme);
+  }
+  return width;
+}
+
 function parseTableRow(line: string): string[] | undefined {
   const trimmed = line.trim();
   if (!trimmed.startsWith("|") || !trimmed.endsWith("|")) return undefined;
@@ -94,11 +157,28 @@ function renderTableBlock(rows: readonly string[]): string | undefined {
   if (!isTableSeparator(parsed[1]!)) return undefined;
   const body = parsed.slice(2).filter((row) => row.length > 0);
   const columns = header.length;
-  const widths = header.map((cell, index) => Math.max(cell.length, ...body.map((row) => (row[index] ?? "").length)));
-  const pad = (cell: string, index: number): string => `${cell}${" ".repeat(Math.max(0, widths[index]! - cell.length))}`;
-  const rowText = (cells: string[]): string => `| ${cells.map((cell, index) => pad(escapeHtml(cell), index)).join(" | ")} |`;
+  // Widths come from header + body cells only: the separator row's dash
+  // padding is model-styled (often longer than any cell) and must not
+  // inflate the rendered column.
+  const widths = header.map((_, index) =>
+    Math.max(3, ...[header, ...body].map((row) => cellDisplayWidth(row[index] ?? ""))),
+  );
+  const rowText = (cells: string[]): string =>
+    `| ${cells
+      .map((cell, index) => {
+        // Pad by the RAW cell's display width: escapeHtml entities render as
+        // one glyph inside <pre><code>, so measuring the escaped string would
+        // under-pad columns containing & < > " characters.
+        const padding = Math.max(0, widths[index]! - cellDisplayWidth(cell));
+        return `${escapeHtml(cell)}${" ".repeat(padding)}`;
+      })
+      .join(" | ")} |`;
   const separator = `| ${header.map((_, index) => "-".repeat(widths[index]!)).join(" | ")} |`;
-  return `<pre><code>${[rowText(header), separator, ...body.map((row) => rowText([...Array(columns)].map((_, index) => row[index] ?? "")))].join("\n")}</code></pre>`;
+  return `<pre><code>${[
+    rowText(header),
+    separator,
+    ...body.map((row) => rowText([...Array(columns)].map((_, index) => row[index] ?? ""))),
+  ].join("\n")}</code></pre>`;
 }
 
 /** First GFM table found anywhere in a text, as an aligned monospace block.

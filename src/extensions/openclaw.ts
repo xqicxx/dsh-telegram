@@ -587,20 +587,42 @@ export function apply(ctx: Context, _config?: unknown): void {
     if (type === "turn/end") {
       const draft = chats.get(chatId);
       const goal = host.goalForChat?.(chatId);
+      const reason = (event.data as { reason?: { kind?: string; error?: { message?: string } } } | undefined)?.reason;
+      // Errored turns surface through the core bridge's classified failure
+      // message (issue #37); here they only suppress success receipts.
+      const failed = reason?.kind === "error" && typeof reason.error?.message === "string" && reason.error.message.trim() !== "";
+      const answer = answers.get(chatId);
       let goalReceipt: string | undefined;
+      // Issue #33: a turn that ends successfully with zero visible output
+      // (no reasoning, no tools, no prose) must not delete its placeholder
+      // into silence - the placeholder becomes the outcome notice instead.
+      let emptyNotice: string | undefined;
+      let noticeOnPlaceholder = false;
       if (draft !== undefined) {
         clearTimers(draft);
         commitReasoning(draft);
         const sessionStats = host.statusStats() as StatusStats | undefined;
         const hasContent = draft.reasoningSteps > 0 || draft.toolCalls > 0;
         const summary = hasContent ? buildSummary(draft, sessionStats, goal?.objective) : undefined;
-        if (goal !== undefined) {
+        if (goal !== undefined && !failed) {
           goalReceipt = summary ?? `\u2705 ${goal.objective.slice(0, 60)} \u00B7 \u23F1\uFE0F ${Math.max(1, Math.round((Date.now() - draft.startedAt) / 1000))}s`;
+        }
+        if (!failed && answer === undefined && summary === undefined && goalReceipt === undefined) {
+          // The notice rides on the placeholder (falling back to a fresh
+          // send when the edit fails) instead of vanishing with deleteMessage.
+          emptyNotice = `\u{1F937} Empty response \u00B7 \u23F1\uFE0F ${Math.max(1, Math.round((Date.now() - draft.startedAt) / 1000))}s`;
+          noticeOnPlaceholder = true;
         }
         const finalize = (messageId: number | undefined): void => {
           if (messageId === undefined) return;
           if (summary !== undefined) {
             void safeWrap("openclaw-finalize", () => host.editMessage(chatId, messageId, summary, { parse_mode: "HTML" }));
+          } else if (noticeOnPlaceholder) {
+            void safeWrap("openclaw-empty-response", () =>
+              host
+                .editMessage(chatId, messageId, emptyNotice!, { parse_mode: "HTML" })
+                .then((edited) => (edited === true ? undefined : host.send(chatId, emptyNotice!, { parse_mode: "HTML" }))),
+            );
           } else {
             void safeWrap("openclaw-cleanup", () => host.deleteMessage(chatId, messageId));
           }
@@ -613,16 +635,29 @@ export function apply(ctx: Context, _config?: unknown): void {
           void safeWrap("openclaw-finalize-pending", () => draft.sending!.then(finalize));
         }
         chats.delete(chatId);
+      } else if (!failed && answer === undefined) {
+        // No live draft existed (turn/start dropped): zero output by
+        // definition, and the notice must still reach the chat (#33).
+        emptyNotice = "\u{1F937} Empty response";
       }
 
       // Final delivery is this plugin's job while it is mounted: the newest
       // prose block is the turn's answer; without one the openclaw-mode
       // reminder replaces the core's (suppressed) reminder. A tool reply
       // (telegram_reply) already answered the inbound — skip both.
-      const answer = answers.get(chatId);
       answers.delete(chatId);
-      if (host.pendingInbound(chatId)) {
-        const text = answer !== undefined ? markdownToHtml(answer.text) : NO_REPLY_REMINDER;
+      if (noticeOnPlaceholder) {
+        // The placeholder edit IS this turn's outcome: it satisfies the
+        // inbound, so the tool-shaped reminder must not stack on top of it.
+        if (host.pendingInbound(chatId)) host.markInboundReplied(chatId);
+      } else if (host.pendingInbound(chatId)) {
+        const text =
+          answer !== undefined
+            ? markdownToHtml(answer.text)
+            : // A zero-output turn is the model returning nothing, not the
+              // agent forgetting telegram_reply: deliver the notice instead
+              // of the tool-shaped reminder (issue #33).
+              emptyNotice ?? NO_REPLY_REMINDER;
         const inboundMessageId = host.inboundMessageId(chatId);
         const agentId = host.agentIdForChat(chatId);
         const assistantMessageId = answer?.assistantMessageId;
@@ -646,6 +681,10 @@ export function apply(ctx: Context, _config?: unknown): void {
         void safeWrap("openclaw-goal-completion", () =>
           host.send(chatId, goalReceipt!, { parse_mode: "HTML", disable_notification: false }),
         );
+      } else if (emptyNotice !== undefined) {
+        // No placeholder carried the notice (turn/start dropped or the
+        // placeholder send failed): still refuse to end in silence (#33).
+        void safeWrap("openclaw-empty-response", () => host.send(chatId, emptyNotice, { parse_mode: "HTML" }));
       }
       return;
     }

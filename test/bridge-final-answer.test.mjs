@@ -313,3 +313,75 @@ test('events for an unbound agent are logged as dropped with a per-agent summary
     assert.match(logs[1], /2 total dropped/);
   });
 });
+
+// ---- issue #37: classified, user-readable upstream failures ----
+
+test('formatTurnFailure classifies opaque 429 literals as a transient rate limit (#37)', async () => {
+  const { formatTurnFailure } = await import('../dist/harness/bridge.js');
+  const text = formatTurnFailure('429 status code (no body)');
+  assert.ok(text.startsWith('\u23F3'), 'rate-limited tone, not a hard ❌');
+  assert.ok(text.includes('Rate limited'), 'says what happened');
+  assert.equal(text.includes('no body'), false, 'the opaque SDK literal is dropped');
+});
+
+test('formatTurnFailure keeps informative rate-limit details alongside the tone (#37)', async () => {
+  const { formatTurnFailure } = await import('../dist/harness/bridge.js');
+  const text = formatTurnFailure('429 You exceeded your current quota, please check your plan');
+  assert.ok(text.startsWith('\u23F3'));
+  assert.ok(text.includes('quota'), 'the provider detail survives');
+});
+
+test('formatTurnFailure classifies 5xx as provider-side trouble (#37)', async () => {
+  const { formatTurnFailure } = await import('../dist/harness/bridge.js');
+  const text = formatTurnFailure('500 status code (no body)');
+  assert.ok(text.startsWith('\u26A0\uFE0F'), 'server-error tone');
+  assert.ok(text.includes('temporarily unavailable'));
+  assert.equal(text.includes('no body'), false);
+});
+
+test('formatTurnFailure keeps verbatim escaped text for unknown failures (#37)', async () => {
+  const { formatTurnFailure } = await import('../dist/harness/bridge.js');
+  const text = formatTurnFailure('boom <fail>');
+  assert.ok(text.startsWith('\u274C'));
+  assert.ok(text.includes('boom &lt;fail&gt;'));
+});
+
+test('a 429 turn error surfaces the rate-limit tone in the chat (#37)', async () => {
+  const transport = makeTransport();
+  const { ctx } = makeBridge(transport);
+  const { Bridge } = await import('../dist/harness/bridge.js');
+  const bridge = new Bridge({
+    ctx,
+    transport,
+    getConfig: () => ({ inbound: { rules: [], defaultMode: 'auto-handle' }, outbound: { parseMode: 'HTML' } }),
+    onStateChange: () => {},
+    log: () => {},
+  });
+  bridge.attach();
+  bridge.bindAgent(7, 'agent-1');
+  ctx.emit('session/event', { id: 'agent-1' }, turnEnd({ kind: 'error', error: { message: '429 status code (no body)' } }));
+  await sleep(10);
+  assert.equal(transport.sent.length, 1);
+  assert.ok(transport.sent[0].text.startsWith('\u23F3'), 'rate limit reads as transient, not a crash');
+  assert.equal(transport.sent[0].text.includes('429 status code (no body)'), false, 'the opaque literal never reaches the user');
+});
+
+test('a 5xx turn error surfaces the provider-error tone in the chat (#37)', async () => {
+  const transport = makeTransport();
+  const { ctx } = makeBridge(transport);
+  const { Bridge } = await import('../dist/harness/bridge.js');
+  const bridge = new Bridge({
+    ctx,
+    transport,
+    getConfig: () => ({ inbound: { rules: [], defaultMode: 'auto-handle' }, outbound: { parseMode: 'HTML' } }),
+    onStateChange: () => {},
+    log: () => {},
+  });
+  bridge.attach();
+  bridge.bindAgent(7, 'agent-1');
+  ctx.emit('session/event', { id: 'agent-1' }, turnEnd({ kind: 'error', error: { message: '503 Service Unavailable' } }));
+  await sleep(10);
+  assert.equal(transport.sent.length, 1);
+  assert.ok(transport.sent[0].text.startsWith('\u26A0\uFE0F'), '5xx reads as provider-side breakage');
+  assert.ok(transport.sent[0].text.includes('503 Service Unavailable'), 'the provider detail survives');
+});

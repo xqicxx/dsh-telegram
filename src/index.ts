@@ -33,6 +33,7 @@ import {
   type SessionDetail,
   searchSessions,
   readHistory,
+  readTrajectory,
   renameSession,
   forkSession,
   resumeSession,
@@ -137,6 +138,7 @@ import { TokenRegistry } from "./telegram/tokens.js";
 import { attachRouter } from "./telegram/router.js";
 import { StatusPanel } from "./telegram/status-panel.js";
 import { TelegramTransport } from "./telegram/transport.js";
+import { renderTrajectoryLines } from "./telegram/trajectory.js";
 import { findWorkspaceRoot } from "./workspace.js";
 
 export const name = "dsh-telegram";
@@ -1127,19 +1129,15 @@ async function openSessionDetailCard(chatId: number, sessionId: string): Promise
 }
 
 async function openHistoryCard(chatId: number, sessionId: string, beforeSeq?: number): Promise<void> {
-  const items = await cardLoad(chatId, "session history", () => readHistory(requireCtx(), sessionId, 21, beforeSeq));
-  if (items === undefined) return;
-  const hasMore = items.length > 20;
-  const visible = items.slice(0, 20);
-  const olderBefore = hasMore ? visible[0]?.seq : undefined;
-  const lines = [`\u{1F4DC} History \u00B7 ${plain(truncate(sessionId, 32))} (${visible.length}${hasMore ? "+" : ""})`, ""];
-  for (const item of visible) {
-    lines.push(`[${item.seq}] ${item.role === "user" ? "\u{1F464}" : item.role === "assistant" ? "\u{1F916}" : "\u2699\uFE0F"} ${plain(truncate(item.text, 120))}`);
-  }
-  if (visible.length === 0) lines.push("(no events)");
-  await openCard(chatId, lines.join("\n"), buildHistoryKeyboard(
+  // Turn-grouped trajectory view (issue #32), matching the web's 轨迹 ledger:
+  // per-turn model/outcome/duration header plus user/thinking/tool/answer steps.
+  const result = await cardLoad(chatId, "session history", () => readTrajectory(requireCtx(), sessionId, 6, beforeSeq));
+  if (result === undefined) return;
+  await openCard(chatId, renderTrajectoryLines(sessionId, result).join("\n"), buildHistoryKeyboard(
     sessionId,
-    olderBefore === undefined ? undefined : token({ action: "history-older", sessionId, beforeSeq: String(olderBefore) }),
+    result.hasMore && result.nextBefore !== undefined
+      ? token({ action: "history-older", sessionId, beforeSeq: String(result.nextBefore) })
+      : undefined,
   ));
 }
 
@@ -2606,7 +2604,7 @@ const TELEGRAM_COMMANDS = [
   { command: "queue", description: "Inspect or edit the agent inbox" },
   { command: "todo", description: "Show the current session todo list" },
   { command: "sessions", description: "Sessions list" },
-  { command: "history", description: "Read session history" },
+  { command: "history", description: "Session trajectory (turn-grouped)" },
   { command: "rename", description: "Rename the current session" },
   { command: "fork", description: "Fork the current session" },
   { command: "use", description: "Switch to a session" },
@@ -2737,7 +2735,7 @@ async function dispatchCommand(chatId: number, command: string, args: string, me
         [
           "Commands:",
           "/new /compact /abort /stop /models /sessions /workspaces /project [path] /goals /skills /subagents /presets /plugins /hostsettings /credentials /host /jobs /status /menu",
-          "/history [sessionId] [limit] \u00B7 /rename <title> \u00B7 /fork [atSeq] \u00B7 /use <sessionId> \u00B7 /archive <sessionId>",
+          "/history [sessionId] [turns] 轨迹 \u00B7 /rename <title> \u00B7 /fork [atSeq] \u00B7 /use <sessionId> \u00B7 /archive <sessionId>",
           "/queue \u00B7 /todo \u00B7 /steer <text> \u00B7 /cancel",
           "/goalcreate <objective> [maxRounds] \u00B7 /goaledit <text>",
           "/workspacecreate <path> [title] \u00B7 /workspacepin <workspaceId> <sessionId> [beforeSessionId]",
@@ -2937,10 +2935,11 @@ async function dispatchCommand(chatId: number, command: string, args: string, me
         await send("No session id given and none bound.");
         return;
       }
-      const items = await readHistory(ctx, sessionId, Number(limitText) || 20);
-      const lines = [`\u{1F4DC} ${plain(truncate(sessionId, 24))}`, ""];
-      for (const item of items) lines.push(`[${item.seq}] ${item.role} ${plain(truncate(item.text, 120))}`);
-      await send(lines.join("\n"));
+      // Structured trajectory view (issue #32): turn-grouped like the web's
+      // 轨迹 ledger. The optional second arg caps how many turns are shown.
+      const maxTurns = Math.max(1, Math.min(20, Number(limitText) || 6));
+      const result = await readTrajectory(ctx, sessionId, maxTurns);
+      await send(renderTrajectoryLines(sessionId, result).join("\n"));
       return;
     }
     case "search": {

@@ -40,6 +40,40 @@
 2. 审计剩余 🟡 收敛（history tool view、settings 边界等）。
 3. 实机通过后决定 tag/publish。
 
+## Round 32 任务计划（修复 open issues #31-#35, #37-#44）
+
+> 2026-08-20 open issues 全景：
+> - 本仓库 bug：#31 CJK 表格错位、#33 空回复静默、#37 429 错误呈现
+> - 本仓库 enhancement：#32 /history 轨迹视图
+> - 上游（dsh rc.7->rc.8 升级可解）：#38-#44（rc.8 已修，dsh-telegram pin rc.7）+
+>   #37 的 retry 半边（rc.8 llm-retry 默认 5 次退避重试）
+> - 上游（rc.8 也没修，pi-ai 需变更）：#34 Dots AI api-key 认证头、#35 MODALITIES
+>   video/audio——属 deepseek-ai/deepseek-harness / pi-ai 范围，按 #29 先例关闭并说明
+
+### 步骤
+1. [x] #31 markdown.ts：cellDisplayWidth（CJK=2/emoji=2/零宽=0，Intl.Segmenter
+   grapheme 切分）+ padCellEnd；renderTableBlock 用显示宽度（顺带修 escapeHtml
+   长度混算的旧错位）；列最小宽 3。
+2. [x] #33 openclaw.ts：turn/end 无 summary 时区分——error（core 已发 ❌ 新消息，
+   占位符删除可接受）vs 空成功（占位符编辑成 `🤷 Empty response` 而非删除；
+   无占位符则发新消息；pendingInbound 时替换误导性 NO_REPLY_REMINDER 并
+   markInboundReplied）。
+3. [x] #37 bridge.ts：formatTurnFailure 分类（429/限流->⏳、5xx->⚠️、其余 ❌ +
+   原文）；openclaw 错误路径复用；retry 部分由 rc.8 升级解决。
+4. [x] #32 sessions.ts readTrajectory（turn 分组 + request/header 模型行 +
+   outcome + 时长）+ 新 src/telegram/trajectory.ts 渲染 + index.ts /history 与
+   History 卡接线 + nextBefore 分页（turn 编号跨页稳定，Prelude 不占号）。
+5. [x] rc.8 升级：peer ^0.1.0-rc.8 + devDep 精确 0.1.0-rc.8，typecheck + 全量测试
+   （同时关闭 #45/#46，同为 rc.8 已修上游项）。
+6. [x] 文档：CHANGELOG / README(.zh) / TESTING §70 / 命令描述。
+7. [ ] `npm run check` 全绿 + `npm pack --dry-run`；commit + push；
+   关闭 #31-#33/#37（本仓库修复）、#38-#46（rc.8 升级）、#34/#35（上游范围）。
+
+### 约束
+- #15/#23/#24 编辑风暴防线不回退：占位符编辑仍走 editMessage，失败不重发新占位。
+- #21 回执单行 5 metrics 不变；空回复通知是新形态，不混入回指标。
+- 测试不依赖真实 Telegram；rc.8 升级不改运行时行为面（纯依赖版本）。
+
 ## 错误记录
 
 | 错误 | 尝试 | 处理 |

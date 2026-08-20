@@ -1556,3 +1556,83 @@ Telegram 却只显示项目基名/id。根因：真实 `SessionPersistence.readR
 
 - 新增/更新：markdown（3）、interactive（4）、config（1），其余全量回归。
 - `npm run check`：**356/356 pass**；`npm pack --dry-run`：149 files。
+
+## 70. 修复 open issues #31-#35, #37-#46（2026-08-20，379/379）
+
+### #31 CJK 表格错位
+
+- 根因：`cell.length` 是 UTF-16 code unit 数；CJK 字符在 Telegram 等宽字体
+  渲染约 2 列，按 code unit  padding 必然错位；且对 escapeHtml 后的字符串
+  量长会把 `&amp;` 等实体算成 5 个字符（渲染只占 1 列）。
+- 修复：`cellDisplayWidth`（CJK/全宽/emoji=2 列、零宽=0，`Intl.Segmenter`
+  grapheme 切分，无 Segmenter 时退化 code-point 迭代）；`renderTableBlock`
+  对 RAW cell 量显示宽、escape 后再补空格；列最小宽 3；模型自由发挥的过
+  长 separator 行不再撑大列宽。
+- 回归：`test/markdown.test.mjs` 新增 6 例（宽度测量、CJK/Latin 混排对齐、
+  可转义字符对齐、最小列宽、emoji 宽度、separator 不撑列）。
+
+### #32 /history 轨迹视图
+
+- `readTrajectory`（sessions adapter）：事件按 `turn/start..turn/end` 分
+  组（首个 anchor 之前的事件归入 Prelude）；每 turn 取 `request/header`
+  的 `provider/model` 模型行与 changes、`turn/end` 的 outcome（error 带
+  消息截断）与起止时长；步骤含 👤 user / 🧠 reasoning / 🤖 assistant /
+  🔧 tool-call（名称+参数截断）/ 📥 tool-result。分页：每窗 6 turn，
+  `hasMore`+`nextBefore` 向更老翻页；turn 编号跨页稳定（Prelude 不占号）。
+- `renderTrajectoryLines`（新 `src/telegram/trajectory.ts`）：纯函数渲染
+  HTML 行，全部 escape；超 8 步折叠为 `… N more step(s)`；running turn
+  显示 ⏳。
+- 接线：History 卡（`openHistoryCard`）与 `/history [id] [turns]` 均改
+  为轨迹视图；`Load older` 按 `nextBefore` 翻页；命令描述同步
+  「Session trajectory (turn-grouped)」。
+- 回归：新 `test/trajectory.test.mjs` 6 例（分组/模型/结局/时长、分页
+  hasMore/nextBefore、未知 session 空态、渲染 escape 与图标、折叠与
+  running/error 标记、空事件）。
+
+### #33 空回复静默
+
+- 根因：turn 成功但零可见输出（无 reasoning/工具/正文）时 openclaw 把
+  占位符 deleteMessage 删掉，聊天陷入静默；pendingInbound 还会补一条误导
+  性的工具形 NO_REPLY_REMINDER。
+- 修复：区分 error（core 桥已发分类失败消息，占位符删除可接受）与空成功
+  ——占位符原地编辑成 `🤷 Empty response · ⏱️ Ns`（编辑失败降级新发；
+  无占位符直接新发）；pendingInbound 用该通知 `markInboundReplied`，不
+  再叠加工具提醒；turn/start 丢失（无 draft）时也同样发通知。
+- 回归：`test/openclaw.test.mjs` 新增 2 例（占位符编辑成通知而非删除；
+  inbound 由通知满足、不发工具提醒）。
+
+### #37 429 错误呈现
+
+- `formatTurnFailure`（bridge）：分类语气——429/RATE_LIMIT/quota →
+  `⏳ Rate limited…`；5xx/SERVER/网关类 → `⚠️ Upstream provider error…`；
+  其余原文 ❌ + escape。OpenAI SDK 无信息字面量
+  `429 status code (no body)` 不原文展示，有信息 detail 以 `·` 随行。
+- openclaw turn/end error 路径复用同一分类（core 桥发送，openclaw 只抑制
+  成功回执）。
+- retry 半边由 rc.8 升级解决（见下 #39）。
+- 回归：`test/bridge-final-answer.test.mjs` 新增 6 例（四类分类纯函数 +
+  429/5xx 端到端落聊天语气）。
+
+### #38-#44, #45, #46 dsh 0.1.0-rc.8 升级
+
+- package.json：6 个 `@deepseek-ai/dsh-*` devDep 精确 pin `0.1.0-rc.8`，
+  peerDep 范围 `^0.1.0-rc.8`；`npm install`（独立 cache）后全部 rc.8。
+- rc.8 上游修复随之落地：deepseek reasoning_content 回传（#38）、默认
+  5 次退避重试 429/5xx/TIMEOUT/TRANSPORT/EMPTY_RESPONSE（#39，即 #37 的
+  retry 半边）、pi-ai wire-compat profile surface（#40）、pi-ai 图片
+  payload 上限+最旧卸载（#41）、deepseek 多模态（#42）、plan-mode 纯图
+  片计划请求（#43）、agent-loop finalize 已送达前缀取消（#44）、slash
+  command 路由图片附件（#45）、attachment admission 拒绝过大图片（#46）。
+- rc.7→rc.8 类型面兼容：typecheck 0 error，全套测试在 rc.8 下通过。
+
+### #34/#35 上游范围（按 #29 先例关闭）
+
+- #34 Dots AI `api-key` 认证头、#35 MODALITIES video/audio 输入：需
+  `deepseek-ai/deepseek-harness` / `pi-ai` 本体变更（rc.8 也未覆盖），
+  不属本仓库范围，按 #29 先例关闭并说明。
+
+### 测试记录
+
+- 新增：trajectory 6 例；markdown +6（#31）、openclaw +2（#33）、
+  bridge-final-answer +6（#37）。
+- `npm run check`：**379/379 pass**（rc.8 依赖下）。

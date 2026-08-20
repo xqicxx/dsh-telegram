@@ -515,7 +515,7 @@ export interface HistoryItem {
   text: string;
 }
 
-/** session.history: read a window of events from a live or persisted session. */
+/** session.history: read a flat window of events (legacy; prefer readTrajectory). */
 export async function readHistory(ctx: Context, sessionId: string, limit = 20, beforeSeq?: number): Promise<HistoryItem[]> {
   let events: readonly SessionEventLike[] | undefined;
   let live = true;
@@ -543,6 +543,148 @@ export async function readHistory(ctx: Context, sessionId: string, limit = 20, b
     out.push({ seq: event.seq, type: event.type, role, text: text.slice(0, 400) });
   }
   return out;
+}
+
+export interface TrajectoryStep {
+  seq: number;
+  kind: "user" | "assistant" | "reasoning" | "tool-call" | "tool-result";
+  text: string;
+}
+
+export interface TrajectoryTurn {
+  startSeq: number;
+  endSeq?: number;
+  index: number;
+  seconds?: number;
+  outcome?: string;
+  model?: string;
+  changes?: string;
+  steps: TrajectoryStep[];
+}
+
+export interface TrajectoryResult {
+  turns: TrajectoryTurn[];
+  hasMore: boolean;
+  nextBefore?: number;
+}
+
+/** session.trajectory: turn-grouped structured view (issue #32). */
+export async function readTrajectory(
+  ctx: Context,
+  sessionId: string,
+  maxTurns = 6,
+  beforeSeq?: number,
+): Promise<TrajectoryResult> {
+  let events: readonly SessionEventLike[] | undefined;
+  const session = sessionById(ctx, sessionId);
+  if (session) {
+    events = session.events;
+  } else {
+    const persistence = persistenceOf(ctx);
+    if (!persistence) return { turns: [], hasMore: false };
+    const raw = await persistence.readRaw(SessionId(sessionId)).catch(() => undefined);
+    events = raw?.events ?? [];
+  }
+  if (events.length === 0) return { turns: [], hasMore: false };
+
+  // Build turns: one turn spans turn/start .. turn/end. Events before the
+  // first turn/start form a headless "prelude" turn.
+  const rawTurns: { start: number; end: number; startSeq: number; endSeq?: number; headless: boolean }[] = [];
+  let openStart: number | undefined;
+  for (let i = 0; i < events.length; i += 1) {
+    if (events[i]!.type === "turn/start") {
+      if (openStart !== undefined) rawTurns.push({ start: openStart, end: i, startSeq: events[openStart]!.seq, endSeq: undefined, headless: false });
+      openStart = i;
+    } else if (events[i]!.type === "turn/end") {
+      if (openStart !== undefined) {
+        rawTurns.push({ start: openStart, end: i + 1, startSeq: events[openStart]!.seq, endSeq: events[i]!.seq, headless: false });
+        openStart = undefined;
+      }
+    }
+  }
+  if (openStart !== undefined) rawTurns.push({ start: openStart, end: events.length, startSeq: events[openStart]!.seq, endSeq: undefined, headless: false });
+
+  // Prelude: events before the first turn/start or turn/end.
+  const firstAnchor = rawTurns.length > 0 ? rawTurns[0]!.start : events.length;
+  if (firstAnchor > 0) {
+    rawTurns.unshift({ start: 0, end: firstAnchor, startSeq: events[0]!.seq, endSeq: undefined, headless: true });
+  }
+
+  // Paging: take the last `maxTurns` turns whose startSeq < beforeSeq.
+  if (beforeSeq !== undefined) {
+    const cutoff = rawTurns.findIndex((t) => t.startSeq >= beforeSeq);
+    if (cutoff !== -1) rawTurns.splice(cutoff);
+  }
+  const hasMore = rawTurns.length > maxTurns;
+  const page = hasMore ? rawTurns.slice(rawTurns.length - maxTurns) : rawTurns;
+  const nextBefore = page.length > 0 ? page[0]!.startSeq : undefined;
+
+  // Build TrajectoryTurn objects. Turn numbers count real turns only (the
+  // headless prelude is not Turn 1) and stay stable across paged windows.
+  const turns: TrajectoryTurn[] = [];
+  const offset = rawTurns.length - page.length;
+  const headlessBefore = offset > 0 && rawTurns[0]?.headless === true ? 1 : 0;
+  let turnIndex = offset - headlessBefore;
+  for (const raw of page) {
+    if (!raw.headless) turnIndex += 1;
+    const steps: TrajectoryStep[] = [];
+    let model: string | undefined;
+    let changes: string | undefined;
+    let outcome: string | undefined;
+    let seconds: number | undefined;
+    const startAt = events[raw.start]?.at;
+    const endAt = raw.endSeq !== undefined ? events.find((e) => e.seq === raw.endSeq)?.at : undefined;
+    if (startAt !== undefined && endAt !== undefined) seconds = Math.round((endAt - startAt) / 1000);
+
+    for (let i = raw.start; i < raw.end; i += 1) {
+      const event = events[i]!;
+      if (event.type === "request/header") {
+        const header = (event.data as { header?: { config?: { provider?: string; model?: string } } } | undefined)?.header;
+        model = header?.config?.provider !== undefined && header.config.model !== undefined
+          ? `${header.config.provider}/${header.config.model}`
+          : undefined;
+        changes = (event.data as { reason?: string } | undefined)?.reason ?? changes;
+      } else if (event.type === "turn/end") {
+        const reason = (event.data as { reason?: { kind?: string; error?: { message?: string } } } | undefined)?.reason;
+        if (reason?.kind === "error") {
+          outcome = `error: ${reason.error?.message?.slice(0, 50) ?? "unknown"}`;
+        } else {
+          outcome = reason?.kind ?? "completed";
+        }
+      } else if (event.type === "user/message") {
+        const text = textOfContent((event.data as { content?: unknown } | undefined)?.content);
+        if (text) steps.push({ seq: event.seq, kind: "user", text: text.slice(0, 200) });
+      } else if (event.type === "assistant/message") {
+        const content = (event.data as { message?: { content?: readonly { type?: string; text?: string }[] } } | undefined)?.message?.content;
+        if (Array.isArray(content)) {
+          for (const block of content) {
+            if (block.type === "reasoning" && block.text) {
+              steps.push({ seq: event.seq, kind: "reasoning", text: block.text.slice(0, 200) });
+            } else if (block.type === "text" && block.text) {
+              steps.push({ seq: event.seq, kind: "assistant", text: block.text.slice(0, 200) });
+            }
+          }
+        }
+      } else if (event.type === "tool/call") {
+        const data = event.data as { name?: unknown; arguments?: unknown; args?: unknown } | undefined;
+        const name = typeof data?.name === "string" && data.name !== "" ? data.name : "tool";
+        const raw = data?.arguments ?? data?.args;
+        let detail = "";
+        if (typeof raw === "string" && raw.trim() !== "") detail = ` ${raw.trim().slice(0, 80)}`;
+        else if (raw !== undefined) detail = ` ${JSON.stringify(raw).slice(0, 80)}`;
+        steps.push({ seq: event.seq, kind: "tool-call", text: `${name}${detail}` });
+      } else if (event.type === "tool/result") {
+        const text = String((event.data as { output?: unknown } | undefined)?.output ?? "");
+        if (text.trim()) steps.push({ seq: event.seq, kind: "tool-result", text: text.trim().slice(0, 120) });
+      }
+    }
+    if (raw.headless) {
+      turns.push({ startSeq: raw.startSeq, endSeq: raw.endSeq, index: 0, steps });
+    } else {
+      turns.push({ startSeq: raw.startSeq, endSeq: raw.endSeq, index: turnIndex, seconds, outcome, model, changes, steps });
+    }
+  }
+  return { turns, hasMore, nextBefore };
 }
 
 /** session.rename over ctx.sessionTitle (the web's exact seam). */

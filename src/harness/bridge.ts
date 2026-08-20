@@ -28,6 +28,40 @@ function withReasoningDirective(config: TelegramConfig, text: string): string {
   return `${directive}\n\n${text}`;
 }
 
+/** The OpenAI SDK's no-body fallback literal (`"429 status code (no body)"`)
+ * carries no information beyond its status; showing it verbatim reads as an
+ * opaque crash (issue #37). */
+const OPAQUE_STATUS_LITERAL = /^\d{3} status code \(no body\)$/;
+
+/** User-facing rendering of one turn failure (issue #37): classify the tone
+ * instead of forwarding the provider literal - a 429 is transient (the user
+ * should wait), a 5xx is provider-side breakage, anything else stays verbatim.
+ * Returns Telegram HTML. */
+export function formatTurnFailure(failure: string): string {
+  const raw = failure.trim();
+  if (raw === "") return "";
+  const detail = OPAQUE_STATUS_LITERAL.test(raw)
+    ? ""
+    : ` \u00B7 ${markdownToHtml(raw.slice(0, 400))}`;
+  const rateLimited =
+    /\b429\b/.test(raw) ||
+    /\bRATE_LIMIT\b/.test(raw) ||
+    /rate[ -]?limit/i.test(raw) ||
+    /too many requests/i.test(raw) ||
+    /\bquota\b/i.test(raw);
+  if (rateLimited) {
+    return `\u23F3 Rate limited by the upstream provider - wait a moment and try again.${detail}`;
+  }
+  const serverError =
+    /\b5\d\d\b/.test(raw) ||
+    /\bSERVER\b/.test(raw) ||
+    /internal server error|service unavailable|bad gateway|gateway timeout|server error/i.test(raw);
+  if (serverError) {
+    return `\u26A0\uFE0F Upstream provider error - the provider may be temporarily unavailable, try again shortly.${detail}`;
+  }
+  return `\u274C ${markdownToHtml(raw.slice(0, 900))}`;
+}
+
 export interface BridgeOptions {
   ctx: Context;
   transport: TelegramTransport;
@@ -461,11 +495,12 @@ export class Bridge {
           if (failure !== undefined && failure.trim() !== "" && unanswered) {
             // Autonomous turns (a /goal turn, for example) have no inbound
             // message, but their LLM/infra failure still has to reach the
-            // chat instead of leaving the user staring at silence.
+            // chat instead of leaving the user staring at silence. The tone
+            // is classified (429 vs 5xx vs verbatim) per issue #37.
             if (inbound !== undefined) inbound.replied = true;
             if (state) state.reminded = true;
             void this.transport
-              .sendText(chatId, `\u274C ${markdownToHtml(failure.slice(0, 900))}`, {
+              .sendText(chatId, formatTurnFailure(failure), {
                 parse_mode: "HTML",
                 ...this.replyParametersFor(chatId),
               })

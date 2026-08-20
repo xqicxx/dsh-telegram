@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { markdownTablePreBlock, markdownToHtml } from '../dist/telegram/markdown.js';
+import { cellDisplayWidth, markdownTablePreBlock, markdownToHtml } from '../dist/telegram/markdown.js';
 import { splitText } from '../dist/telegram/html.js';
 
 test('markdownToHtml renders the issue example without literal markers', () => {
@@ -155,4 +155,68 @@ test('deeply nested inline markup degrades instead of overflowing the stack', ()
   const html = markdownToHtml(nested);
   assert.ok(html.includes('deep'), 'deep content survives as escaped text once the depth guard trips');
   assert.doesNotThrow(() => markdownToHtml(`${'['.repeat(500)}deep`));
+});
+
+// ---- issue #31: CJK-aware display width for table columns ----
+
+/** Rendered column widths of a markdown table: split each row line back into
+ * cells (stripping only the single ` | ` delimiter spaces, so alignment
+ * padding survives) and measure with the same display-width rule the
+ * renderer used. */
+function renderedColumnWidths(markdown) {
+  const html = markdownToHtml(markdown);
+  const block = /<pre><code>([\s\S]*?)<\/code><\/pre>/.exec(html)?.[1] ?? '';
+  const rows = block.split('\n').map((line) => line.replace(/^\|/, '').replace(/\|$/, '').split('|').map((cell) => cell.replace(/^ /, '').replace(/ $/, '')));
+  return rows.map((row) => row.map((cell) => cellDisplayWidth(cell)));
+}
+test('cellDisplayWidth measures CJK as two columns and Latin as one (#31)', () => {
+  assert.equal(cellDisplayWidth('文件'), 4);
+  assert.equal(cellDisplayWidth('20,064 B'), 8);
+  assert.equal(cellDisplayWidth('主交付物'), 8);
+  assert.equal(cellDisplayWidth('📌'), 2);
+  assert.equal(cellDisplayWidth('e\u0301'), 1, 'combining mark adds no width');
+  assert.equal(cellDisplayWidth('a&b'), 3, 'raw width: entities render one glyph');
+  assert.equal(cellDisplayWidth(''), 0);
+});
+
+test('CJK and Latin cells in one column align by display width (#31)', () => {
+  const markdown = [
+    '| 文件 | 大小 | 说明 |',
+    '|---|---|---|',
+    '| result.xlsx | 20,064 B | 主交付物 |',
+    '| data.csv | 5,039 B | CSV 备份 |',
+  ].join('\n');
+  const widths = renderedColumnWidths(markdown);
+  assert.equal(widths.length, 4);
+  for (const row of widths) {
+    assert.deepEqual(row, widths[0], 'every row renders identical column widths');
+  }
+  assert.deepEqual(widths[0], [11, 8, 8], `columns sized to the widest cell, got ${JSON.stringify(widths[0])}`);
+});
+
+test('cells containing HTML-escapable characters still align (#31)', () => {
+  const markdown = ['| a&b | x |', '|---|---|', '| abcdef | y |'].join('\n');
+  const html = markdownToHtml(markdown);
+  const rows = (/<pre><code>([\s\S]*?)<\/code><\/pre>/.exec(html)?.[1] ?? '').split('\n');
+  // The escaped entity `&amp;` renders as one glyph, so the rendered widths
+  // must match: `a&b` padded like a 3-wide cell next to 6-wide `abcdef`.
+  assert.ok(rows[0].includes('a&amp;b   '), `header cell padded by raw width: ${JSON.stringify(rows[0])}`);
+  assert.ok(rows[2].includes('abcdef'), 'body cell unpadded');
+  assert.equal((rows[0].match(/ /g) ?? []).length >= 3, true);
+});
+
+test('narrow columns keep a minimum width of three (#31)', () => {
+  const html = markdownToHtml(['| a | b |', '|---|---|', '| 1 | 2 |'].join('\n'));
+  assert.match(html, /\| --- \| --- \|/, 'separator is at least three dashes');
+});
+
+test('emoji cells measure two columns wide (#31)', () => {
+  const markdown = ['| 📌① | n |', '|---|---|', '| ab | y |'].join('\n');
+  const widths = renderedColumnWidths(markdown);
+  for (const row of widths) assert.equal(row[0], 3, `emoji column aligned at 3, got ${JSON.stringify(row)}`);
+});
+
+test('a long model-styled separator does not inflate column width (#31)', () => {
+  const html = markdownToHtml(['| a | b |', '|-----------|-----------|', '| 1 | 2 |'].join('\n'));
+  assert.match(html, /\| --- \| --- \|/, 'separator reflects data width, not its own dashes');
 });

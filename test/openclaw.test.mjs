@@ -257,15 +257,16 @@ test('tool result with isError marks the line failed', async () => {
   assert.ok(streamEdit.text.includes('\u2713') === false);
 });
 
-test('empty turn sends an immediate placeholder, then cleans it up (#12)', async () => {
+test('empty turn finalizes the placeholder into an empty-response notice instead of silence (#33)', async () => {
   const { host, ctx } = await setup();
   ctx.emit('agent-1', ev('turn/start', { turn: 1 }));
   assert.equal(host.sends.length, 1, 'feedback starts with turn/start, not the first stream event');
   ctx.emit('agent-1', ev('turn/end', { turn: 1, reason: { kind: 'completed' } }));
   await sleep(20);
-  assert.equal(host.sends.length, 1);
-  assert.equal(host.edits.length, 0);
-  assert.equal(host.deletes.length, 1);
+  assert.equal(host.sends.length, 1, 'no extra message on top of the placeholder');
+  assert.equal(host.edits.length, 1);
+  assert.match(host.edits[0].text, /^\u{1F937} Empty response \u00B7 \u23F1\uFE0F \d+s$/u);
+  assert.equal(host.deletes.length, 0, 'the placeholder is not deleted into silence');
 });
 
 test('telegram_reply tool detail shows the message body, not the JSON wrapper', async () => {
@@ -334,15 +335,19 @@ test('openclaw final answers are normalized from Markdown to Telegram HTML', asy
   assert.equal(answer.text, '<b>bold</b> and <i>italic</i>');
 });
 
-test('turn end sends the openclaw-mode reminder when nothing answered', async () => {
+test('turn end satisfies the inbound with the empty notice, not the tool reminder (#33)', async () => {
   const { host, ctx } = await setup();
   host.inboundPending = true;
   ctx.emit('agent-1', ev('turn/start', { turn: 1 }));
   ctx.emit('agent-1', ev('turn/end', { turn: 1, reason: { kind: 'completed' } }));
   await sleep(20);
-  const reminder = host.sends.find((s) => s.text.includes('The turn ended without a telegram_reply'));
-  assert.ok(reminder, 'plugin owns the reminder while mounted');
-  assert.equal(host.inboundRepliedMarks, 1);
+  assert.equal(host.edits.length, 1, 'placeholder carries the empty-response notice');
+  assert.match(host.edits[0].text, /^\u{1F937} Empty response/u);
+  assert.ok(
+    host.sends.every((s) => !s.text.includes('The turn ended without a telegram_reply')),
+    'the tool-shaped reminder is not stacked on a zero-output turn',
+  );
+  assert.equal(host.inboundRepliedMarks, 1, 'the notice satisfies the inbound');
 });
 
 test('turn end skips delivery when a tool reply already answered the inbound', async () => {
@@ -545,4 +550,65 @@ test('reasoning table snapshots render as aligned monospace blocks (#26)', async
   assert.equal(streamEdit.text.includes('<i>'), false, 'table reasoning is not emitted as an italic pipe soup');
   ctx.emit('agent-1', ev('turn/end', { turn: 1, reason: { kind: 'completed' } }));
   await sleep(20);
+});
+
+// ---- issue #33: no silent chat on empty LLM responses ----
+
+test('an empty turn without a draft still delivers the notice as a fresh message (#33)', async () => {
+  const { host, ctx } = await setup();
+  // turn/start was dropped: no draft, no placeholder.
+  ctx.emit('agent-1', ev('turn/end', { turn: 1, reason: { kind: 'completed' } }));
+  await sleep(20);
+  const notice = host.sends.find((s) => s.text.includes('Empty response'));
+  assert.ok(notice, 'a fresh empty-response notice is sent');
+  assert.equal(notice.options.parse_mode, 'HTML');
+  assert.equal(host.deletes.length, 0);
+});
+
+test('an empty turn with a pending inbound but no draft sends the notice instead of the reminder (#33)', async () => {
+  const { host, ctx } = await setup();
+  host.inboundPending = true;
+  ctx.emit('agent-1', ev('turn/end', { turn: 1, reason: { kind: 'completed' } }));
+  await sleep(20);
+  const notice = host.sends.find((s) => s.text.includes('Empty response'));
+  assert.ok(notice, 'the notice replaces the misleading telegram_reply reminder');
+  assert.ok(host.sends.every((s) => !s.text.includes('The turn ended without a telegram_reply')));
+  assert.equal(host.inboundRepliedMarks, 1);
+  assert.deepEqual(notice.options.reply_parameters, { message_id: 99 }, 'the notice quotes the inbound');
+});
+
+test('a failed notice edit falls back to a fresh send instead of silence (#33)', async () => {
+  const { host, ctx } = await setup();
+  host.editMessage = async (chatId, messageId, text, options) => {
+    host.edits.push({ chatId, messageId, text, options });
+    return false;
+  };
+  ctx.emit('agent-1', ev('turn/start', { turn: 1 }));
+  ctx.emit('agent-1', ev('turn/end', { turn: 1, reason: { kind: 'completed' } }));
+  await sleep(20);
+  assert.equal(host.edits.length, 1, 'the placeholder edit was attempted');
+  const fresh = host.sends.find((s) => s.text.includes('Empty response'));
+  assert.ok(fresh, 'the notice is re-sent when the edit fails');
+});
+
+test('an errored turn keeps the core failure path: placeholder is removed, no notice (#33, #37)', async () => {
+  const { host, ctx } = await setup();
+  ctx.emit('agent-1', ev('turn/start', { turn: 1 }));
+  ctx.emit('agent-1', ev('turn/end', { turn: 1, reason: { kind: 'error', error: { message: '429 status code (no body)' } } }));
+  await sleep(20);
+  assert.equal(host.deletes.length, 1, 'the placeholder is cleaned up; the core bridge owns the error message');
+  assert.ok(host.sends.every((s) => !s.text.includes('Empty response')), 'no empty notice on an errored turn');
+  assert.ok(host.edits.every((e) => !e.text.includes('Empty response')));
+});
+
+test('a turn with tool calls but no answer still sends the openclaw reminder (#33)', async () => {
+  const { host, ctx } = await setup();
+  host.inboundPending = true;
+  ctx.emit('agent-1', ev('turn/start', { turn: 1 }));
+  ctx.emit('agent-1', ev('tool/call', { callId: 'call_x', name: 'bash', arguments: 'ls' }));
+  ctx.emit('agent-1', ev('turn/end', { turn: 1, reason: { kind: 'completed' } }));
+  await sleep(20);
+  const reminder = host.sends.find((s) => s.text.includes('The turn ended without a telegram_reply'));
+  assert.ok(reminder, 'a turn that did work but did not answer keeps the reminder');
+  assert.ok(host.edits.at(-1).text.includes('完成'), 'the summary receipt covers the placeholder');
 });
