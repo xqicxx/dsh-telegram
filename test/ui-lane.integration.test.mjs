@@ -197,6 +197,9 @@ test('typing keep-alive renews while the turn is still running after 10 minutes 
     emit(env.listeners, 'session/event', 'agent-ui', { type: 'turn/start', data: { turn: 1 } });
     await Promise.resolve();
     assert.ok(env.state.chatActions.length > 0, 'typing starts with the turn');
+    // #48: the keepalive guard now trusts the live agent's own status over
+    // the sticky turn flag, so the fixture agent must actually be running.
+    env.agent.status = 'running';
 
     t.mock.timers.tick(10 * 60_000);
     await Promise.resolve();

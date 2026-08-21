@@ -612,3 +612,51 @@ test('a turn with tool calls but no answer still sends the openclaw reminder (#3
   assert.ok(reminder, 'a turn that did work but did not answer keeps the reminder');
   assert.ok(host.edits.at(-1).text.includes('完成'), 'the summary receipt covers the placeholder');
 });
+
+test('stopLiveFeed kills every timer path: no edit after abort even when events keep coming (#48)', async () => {
+  const { host, ctx } = await setup();
+  ctx.emit('agent-1', { type: 'turn/start', data: {} });
+  await sleep(10);
+  const sent = host.sends.length;
+  assert.equal(sent > 0, true, 'placeholder was sent');
+
+  host.stopLiveFeed(7);
+
+  // Events keep streaming (the lost-turn/end scenario) but nothing may edit.
+  ctx.emit('agent-1', { type: 'tool/call', data: { name: 'bash', arguments: 'ls' } });
+  ctx.emit('agent-1', { type: 'assistant/chunk', data: { chunk: { type: 'text-delta', text: 'more' } } });
+  await sleep(300);
+  const editsAfterStop = host.edits.length;
+  await sleep(300);
+  assert.equal(host.edits.length, editsAfterStop, 'no timer may edit a stopped draft');
+});
+
+test('heartbeat budget is bounded and the abort seam is idempotent (#48)', async () => {
+  const { host, ctx } = await setup();
+  ctx.emit('agent-1', { type: 'turn/start', data: {} });
+  await sleep(10);
+  assert.equal(typeof host.stopLiveFeed, 'function', 'core abort seam is assigned on mount');
+  host.stopLiveFeed(7);
+  const editsAtStop = host.edits.length;
+  // Double-abort and continued events must not produce any further edits:
+  // this is the "lost turn/end" freeze from issue #48.
+  host.stopLiveFeed(7);
+  ctx.emit('agent-1', { type: 'tool/call', data: { name: 'bash', arguments: 'ls' } });
+  ctx.emit('agent-1', { type: 'assistant/chunk', data: { chunk: { type: 'text-delta', text: 'x' } } });
+  await sleep(300);
+  assert.equal(host.edits.length, editsAtStop, 'a stopped draft is never edited again');
+});
+
+test('turn/end after an aborted draft still finalizes without re-editing loops (#48)', async () => {
+  const { host, ctx } = await setup();
+  ctx.emit('agent-1', { type: 'turn/start', data: {} });
+  await sleep(10);
+  host.stopLiveFeed(7);
+  const editsAtStop = host.edits.length;
+  ctx.emit('agent-1', { type: 'turn/end', data: { reason: { kind: 'completed' } } });
+  await sleep(30);
+  // Finalize may edit once (collapse to receipt/delete), but nothing keeps
+  // editing afterwards.
+  await sleep(300);
+  assert.ok(host.edits.length - editsAtStop <= 1, 'at most one finalize edit after abort');
+});

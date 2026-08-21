@@ -45,6 +45,9 @@ const EDIT_RETRY_BASE_MS = 1500;
 const EDIT_RETRY_MAX_MS = 30_000;
 /** Only abandon a message after this many consecutive edit failures. */
 const MAX_EDIT_FAILURES = 5;
+/** Heartbeat budget per draft (#48): 60 beats x 30s = a 30-minute hard
+ * deadline for ONE draft, so a lost turn/end can never edit forever. */
+const MAX_HEARTBEATS = 60;
 const NO_REPLY_REMINDER = "\u231B The turn ended without a telegram_reply \u2014 use the telegram_reply tool or reply yourself.";
 /** openclaw progress-draft-status-text: strip <think>-style tags. */
 const THINKING_TAG_RE =
@@ -166,6 +169,11 @@ interface Draft {
   /** Edits attempted / succeeded for this turn (receipt hit-rate line). */
   editAttempts: number;
   editSucceeded: number;
+  /** Set by the core's Abort seam: every timer path must go dormant. */
+  stopped?: boolean;
+  /** Heartbeats fired for this draft — bounded so a lost turn/end can never
+   * edit one message forever (#48). */
+  heartbeats: number;
   sending?: Promise<number | undefined>;
   /** One fallback notice per turn when streaming delivery fails (#12). */
   fallbackSent?: boolean;
@@ -368,7 +376,17 @@ export function apply(ctx: Context, _config?: unknown): void {
   host.setAssistantConsumer((chatId, text, assistantMessageId) => {
     answers.set(chatId, { text, assistantMessageId });
   });
+  // Core Abort seam (#48): the user must never need to watch a draft being
+  // rewritten forever. Clear every timer and latch the draft dormant; the
+  // real turn/end (if it still arrives) finalizes the placeholder as usual.
+  host.stopLiveFeed = (chatId) => {
+    const draft = chats.get(chatId);
+    if (draft === undefined) return;
+    clearTimers(draft);
+    draft.stopped = true;
+  };
   ctx.effect(() => () => {
+    host.stopLiveFeed = undefined;
     host.setAssistantConsumer(undefined);
     chats.clear();
     answers.clear();
@@ -410,6 +428,9 @@ export function apply(ctx: Context, _config?: unknown): void {
     // A turn boundary or hot teardown may have replaced this draft while a
     // timer was still armed; stale drafts must never edit anything.
     if (chats.get(chatId) !== draft) return;
+    // Aborted turns are terminal: no retry, heartbeat, or throttle timer may
+    // touch the message again (#48).
+    if (draft.stopped === true) return;
     if (draft.messageId === undefined) return;
     if (!draft.dirty && !force) return;
     draft.dirty = false;
@@ -467,12 +488,20 @@ export function apply(ctx: Context, _config?: unknown): void {
 
   const armHeartbeat = (chatId: number, draft: Draft): void => {
     if (draft.heartbeatTimer !== undefined) return;
+    if (draft.stopped === true) return;
+    // Hard deadline: a lost turn/end (crashed stream, dropped event) used to
+    // re-arm this heartbeat forever, editing the same message every 30s and
+    // freezing the chat (#48). The budget bounds one draft to
+    // MAX_HEARTBEATS beats; a live turn re-arms a fresh budget on its next
+    // event anyway.
+    if (draft.heartbeats >= MAX_HEARTBEATS) return;
     draft.heartbeatTimer = setTimeout(() => {
       draft.heartbeatTimer = undefined;
-      if (chats.get(chatId) !== draft) return;
+      if (chats.get(chatId) !== draft || draft.stopped === true) return;
       // Edit immediately with the elapsed title: throttling to a 1s frame
       // would strip the liveness suffix again, and 1 edit/30s is far below
       // the per-chat rate limit.
+      draft.heartbeats += 1;
       flush(chatId, draft, titleFor(chatId, draft, true), true);
       armHeartbeat(chatId, draft);
     }, LIVENESS_HEARTBEAT_MS);
@@ -565,6 +594,7 @@ export function apply(ctx: Context, _config?: unknown): void {
         editFails: 0,
         editAttempts: 0,
         editSucceeded: 0,
+        heartbeats: 0,
         uncachedInputTokens: 0,
         outputTokens: 0,
         cacheReadTokens: 0,

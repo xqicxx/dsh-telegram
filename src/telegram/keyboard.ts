@@ -481,10 +481,13 @@ export function buildQueueKeyboard(items: readonly QueueRow[]): InlineKeyboard {
   return InlineKeyboard.from(rows);
 }
 
-export function buildModelsKeyboard(groups: readonly { id: string; name: string }[], providersCb?: string): InlineKeyboard {
+export function buildModelsKeyboard(groups: readonly { id: string; name: string }[], providersCb?: string, currentProviderId?: string): InlineKeyboard {
   const kb = new InlineKeyboard();
   for (const group of groups.slice(0, 20)) {
-    kb.text(`\u{1F4E1} ${group.name.slice(0, 30)}`, encodedCallback("mo:", group.id)).row();
+    // The current provider carries a check mark so the overview card shows
+    // the selection at a glance, not only in the top-line string (#47).
+    const marker = group.id === currentProviderId ? "\u2705 " : "";
+    kb.text(`${marker}\u{1F4E1} ${group.name.slice(0, 30)}`, encodedCallback("mo:", group.id)).row();
   }
   if (providersCb !== undefined) kb.row().text("\u{1F6F0}\uFE0F Providers", providersCb);
   return kb.row().text("\u{1F50D} Discover models", "m:discover").text("\u2190 Back", "m:back");

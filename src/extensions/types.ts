@@ -63,6 +63,10 @@ export interface ExtensionHost {
   /** Mark a chat's inbound as answered (suppresses the core turn/end
    * reminder when a renderer plugin owns final delivery). */
   markInboundReplied(chatId?: number): void;
+  /** Hard-stop every background live-feed loop (heartbeat/retry timers) for
+   * one chat. Assigned by the streaming renderer on mount; the core calls it
+   * when the user Aborts so no timer can outlive the turn (#48). */
+  stopLiveFeed?(chatId: number): void;
   /** Current goal for a chat, if any (goal-aware streaming titles). */
   goalForChat?(chatId: number): { objective: string } | undefined;
 }

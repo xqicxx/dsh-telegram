@@ -574,10 +574,25 @@ const typingLoops = new Map<number, ReturnType<typeof setInterval>>();
 /** Chats whose latest turn/start has not yet seen turn/end (issue #17). */
 const runningTurns = new Set<number>();
 const TYPING_KEEPALIVE_MAX_MS = 10 * 60_000;
+/** Self-rearm budget (#48): a lost turn/end used to re-arm the keepalive
+ * forever. Three windows (30 min) per turn/start is generous; a genuinely
+ * running turn resets the budget whenever it re-asserts typing. */
+const TYPING_REARM_LIMIT = 3;
+const typingRearms = new Map<number, number>();
+
+/** Keepalive decision (#48): a live agent's own status is authoritative —
+ * the sticky `runningTurns` flag goes stale when a turn/end event is lost,
+ * which used to re-arm the typing loop forever. The flag is only trusted
+ * when no live agent can answer, and the rearm budget caps everything. */
+export function typingKeepaliveActive(agentRunning: boolean | undefined, stickyRunning: boolean, rearmCount: number, rearmLimit = TYPING_REARM_LIMIT): boolean {
+  if (rearmCount > rearmLimit) return false;
+  return agentRunning === undefined ? stickyRunning : agentRunning;
+}
 
 function turnStillRunning(chatId: number): boolean {
-  if (runningTurns.has(chatId)) return true;
-  return currentAgent(chatId)?.status === "running";
+  const agent = currentAgent(chatId);
+  const agentRunning = agent === undefined ? undefined : agent.status === "running";
+  return typingKeepaliveActive(agentRunning, runningTurns.has(chatId), typingRearms.get(chatId) ?? 0);
 }
 
 function startTyping(chatId: number): void {
@@ -592,12 +607,28 @@ function startTyping(chatId: number): void {
   typingLoops.set(chatId, timer);
   // Self-arming one-shot guard: if turn/end was lost the loop must still die.
   // When the turn is genuinely still running, renew one more keep-alive
-  // window instead of silently dropping the typing indicator (#17).
+  // window instead of silently dropping the typing indicator (#17) — but
+  // never beyond the rearm budget (#48).
+  typingRearms.set(chatId, (typingRearms.get(chatId) ?? 0) + 1);
   setTimeout(() => {
     if (typingLoops.get(chatId) !== timer) return;
     if (turnStillRunning(chatId)) startTyping(chatId);
     else stopTyping(chatId);
   }, TYPING_KEEPALIVE_MAX_MS);
+}
+
+/** The provided `telegram` service instance (assigned on plugin apply) so
+ * core paths can reach renderer-assigned seams like stopLiveFeed (#48). */
+let telegramService: (ExtensionHost & Record<string, unknown>) | undefined;
+
+/** Terminal cleanup for one chat's background loops (#48): Abort must kill
+ * the typing keepalive, the sticky turn flag, its rearm budget, and every
+ * live-feed timer — not just hide the UI. */
+function abortChatLoops(chatId: number): void {
+  stopTyping(chatId);
+  runningTurns.delete(chatId);
+  typingRearms.delete(chatId);
+  telegramService?.stopLiveFeed?.(chatId);
 }
 
 function stopTyping(chatId: number): void {
@@ -929,7 +960,7 @@ async function openModelsCard(chatId: number): Promise<void> {
   for (const failure of catalog.failures) lines.push(`\u26A0\uFE0F ${plain(failure.provider)}: ${plain(failure.message)}`);
   lines.push("", "Tap a provider to switch the current session's model.");
   log(`models card: groups=${catalog.groups.map((g) => g.id).join(",")} failures=${catalog.failures.length}`);
-  await openCard(chatId, lines.join("\n"), buildModelsKeyboard(catalog.groups, "m:providers"));
+  await openCard(chatId, lines.join("\n"), buildModelsKeyboard(catalog.groups, "m:providers", current.provider));
 }
 
 /** Standalone Providers view (llm.providers): deployment facts per provider
@@ -1940,7 +1971,9 @@ async function dispatchToken(chatId: number, payload: Record<string, string>): P
       log(`model-select agent=${agent.id} provider=${provider} model=${model} -> ${res.ok ? "ok" : res.text}`);
       await uiSend(chatId, res.ok ? plain(res.text) : `\u274C ${plain(res.text)}`, { parse_mode: "HTML" });
       refreshAllPanels();
-      return openModelsCard(chatId);
+      // Return to the PROVIDER card (not the overview): the freshly selected
+      // model must show its check mark immediately (#47).
+      return openProviderModelsCard(chatId, provider);
     }
     case "model-page": {
       const page = Number(payload["page"] ?? "0");
@@ -2370,6 +2403,7 @@ async function dispatchCallback(chatId: number, data: string): Promise<void> {
     if (sub === "model") return openProviderModelsCard(chatId, currentSessionModel(requireCtx(), id).provider ?? "deepseek");
     if (sub === "stop") {
       const res = sessionLifecycle.stop(requireCtx(), id);
+      abortChatLoops(chatId);
       await uiSend(chatId, res.ok ? plain(res.text) : `\u274C ${plain(res.text)}`, { parse_mode: "HTML" });
       return openSessionDetailCard(chatId, id);
     }
@@ -2547,6 +2581,8 @@ async function dispatchCallback(chatId: number, data: string): Promise<void> {
         return openMenuAt(chatId, menuPageIndex.get(chatId) ?? 0);
       }
       const res = sessionLifecycle.stop(requireCtx(), agentId);
+      // Abort is terminal for background loops too, not just the UI (#48).
+      abortChatLoops(chatId);
       await uiSend(chatId, res.ok ? plain(res.text) : `\u274C ${plain(res.text)}`, { parse_mode: "HTML" });
       return openMenuAt(chatId, menuPageIndex.get(chatId) ?? 0);
     }
@@ -2895,6 +2931,7 @@ async function dispatchCommand(chatId: number, command: string, args: string, me
         return;
       }
       const res = sessionLifecycle.stop(ctx, agentId);
+      abortChatLoops(chatId);
       await send(res.text, res.ok);
       return;
     }
@@ -2905,6 +2942,7 @@ async function dispatchCommand(chatId: number, command: string, args: string, me
         return;
       }
       const res = await sessionLifecycle.close(agentId, ctx);
+      abortChatLoops(chatId);
       state.bridge?.bindAgent(chatId, undefined);
       await send(res.ok ? `${res.text} \u2014 send any message to start a new session.` : res.text, res.ok);
       return;
@@ -3673,7 +3711,7 @@ export function apply(ctx: Context, loaderConfig?: unknown): void {
   // ExtensionHost surface (streaming draft, cards, stats, agent binding) so
   // a loader-mounted plugin like dsh-telegram/extensions/openclaw needs no
   // knowledge of core internals.
-  ctx.provide("telegram", {
+  telegramService = {
     ...buildExtensionHost(),
     getConfig: () => ({ ...state.config }),
     status: () => renderStatus(),
@@ -3705,7 +3743,8 @@ export function apply(ctx: Context, loaderConfig?: unknown): void {
       removed.detach?.();
       refreshExtensionUi();
     },
-  });
+  };
+  ctx.provide("telegram", telegramService);
 
   // Built-in extensions register directly (core's own apply cannot read its
   // freshly provided service — cordis provide registers through fiber.effect).
@@ -3754,10 +3793,16 @@ export function apply(ctx: Context, loaderConfig?: unknown): void {
       getConfig: () => state.config,
       onStateChange: refreshAllPanels,
       onTurnRunning: (chatId, running) => {
-        if (running) runningTurns.add(chatId);
-        else runningTurns.delete(chatId);
-        if (running) startTyping(chatId);
-        else stopTyping(chatId);
+        if (running) {
+          runningTurns.add(chatId);
+          // A genuine new turn gets a fresh keepalive budget (#48).
+          typingRearms.delete(chatId);
+          startTyping(chatId);
+        } else {
+          runningTurns.delete(chatId);
+          typingRearms.delete(chatId);
+          stopTyping(chatId);
+        }
       },
       log,
     });
