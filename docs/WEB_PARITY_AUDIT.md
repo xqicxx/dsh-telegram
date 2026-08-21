@@ -127,7 +127,7 @@ Web 端组装文件 `packages/api/remotes/src/client/index.ts` 只 mount 这 24 
 | messageFeedback/delete | 反馈列表逐项 Delete → `deleteFeedback` | ✅ | |
 | goals/*（6） | Goals 卡 + 命令 | ✅ | |
 | dynamicCordisRunner/inventory | Dynamic 卡 | ✅ | |
-| dynamicCordisRunner 其余 11 | 卡片给“去 web 面板”指引 | ➖ | 按计划不实现 |
+| dynamicCordisRunner define/run/stop/undefine | `/pluginadd` + Dynamic 卡 ▶/⏸/🗑 动作（#50） | ✅ | client 半激活走审批卡；invoke/inspect 仍属 web 面板 |
 
 ### 2.3 转发事件 11 项
 

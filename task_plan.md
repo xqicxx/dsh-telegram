@@ -267,3 +267,34 @@
   forever 只持久化工具名，不写 settings 服务（本插件配置在
   `.pi/telegram.json`，`/config set` 可撤销）。
 - 编辑风暴防线（#15/#24）不因表格 `<code>` 包裹变化。
+
+## Round 33 任务计划（goal: DSH 更新对齐 + 插件手机安装接口）
+
+> 2026-08-21。上游 deepseek-harness 已发布 0.1.1-rc.1/rc.2（区间 207 commit，
+> 图片统一管线/凭证体系/vision 模型/docs site）；目标要求：查上游更新文档 →
+> 读本项目文档 → 提交更新 issue → Telegram 全功能对齐 + 留插件代码（用户装
+> 插件后用自己的模型 decode，经暴露接口在 Telegram 使用）。
+
+### 步骤
+1. [x] 通读上游 docs 变更（258 文件，无破坏本桥的 API 契约变更）与本项目
+   文档（README(.zh)/CHANGELOG/TESTING §70/WEB_PARITY_AUDIT/task_plan）。
+2. [x] 提交跟踪 issue #50（升级 + 全功能对齐剩余项 + 插件安装接口计划）。
+3. [x] 升级 devDeps/peers → `0.1.1-rc.2`；typecheck 零错误、全量测试通过；
+   版本升至 **0.4.0**。
+4. [x] #50 核心实现：`dynamicCordis.ts` 补 define/run/stop/undefine（降级
+   安全）；`/pluginadd` 命令 + Dynamic 卡 ➕/▶/⏸/🗑 动作（token 回调、
+   Remove 二次确认、client 半走审批卡）；TELEGRAM_COMMANDS//help 同步。
+5. [x] #49 修复：editText not-modified 先分类后记录（noop 级，不再污染
+   FAILED 告警）。
+6. [x] 文档同步：CHANGELOG（#49/#50 三条）、README(.zh) /pluginadd、
+   WEB_PARITY_AUDIT dynamicCordisRunner 行 ➖→✅、TESTING §71。
+7. [x] `npm run check` 全绿（**405/405**）+ `npm pack --dry-run`
+   （152 files，dsh-telegram-0.4.0.tgz）。
+8. [ ] commit/push + 关闭 #49/#50。
+
+### 约束
+- 审批卡语义不回退：client 半激活仍走标准审批通道（allowed-once/session/
+  forever 各档不变）。
+- 入站 roster 白名单是插件安装的唯一安全边界（命令/pending 仅授权 chat）。
+- 编辑风暴防线（#15/#23/#24）不动；#49 只改日志分级不改返回值语义
+  （not-modified 仍返回 true）。

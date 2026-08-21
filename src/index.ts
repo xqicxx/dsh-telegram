@@ -65,7 +65,7 @@ import { describeHost, hostVersionOf, breadcrumbSegments, listDirectory, createD
 import { listCommands, executeCommand } from "./harness/adapters/commands.js";
 import { listJobs } from "./harness/adapters/jobs.js";
 import { exportSessionLog } from "./harness/adapters/downloads.js";
-import { listDynamicCordis } from "./harness/adapters/dynamicCordis.js";
+import { listDynamicCordis, defineDynamicCordis, runDynamicPlugin, stopDynamicPlugin, undefineDynamicPlugin } from "./harness/adapters/dynamicCordis.js";
 import { probeCapabilities, missingServices } from "./harness/adapters/capabilities.js";
 import { attachInteractive, type Interactive, questionIdAt } from "./harness/adapters/interactive.js";
 import { ensureOpencodeGoResponsesRoute, normalizeOpencodeGoModel, opencodeGoModelUsesResponses } from "./harness/adapters/opencodeGo.js";
@@ -112,6 +112,8 @@ import {
   buildCredentialsKeyboard,
   buildHostKeyboard,
   buildDynamicCordisKeyboard,
+  buildPluginLifecycleKeyboard,
+  type PluginRow,
   buildCapabilitiesKeyboard,
   CALLBACK_RE,
   COLLAPSE_BTN,
@@ -144,7 +146,7 @@ import { renderTrajectoryLines } from "./telegram/trajectory.js";
 import { findWorkspaceRoot } from "./workspace.js";
 
 export const name = "dsh-telegram";
-export const version = "0.3.9";
+export const version = "0.4.0";
 export const inject = ["tools", "commands", "agents"];
 
 interface State {
@@ -247,6 +249,7 @@ function teardownMount(): void {
   pendingSearch = undefined;
   pendingPresetCopy = undefined;
   pendingMkdir = undefined;
+  pendingPluginAdd = undefined;
   pendingStartAfterAllow.clear();
   for (const timer of typingLoops.values()) clearInterval(timer);
   typingLoops.clear();
@@ -1788,12 +1791,28 @@ async function openJobsCard(chatId: number, page = 0): Promise<void> {
 
 async function openDynamicCordisCard(chatId: number): Promise<void> {
   const rows = listDynamicCordis(requireCtx());
-  const lines = [`\u{1F9F0} Dynamic plugin packages (${rows.length})`, ""];
+  const lines = [`\u{1F9F0} Dynamic plugins (${rows.length})`, ""];
+  const pluginRows: PluginRow[] = [];
   for (const row of rows.slice(0, 15)) {
-    lines.push(`\u2022 ${plain(String(row.pluginId))}${row.packageId === undefined ? "" : ` \u00B7 ${plain(String(row.packageId))}`}${row.status === undefined ? "" : ` \u00B7 ${plain(String(row.status))}`}`);
+    const pluginId = String(row.pluginId);
+    const running = row.activeRun !== undefined && row.activeRun !== null;
+    const current = row.currentPackageId === undefined || row.currentPackageId === null ? undefined : String(row.currentPackageId);
+    const versions = Array.isArray(row.packages) ? row.packages.length : 0;
+    lines.push(`\u2022 ${plain(pluginId)} \u00B7 ${versions} pkg${current === undefined ? "" : ` \u00B7 @ ${plain(truncate(current, 18))}`}${running ? " \u00B7 \u25B6 running" : ""}`);
+    pluginRows.push({
+      pluginId,
+      running,
+      callbacks: {
+        run: token({ action: "plugin-run", pluginId }),
+        stop: token({ action: "plugin-stop", pluginId }),
+        remove: token({ action: "plugin-remove", pluginId }),
+      },
+    });
   }
-  lines.push("", "Run/stop/dependency controls are web panel operations \u2014 use the web UI for those.");
-  await openCard(chatId, lines.join("\n"), buildDynamicCordisKeyboard());
+  if (rows.length === 0) {
+    lines.push("(none)", "", "Install your own plugin from the phone:", "tap \u2795 Add plugin, then reply with a JSON:", '{"name": "my-decoder", "purpose": "...", "host": "<js source>"}', "The host half can call your own model to decode.");
+  }
+  await openCard(chatId, lines.join("\n"), buildPluginLifecycleKeyboard(pluginRows));
 }
 
 async function openCapabilitiesCard(chatId: number): Promise<void> {
@@ -2234,6 +2253,58 @@ async function dispatchToken(chatId: number, payload: Record<string, string>): P
       await uiSend(chatId, "\u2716 Remove cancelled.", { parse_mode: "HTML" });
       return openPresetsCard(chatId);
     }
+    // Issue #50: dynamic plugin lifecycle from the phone. Run/Stop act on the
+    // chat's bound agent (session-scoped ownership, web semantics); Remove
+    // confirms first because it deletes every immutable Package version.
+    case "plugin-run": {
+      const pluginId = payload["pluginId"] ?? "";
+      const agent = currentAgent(chatId);
+      if (!agent) {
+        await uiSend(chatId, "\u274C No live session in this chat \u2014 send a message first, then run plugins.", { parse_mode: "HTML" });
+        return;
+      }
+      const res = await runDynamicPlugin(requireCtx(), agent, pluginId);
+      await uiSend(chatId, res.ok ? plain(res.text) : `\u274C ${plain(res.text)}`, { parse_mode: "HTML" });
+      refreshAllPanels();
+      return;
+    }
+    case "plugin-stop": {
+      const pluginId = payload["pluginId"] ?? "";
+      const agent = currentAgent(chatId);
+      if (!agent) {
+        await uiSend(chatId, "\u274C No live session in this chat.", { parse_mode: "HTML" });
+        return;
+      }
+      const res = await stopDynamicPlugin(requireCtx(), agent, pluginId);
+      await uiSend(chatId, res.ok ? plain(res.text) : `\u274C ${plain(res.text)}`, { parse_mode: "HTML" });
+      refreshAllPanels();
+      return;
+    }
+    case "plugin-remove": {
+      const pluginId = payload["pluginId"] ?? "";
+      return askConfirm(
+        chatId,
+        `\u{1F5D1} Remove plugin ${plain(truncate(pluginId, 32))}? All versions and the active run are deleted.`,
+        { action: "plugin-remove-confirm", pluginId },
+        { action: "plugin-remove-cancel", pluginId },
+      );
+    }
+    case "plugin-remove-confirm": {
+      const pluginId = payload["pluginId"] ?? "";
+      const agent = currentAgent(chatId);
+      if (!agent) {
+        await uiSend(chatId, "\u274C No live session in this chat.", { parse_mode: "HTML" });
+        return;
+      }
+      const res = await undefineDynamicPlugin(requireCtx(), agent, pluginId);
+      await uiSend(chatId, res.ok ? plain(res.text) : `\u274C ${plain(res.text)}`, { parse_mode: "HTML" });
+      refreshAllPanels();
+      return openDynamicCordisCard(chatId);
+    }
+    case "plugin-remove-cancel": {
+      await uiSend(chatId, "\u2716 Remove cancelled.", { parse_mode: "HTML" });
+      return openDynamicCordisCard(chatId);
+    }
     case "preset-open": {
       const res = openAgentPresetDocument(requireCtx(), payload["presetId"] ?? "");
       await uiSend(chatId, res.ok ? plain(res.text) : `\u274C ${plain(res.text)}`, { parse_mode: "HTML" });
@@ -2299,6 +2370,8 @@ let pendingSteer: { chatId: number; sessionId: string } | undefined;
 let pendingSearch: { chatId: number } | undefined;
 let pendingPresetCopy: { chatId: number; sourceId: string } | undefined;
 let pendingMkdir: { chatId: number; path: string } | undefined;
+/** Issue #50: awaiting the plugin-definition JSON reply. */
+let pendingPluginAdd: { chatId: number } | undefined;
 
 async function dispatchCallback(chatId: number, data: string): Promise<void> {
   const ext = extensionForCallback(data);
@@ -2544,6 +2617,25 @@ async function dispatchCallback(chatId: number, data: string): Promise<void> {
     }
     return;
   }
+  if (data.startsWith("p:")) {
+    const sub = data.slice(2);
+    if (sub === "add") {
+      pendingPluginAdd = { chatId };
+      await uiSend(
+        chatId,
+        [
+          "\u{1F9E9} Reply with the plugin JSON (or /cancel):",
+          "",
+          '<code>{"name": "my-decoder", "purpose": "decode with my own model", "host": "// js source"}</code>',
+          "",
+          "Keys: <code>name</code>* \u00B7 <code>purpose</code>* \u00B7 <code>host</code> (JS source) \u00B7 <code>client</code> (JS source). At least one source half is required; a client half activates through the approval card.",
+        ].join("\n"),
+        { parse_mode: "HTML", reply_markup: inputPromptKeyboard('{"name": …}') },
+      );
+      return;
+    }
+    return;
+  }
   const match = CALLBACK_RE.exec(data);
   if (!match) return;
   const action = match[1]!;
@@ -2754,6 +2846,7 @@ const TELEGRAM_COMMANDS = [
   { command: "ls", description: "List a directory" },
   { command: "attachment", description: "Send a saved photo attachment back" },
   { command: "mkdir", description: "Create a directory" },
+  { command: "pluginadd", description: "Install your own dynamic plugin (JSON)" },
   { command: "jobs", description: "Jobs list" },
   { command: "capabilities", description: "Profile capability matrix" },
   { command: "menucheck", description: "Self-check every menu data source" },
@@ -2869,6 +2962,7 @@ async function dispatchCommand(chatId: number, command: string, args: string, me
           "/pluginenable <name> \u00B7 /plugindisable <name> \u00B7 /settingsdescribe [ns] \u00B7 /settingsupdate <ns> <json> \u00B7 /settingsreplace <ns> <json> \u00B7 /settingsmutate <ns> <json ops>",
           "/credential <REF> [REF...] \u00B7 /credentialset <REF> <value> \u00B7 /credentialunset <REF> \u00B7 /answer <id> <question-number> <text>",
           "/attachment <attachmentId> \u00B7 /ls [path] \u00B7 /mkdir <path> \u00B7 /pickdir [path] \u00B7 /openpath [path] \u00B7 /discover <settingsNs> [baseURL] \u00B7 /subagentprompt <text>",
+          "/pluginadd [json] \u00B7 install your own dynamic plugin (host half can call your own model to decode)",
           "/sessionlog [sessionId] \u00B7 /commands \u00B7 /capabilities \u00B7 /config get|set <path> [json]",
           "/menucheck \u00B7 self-checks every menu card's data source",
         ].join("\n"),
@@ -2904,9 +2998,53 @@ async function dispatchCommand(chatId: number, command: string, args: string, me
       } else if (pendingMkdir && pendingMkdir.chatId === chatId) {
         pendingMkdir = undefined;
         await send("New-folder cancelled.");
+      } else if (pendingPluginAdd && pendingPluginAdd.chatId === chatId) {
+        pendingPluginAdd = undefined;
+        await send("Plugin add cancelled.");
       } else {
         await send("Nothing to cancel.");
       }
+      return;
+    }
+    case "pluginadd": {
+      const agentId = boundAgentId(chatId);
+      if (agentId === undefined) {
+        await send("\u274C No live session in this chat \u2014 send a message first to create one, then /pluginadd.");
+        return;
+      }
+      const json = args.trim();
+      if (json === "") {
+        pendingPluginAdd = { chatId };
+        await send(
+          [
+            "\u{1F9E9} Reply with the plugin JSON (or /cancel):",
+            "",
+            '{"name": "my-decoder", "purpose": "decode with my own model", "host": "// js source"}',
+            "",
+            "Keys: name* \u00B7 purpose* \u00B7 host (JS source) \u00B7 client (JS source). At least one source half is required; a client half activates through the approval card. Optional pluginId appends a version to an existing plugin.",
+          ].join("\n"),
+          true,
+        );
+        return;
+      }
+      let parsed: Record<string, unknown>;
+      try {
+        const value: unknown = JSON.parse(json);
+        if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("not an object");
+        parsed = value as Record<string, unknown>;
+      } catch {
+        await send('\u274C That is not a JSON object. Expected {"name", "purpose", "host"/"client"}.', false);
+        return;
+      }
+      const str = (key: string): string | undefined => (typeof parsed[key] === "string" ? (parsed[key] as string) : undefined);
+      const res = await defineDynamicCordis(ctx, agentId, {
+        name: str("name") ?? "",
+        purpose: str("purpose") ?? "",
+        host: str("host"),
+        client: str("client"),
+      }, typeof parsed["pluginId"] === "string" ? (parsed["pluginId"] as string) : undefined);
+      await send(res.text, res.ok);
+      if (res.ok) refreshAllPanels();
       return;
     }
     case "new": {
@@ -4076,6 +4214,41 @@ export function apply(ctx: Context, loaderConfig?: unknown): void {
             }),
           log).then((done) => {
             if (done === undefined) void uiSend(chatId, "\u274C Preset copy failed.", { parse_mode: "HTML" });
+          });
+          return;
+        }
+        if (pendingPluginAdd && pendingPluginAdd.chatId === chatId) {
+          pendingPluginAdd = undefined;
+          const agentId = boundAgentId(chatId);
+          if (agentId === undefined) {
+            void uiSend(chatId, "\u274C No live session in this chat \u2014 send a message first to create one, then /pluginadd.", { parse_mode: "HTML" });
+            return;
+          }
+          // Tolerate ```json fences and leading labels around the payload.
+          const raw = text.trim().replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "");
+          let parsed: Record<string, unknown>;
+          try {
+            const value: unknown = JSON.parse(raw);
+            if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("not an object");
+            parsed = value as Record<string, unknown>;
+          } catch {
+            void uiSend(chatId, '\u274C That is not a JSON object. Expected {"name", "purpose", "host"/"client"} — try again or /cancel.', { parse_mode: "HTML" });
+            pendingPluginAdd = { chatId };
+            return;
+          }
+          const str = (key: string): string | undefined => (typeof parsed[key] === "string" ? (parsed[key] as string) : undefined);
+          void safeWrap("plugin-add", () =>
+            defineDynamicCordis(requireCtx(), agentId, {
+              name: str("name") ?? "",
+              purpose: str("purpose") ?? "",
+              host: str("host"),
+              client: str("client"),
+            }, typeof parsed["pluginId"] === "string" ? (parsed["pluginId"] as string) : undefined).then((res) => {
+              void uiSend(chatId, res.ok ? `\u2705 ${plain(res.text)}\nTap \u25B6 Run on the Dynamic card to activate it.` : `\u274C ${plain(res.text)}`, { parse_mode: "HTML" });
+              if (res.ok) refreshAllPanels();
+            }),
+          log).then((done) => {
+            if (done === undefined) void uiSend(chatId, "\u274C Plugin definition failed.", { parse_mode: "HTML" });
           });
           return;
         }

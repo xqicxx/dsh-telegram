@@ -444,16 +444,19 @@ export class TelegramTransport {
         this.log(`editText ok chatId=${chatId} messageId=${messageId}`);
         return true;
       } catch (err) {
-        this.log(`editText FAILED chatId=${chatId} messageId=${messageId} err=${err instanceof Error ? err.message : String(err)}`, err);
-        if (err instanceof GrammyError) {
-          // "message is not modified" means the message is alive and already
-          // shows the target content — that IS the desired end state, so the
-          // edit logically succeeded. Reporting false here made Ephemeral
-          // drop a perfectly good message id and re-send the card (#models
-          // card taps feeling dead). Every other GrammyError stays a failure.
-          if (/message is not modified/i.test(err.message)) return true;
-          return false;
+        // "message is not modified" means the message is alive and already
+        // shows the target content — that IS the desired end state, so the
+        // edit logically succeeded. Reporting false here made Ephemeral
+        // drop a perfectly good message id and re-send the card (#models
+        // card taps feeling dead). Classify BEFORE logging: this benign case
+        // must not pollute ERROR-level FAILED alerting (#49). Every other
+        // GrammyError stays a failure.
+        if (err instanceof GrammyError && /message is not modified/i.test(err.message)) {
+          this.log(`editText noop chatId=${chatId} messageId=${messageId} (already up to date)`);
+          return true;
         }
+        this.log(`editText FAILED chatId=${chatId} messageId=${messageId} err=${err instanceof Error ? err.message : String(err)}`, err);
+        if (err instanceof GrammyError) return false;
         throw err;
       }
     });

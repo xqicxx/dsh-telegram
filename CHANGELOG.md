@@ -5,7 +5,11 @@ Versioning follows the npm package version in `package.json`.
 
 ## Unreleased
 
-Issues #7-#13, #14, #15, #16-#21, #22-#26, #27-#30, #31-#33, #37-#44.
+Issues #7-#13, #14, #15, #16-#21, #22-#26, #27-#30, #31-#33, #37-#44, #49, #50.
+
+- **#50 plugin install from the phone**: the Dynamic card is no longer read-only — new `/pluginadd` command (or the `➕ Add plugin` button) accepts a JSON definition (`{"name", "purpose", "host"/"client"}`, optional `pluginId` to append a version), and the card gains per-plugin `▶ Run` / `⏸ Stop` / `🗑 Remove` (confirm-guarded) actions backed by the `dynamicCordisRunner` define/run/stop/undefine remotes. Run prefers the newest defined package and transitions as an update when it differs from the current activation; an unauthorized client half parks in approval and settles through the standard approval card. This lets a user install their own decode plugin — one that calls their own model — and activate it entirely from Telegram.
+- **#50 dsh 0.1.1-rc.2 upgrade**: all `@deepseek-ai/dsh-*` dev pins and peer ranges move from `0.1.0-rc.8` to `0.1.1-rc.2` (typecheck + full suite green). Upstream highlights absorbed: unified master/Files image request pipeline with canonical admission, credential records + ask-the-human authorization, llm-deepseek vision model and Files fallback, webserver structured index injection.
+- **#49 editText noise**: the benign Telegram `400: message is not modified` response is now classified BEFORE logging and reported as an `editText noop` line — it never pollutes ERROR-level `FAILED` alerting (and pre-c84db7f builds no longer escalate it into identical-payload retry storms once deployed).
 
 - **#31 CJK table alignment**: table cells are now padded by Telegram monospace display width (CJK/fullwidth/emoji = 2 columns, zero-width = 0) measured on the raw cell via `Intl.Segmenter` grapheme splitting, instead of UTF-16 `cell.length` — CJK columns no longer misalign, and cells containing `& < > "` stay aligned because escaping no longer counts toward padding. Columns keep a minimum width of 3 and a model-styled overlong separator row no longer inflates column widths.
 - **#32 trajectory view**: `/history` and the History card now render the web's 轨迹 (trajectory) ledger instead of a flat event dump — turns grouped `turn/start..turn/end` with per-turn `provider/model` (from `request/header`), outcome, duration, and 👤/🧠/🔧/📥/🤖 step lines (tool calls include their arguments). Long step lists fold to a counter; `Load older` pages six turns per window.

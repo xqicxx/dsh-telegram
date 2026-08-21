@@ -1636,3 +1636,56 @@ Telegram 却只显示项目基名/id。根因：真实 `SessionPersistence.readR
 - 新增：trajectory 6 例；markdown +6（#31）、openclaw +2（#33）、
   bridge-final-answer +6（#37）。
 - `npm run check`：**379/379 pass**（rc.8 依赖下）。
+
+## 71. 插件手机安装接口 + rc.2 升级 + #49 日志降噪（2026-08-21，405/405）
+
+### #50 Telegram 插件安装接口（dynamicCordisRunner 生命周期）
+
+- 背景：上游 DSH 已发布 `0.1.1-rc.1`/`0.1.1-rc.2`（区间 207 commit）；目标
+  是「用户装了插件就可以通过他自己的模型自己 decode，然后通过暴露的接口
+  在 Telegram 上使用」。此前 Dynamic 卡只读（inventory），define/run/
+  stop/undefine 全部指引去 web 面板。
+- `dynamicCordis.ts` 适配器补齐：`defineDynamicCordis`（session-scoped
+  define 请求，`kind: new|existing`、name/purpose/host/client 校验：至少
+  一个 source half）、`runDynamicPlugin`（缺省取最新定义的包；与当前激活
+  不同 → `update`，相同 → `run`；awaiting-approval/starting/running 三态
+  文案；失败 reason/message 直出）、`stopDynamicPlugin`、
+  `undefineDynamicPlugin`。runner 缺席时全部干净降级（`not available`）。
+- UI 接线：
+  - `/pluginadd [json]` 命令与 Dynamic 卡 `➕ Add plugin` 按钮 → 回复
+    JSON（容忍 ```json 围栏）定义插件；可选 `pluginId` 追加新版本。
+  - Dynamic 卡升级为逐插件行（版本数/当前包/running 标记）+ `▶ Run` /
+    `⏸ Stop` / `🗑 Remove` 动作（长 id 走 token registry，回调 ≤64 字节）；
+    Remove 走 askConfirm 二次确认（删除全部不可变版本，不可逆）。
+  - client 半未授权时 run 进入 awaiting-approval → 复用现有审批卡通道。
+  - `/pluginadd` 进 TELEGRAM_COMMANDS 与 /help；pending 状态在 /cancel 与
+    teardown 清理。
+- 安全边界沿用入站 roster 白名单（onUserText/命令仅在授权 chat 触发）。
+- 回归：新 `test/plugin-install.test.mjs` 9 例（define 收据与请求形状、
+  existing 追加版本、name/purpose/half 校验不触达 runner、四操作降级、
+  run 缺省包选择与 update/run 模式、三态文案与失败路径、stop/undefine
+  收据、畸形行过滤、keyboard 渲染 + 回调长度上限）。
+
+### #50 dsh 0.1.0-rc.8 → 0.1.1-rc.2 升级
+
+- devDeps 精确 pin `0.1.1-rc.2`，peer 范围 `^0.1.1-rc.2`（#28 先例）。
+- typecheck 零错误、全量测试一次通过——无 API 断面变化需要适配。
+- 上游要点吸收：图片 master/Files 统一管线与 canonical admission、
+  credential records + ask-the-human authorization、llm-deepseek vision
+  模型与 Files fallback、webserver 结构化 index 注入表。
+- 版本升至 **0.4.0**。
+
+### #49 editText「message is not modified」日志降噪
+
+- 根因（HEAD 仍存在）：`editTextLane` 先记 ERROR 级 `editText FAILED`
+  再分类；benign not-modified（设计内热路径：重复点击未变化卡片）每次
+  都打全栈错误，FAILED-grep 告警失效。
+- 修复：先分类后记录——not-modified → `editText noop … (already up to
+  date)` 并返回 true；其余 GrammyError 才记 FAILED 返回 false。
+- 回归：`test/transport.test.mjs` 新增 1 例（noop 不打 FAILED、genuine
+  failure 恰好一条 FAILED）。
+
+### 测试记录
+
+- 新增：plugin-install 9 例；transport +1（#49）。
+- `npm run check`：**405/405 pass**（dsh 0.1.1-rc.2 依赖下）。

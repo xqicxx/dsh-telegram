@@ -648,6 +648,24 @@ export function buildDynamicCordisKeyboard(): InlineKeyboard {
   return new InlineKeyboard().row().text("\u2190 Back", "m:back");
 }
 
+export interface PluginRow {
+  pluginId: string;
+  running: boolean;
+  callbacks: { run: string; stop: string; remove: string };
+}
+
+/** Issue #50: per-plugin lifecycle actions plus the Add entry. Long ids stay
+ * out of the 64-byte callback limit — callers pass minted tokens. */
+export function buildPluginLifecycleKeyboard(rows: readonly PluginRow[]): InlineKeyboard {
+  const keyboard = new InlineKeyboard().text("\u2795 Add plugin", "p:add");
+  for (const row of rows) {
+    const label = row.pluginId.length > 24 ? `${row.pluginId.slice(0, 23)}\u2026` : row.pluginId;
+    keyboard.row().text(`${row.running ? "\u23F8 Stop" : "\u25B6 Run"} ${label}`, row.running ? row.callbacks.stop : row.callbacks.run);
+    keyboard.text("\u{1F5D1} Remove", row.callbacks.remove);
+  }
+  return keyboard.row().text("\u2190 Back", "m:back");
+}
+
 export function buildCapabilitiesKeyboard(): InlineKeyboard {
   return new InlineKeyboard().row().text("\u2190 Back", "m:back");
 }

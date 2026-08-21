@@ -323,3 +323,28 @@ test('editText treats "message is not modified" as success (#models card dead ta
   };
   await assert.rejects(transport.editText(7, 5, 'x'), /network down/, 'non-Grammy errors still propagate');
 });
+
+test('editText logs the benign "not modified" case at noop level, never FAILED (#49)', async () => {
+  const lines = [];
+  const transport = new TelegramTransport({
+    token: '123456:test-token',
+    log: (line) => lines.push(line),
+    queue: { push: async (_key, fn) => fn(), pendingCount: () => 0, configure: () => {} },
+  });
+
+  // Repeated taps on an unchanged card are the designed hot path: they must
+  // read as a noop, so FAILED-grep alerting stays meaningful.
+  transport.api.editMessageText = async () => {
+    throw new GrammyError('Bad Request: message is not modified', { error_code: 400, description: 'Bad Request: message is not modified' }, 'editMessageText', {});
+  };
+  assert.equal(await transport.editText(7, 5, 'same content'), true);
+  assert.equal(lines.some((line) => line.includes('FAILED')), false, `benign edit must not log FAILED, got: ${lines.join(' | ')}`);
+  assert.equal(lines.filter((line) => line.includes('editText noop')).length, 1);
+
+  // A genuine failure still logs the FAILED line for alerting.
+  transport.api.editMessageText = async () => {
+    throw new GrammyError('Bad Request: chat not found', { error_code: 400, description: 'Bad Request: chat not found' }, 'editMessageText', {});
+  };
+  assert.equal(await transport.editText(7, 5, 'x'), false);
+  assert.equal(lines.filter((line) => line.includes('FAILED')).length, 1);
+});
