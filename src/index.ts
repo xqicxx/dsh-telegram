@@ -15,10 +15,8 @@ import type {} from "@deepseek-ai/dsh-agent";
 import type { CommandInvocation, CommandResult } from "@deepseek-ai/dsh-commands";
 import type {} from "@deepseek-ai/dsh-session";
 import { existsSync } from "node:fs";
-import { readFile, stat } from "node:fs/promises";
-import { defineTool, type ToolRunContext } from "@deepseek-ai/dsh-tools";
 import { homedir } from "node:os";
-import { basename, join, parse, resolve, sep } from "node:path";
+import { basename, join, parse, resolve } from "node:path";
 import { isChatAllowed, readConfig, resolveToken, writeConfig, overlayConfig, getConfigPath, patchFromPath, type ConfigSection, type TelegramConfig } from "./config.js";
 import { Bridge } from "./harness/bridge.js";
 import { compactCurrent } from "./harness/adapters/compact.js";
@@ -43,7 +41,6 @@ import {
   currentSessionModel,
   listQueue,
   updateQueueItem,
-  saveImageAttachment,
   readImageAttachment,
   releaseSavedAttachments,
   SessionLifecycle,
@@ -69,10 +66,9 @@ import { listDynamicCordis, defineDynamicCordis, runDynamicPlugin, stopDynamicPl
 import { probeCapabilities, missingServices } from "./harness/adapters/capabilities.js";
 import { attachInteractive, type Interactive, questionIdAt } from "./harness/adapters/interactive.js";
 import { ensureOpencodeGoResponsesRoute, normalizeOpencodeGoModel, opencodeGoModelUsesResponses } from "./harness/adapters/opencodeGo.js";
-import { saveDocumentAttachment, transcribeVoice } from "./harness/adapters/media.js";
-import { forgetStatusSession, renderStatsStrip, resetStatusStats, statusSnapshot } from "./harness/adapters/status.js";
+import { renderStatsStrip, resetStatusStats, statusSnapshot } from "./harness/adapters/status.js";
 import { CompactionWatcher, contextUsageOf } from "./harness/adapters/compaction-watch.js";
-import { diffTodos, listTodos, normalizeTodos, pendingTodoCount, type TodoView } from "./harness/adapters/todos.js";
+import { diffTodos, listTodos, pendingTodoCount, type TodoView } from "./harness/adapters/todos.js";
 import { GoalProgressFeed, type ProgressSnapshot } from "./telegram/goal-progress.js";
 import { renderTodosCard } from "./telegram/todos-card.js";
 import { Ephemeral } from "./telegram/ephemeral.js";
@@ -144,6 +140,9 @@ import { StatusPanel } from "./telegram/status-panel.js";
 import { TelegramTransport } from "./telegram/transport.js";
 import { renderTrajectoryLines } from "./telegram/trajectory.js";
 import { findWorkspaceRoot } from "./workspace.js";
+import { makeAttachmentHandlers } from "./media/attachments.js";
+import { attachSessionEvents } from "./core/events.js";
+import { registerTelegramTools } from "./core/tools.js";
 
 export const name = "dsh-telegram";
 export const version = "0.4.0";
@@ -174,24 +173,6 @@ interface State {
   /** Chats whose bar is collapsed to the single return button. */
   barCollapsed: Map<number, boolean>;
 }
-
-/** Web `ApiProxy.events.host` also forwards these remote-service events. */
-const FORWARDED_EVENT_NAMES = [
-  "agent-preset/selected",
-  "commands/change",
-  "credentials/updated",
-  "settings/document-updated",
-  "llm/adapters-updated",
-  "cordis/request-run",
-  "cordis/request-run-resolved",
-  "cordis/dynamic-package",
-  "cordis/dynamic-retract",
-  "cordis/inspect-query",
-  "cordis/inspect-query-resolved",
-] as const;
-
-/** Underlying cordis events that the web projects into `events.host` frames. */
-const HOST_EVENT_NAMES = ["session/created", "session/disposed", "agent/error", "domain/changed"] as const;
 
 /** Latest durable todo snapshot per chat (todo/write is whole-list). */
 const todoSnapshots = new Map<number, TodoView[]>();
@@ -462,103 +443,12 @@ function log(message: string, error?: unknown): void {
   console.error(`[dsh-telegram] ${message}`, error ?? "");
 }
 
-function textOutput() {
-  return {
-    schema: { type: "string" as const },
-    render: (_args: Record<string, unknown>, value: string) => [{ type: "text" as const, text: value }],
-  };
-}
-
 const okCmd = (text: string): CommandResult => ({ kind: "success", text });
 const failCmd = (text: string): CommandResult => ({ kind: "error", text });
 
 function requireTransport(): TelegramTransport {
   if (!state.transport) throw new Error("Telegram is not running: set TELEGRAM_BOT_TOKEN and send /telegram start.");
   return state.transport;
-}
-
-/** Agent outbound attachments (issue #25): 1-10 workspace files, 50MB each,
- * routed to sendPhoto/sendVoice/sendAudio/sendDocument by file extension. */
-const ATTACH_MAX_COUNT = 10;
-const ATTACH_MAX_BYTES = 50 * 1024 * 1024;
-const ATTACH_PHOTO_EXTENSIONS = new Set(["jpg", "jpeg", "png"]);
-const ATTACH_VOICE_EXTENSIONS = new Set(["ogg", "opus"]);
-const ATTACH_AUDIO_EXTENSIONS = new Set(["mp3", "m4a", "aac", "wav", "flac"]);
-
-function attachExtension(filename: string): string {
-  const dot = filename.lastIndexOf(".");
-  return dot === -1 ? "" : filename.slice(dot + 1).toLowerCase();
-}
-
-function attachWithinWorkspace(root: string, target: string): boolean {
-  return target === root || target.startsWith(root.endsWith(sep) ? root : `${root}${sep}`);
-}
-
-async function sendWorkspaceAttachments(
-  args: { paths?: unknown; chatId?: unknown; caption?: unknown },
-  exec: ToolRunContext,
-): Promise<string> {
-  const paths = Array.isArray(args.paths) ? args.paths.filter((entry): entry is string => typeof entry === "string") : [];
-  if (!Array.isArray(args.paths)) return JSON.stringify({ ok: false, error: "paths must be an array of 1-10 workspace-relative file paths" });
-  if (paths.length < 1 || paths.length > ATTACH_MAX_COUNT) {
-    return JSON.stringify({ ok: false, error: `paths must contain 1-10 entries, got ${paths.length}` });
-  }
-  const agentId = exec.agent?.id === undefined ? undefined : String(exec.agent.id);
-  const fallbackAgentId = agentId ?? state.bridge?.currentAgentIdValue();
-  const resolvedChat = args.chatId !== undefined ? Number(args.chatId) : (fallbackAgentId !== undefined ? state.bridge?.chatIdForAgent(fallbackAgentId) : undefined);
-  if (resolvedChat === undefined || !Number.isInteger(resolvedChat) || !state.chats.has(resolvedChat)) {
-    return JSON.stringify({
-      ok: false,
-      error:
-        args.chatId !== undefined
-          ? `chat ${args.chatId} is not in the allowed roster`
-          : "no bound Telegram chat context \u2014 pass chatId explicitly",
-    });
-  }
-  const t = requireTransport();
-  const root = resolve(state.workspaceRoot);
-  const results: { path: string; ok: boolean; method?: string; messageId?: number | null; bytes?: number; error?: string }[] = [];
-  for (const rel of paths) {
-    const abs = resolve(root, rel);
-    try {
-      if (!attachWithinWorkspace(root, abs)) {
-        results.push({ path: rel, ok: false, error: "path is outside the workspace root" });
-        continue;
-      }
-      const info = await stat(abs);
-      if (!info.isFile()) {
-        results.push({ path: rel, ok: false, error: "not a file" });
-        continue;
-      }
-      if (info.size > ATTACH_MAX_BYTES) {
-        results.push({ path: rel, ok: false, error: `exceeds the ${ATTACH_MAX_BYTES / (1024 * 1024)}MB Telegram limit` });
-        continue;
-      }
-      const buffer = await readFile(abs);
-      const filename = basename(abs);
-      const ext = attachExtension(filename);
-      const caption = typeof args.caption === "string" && args.caption !== "" ? args.caption : undefined;
-      let method: string;
-      let messageId: number | undefined;
-      if (ATTACH_PHOTO_EXTENSIONS.has(ext)) {
-        method = "sendPhoto";
-        messageId = await t.sendPhoto(resolvedChat, buffer, filename, caption);
-      } else if (ATTACH_VOICE_EXTENSIONS.has(ext)) {
-        method = "sendVoice";
-        messageId = await t.sendVoice(resolvedChat, buffer, filename, caption);
-      } else if (ATTACH_AUDIO_EXTENSIONS.has(ext)) {
-        method = "sendAudio";
-        messageId = await t.sendAudio(resolvedChat, buffer, filename, caption);
-      } else {
-        method = "sendDocument";
-        messageId = await t.sendDocument(resolvedChat, buffer, filename, caption);
-      }
-      results.push({ path: rel, ok: messageId !== undefined, method, messageId: messageId ?? null, bytes: buffer.length });
-    } catch (err) {
-      results.push({ path: rel, ok: false, error: err instanceof Error ? err.message : String(err) });
-    }
-  }
-  return JSON.stringify({ ok: results.length > 0 && results.every((entry) => entry.ok), results });
 }
 
 /** ChatOps adapter on the UI control lane: cards, menus and status panels
@@ -3668,87 +3558,19 @@ async function dispatchCommand(chatId: number, command: string, args: string, me
   }
 }
 
-/** Ensure this chat has a live agent for media delivery; first media starts
- * its own session, same as first text. */
-async function ensureChatAgent(chatId: number): Promise<Agent | undefined> {
-  let agent = currentAgent(chatId);
-  if (agent) return agent;
-  const created = await createSessionForChat(chatId, state.config.model, undefined, true);
-  if (!created.result.ok || created.agentId === undefined) {
-    await uiSend(chatId, `\u274C ${plain(created.result.text)}`, { parse_mode: "HTML" });
-    return undefined;
-  }
-  bindCreatedSession(chatId, created.agentId);
-  agent = currentAgent(chatId);
-  if (!agent) await uiSend(chatId, "\u274C No live agent in this session.", { parse_mode: "HTML" });
-  return agent;
-}
-
-async function dispatchPhoto(chatId: number, fileId: string, caption: string, messageId?: number): Promise<void> {
-  return dispatchPhotos(chatId, [{ fileId, caption, messageId }]);
-}
-
-/** Media-group batch: N images become ONE user turn (issue #9). */
-async function dispatchPhotos(chatId: number, photos: readonly { fileId: string; caption: string; messageId?: number }[]): Promise<void> {
-  const t = requireTransport();
-  const agent = await ensureChatAgent(chatId);
-  if (!agent) return;
-  const downloads = await Promise.all(photos.slice(0, 10).map(async (photo) => ({ ...photo, data: await t.downloadFile(photo.fileId) })));
-  if (downloads.some((photo) => !photo.data)) {
-    await uiSend(chatId, "\u274C One or more photo downloads failed \u2014 nothing was delivered.", { parse_mode: "HTML" });
-    return;
-  }
-  const attachments: NonNullable<Awaited<ReturnType<typeof saveImageAttachment>>["attachment"]>[] = [];
-  for (const photo of downloads) {
-    const saved = await saveImageAttachment(requireCtx(), photo.data!, "image/jpeg", `telegram-${photo.fileId}.jpg`);
-    if (!saved.ok || !saved.attachment) {
-      await uiSend(chatId, `\u274C ${plain(saved.text)}`, { parse_mode: "HTML" });
-      return;
-    }
-    attachments.push(saved.attachment);
-  }
-  const caption = photos.map((photo) => photo.caption).find((entry) => entry.trim() !== "") ?? "";
-  const firstId = photos[0]?.messageId;
-  const res = state.bridge?.deliverImages(chatId, attachments, caption, firstId);
-  if (res && !res.ok) await uiSend(chatId, `\u274C ${plain(res.text)}`, { parse_mode: "HTML" });
-  else {
-    await uiSend(chatId, `\u{1F4F7} ${plain(res?.text ?? "Images delivered.")} \u00B7 ${attachments.length} images \u00B7 /attachment ${plain(attachments.map((entry) => entry.attachmentId).join(" "))}`, { parse_mode: "HTML" });
-    scheduleBarSync(chatId, 0);
-  }
-}
-
-async function dispatchDocument(chatId: number, kind: "document" | "voice" | "video", fileId: string, name: string, mimeType: string, messageId?: number): Promise<void> {
-  const t = requireTransport();
-  const agent = await ensureChatAgent(chatId);
-  if (!agent) return;
-  const data = await t.downloadFile(fileId);
-  if (!data) {
-    await uiSend(chatId, `\u274C ${plain(kind)} download failed.`, { parse_mode: "HTML" });
-    return;
-  }
-  if (kind === "voice") {
-    const transcribed = await transcribeVoice(data, "voice.ogg", state.config.media?.transcribe);
-    if (!transcribed.ok || transcribed.transcript === undefined) {
-      await uiSend(chatId, `\u274C ${plain(transcribed.text)}`, { parse_mode: "HTML" });
-      return;
-    }
-    await uiSend(chatId, `\u{1F399}\uFE0F \u8F6C\u5199: ${plain(transcribed.transcript)}`, { parse_mode: "HTML" });
-    const delivered = state.bridge!.deliver(chatId, transcribed.transcript, messageId);
-    if (!delivered.ok) await uiSend(chatId, `\u274C ${plain(delivered.text)}`, { parse_mode: "HTML" });
-    else scheduleBarSync(chatId, 0);
-    return;
-  }
-  const saved = await saveDocumentAttachment(agent.id, data, name || `${kind}.bin`);
-  if (!saved.ok || saved.path === undefined) {
-    await uiSend(chatId, `\u274C ${plain(saved.text)}`, { parse_mode: "HTML" });
-    return;
-  }
-  await uiSend(chatId, plain(saved.text), { parse_mode: "HTML" });
-  const prompt = `\u{1F4CE} Telegram ${kind} saved to ${saved.path} (${data.byteLength} bytes, ${mimeType || "unknown type"}) \u2014 read and process it.`;
-  const delivered = state.bridge!.deliver(chatId, prompt, messageId);
-  if (!delivered.ok) await uiSend(chatId, `\u274C ${plain(delivered.text)}`, { parse_mode: "HTML" });
-  else scheduleBarSync(chatId, 0);
-}
+// Outbound + inbound attachment handlers live in media/attachments.ts. This
+// is their single wiring point: the router callbacks below consume the
+// dispatch* names and the tool registration consumes sendWorkspaceAttachments.
+const { dispatchPhoto, dispatchPhotos, dispatchDocument, sendWorkspaceAttachments } = makeAttachmentHandlers({
+  state,
+  requireTransport,
+  requireCtx,
+  uiSend,
+  currentAgent,
+  createSessionForChat,
+  bindCreatedSession,
+  scheduleBarSync,
+});
 
 // ---------------------------------------------------------------------------
 // Watch + lifecycle
@@ -4006,64 +3828,18 @@ async function mountTransport(ctx: Context): Promise<void> {
   });
   compactionWatcher.attach();
 
-  // Incremental todo cards + live bar count (issue #10). The first durable
-  // snapshot only primes the baseline. turn/end also refreshes the open
-  // Todo card immediately instead of waiting for the next 5s tick (#14).
-  refreshEventDisposers.push(
-    (ctx.on.bind(ctx) as (name: string, listener: (...args: unknown[]) => void) => () => void)("session/event", (...args: unknown[]) => {
-      const session = args[0] as { id: unknown };
-      const event = args[1] as { type?: string; data?: { todos?: readonly TodoView[] } };
-      const chatId = state.bridge?.chatIdForAgent(String(session.id));
-      if (chatId === undefined) return;
-      if (event.type === "turn/end") {
-        refreshActiveCards();
-        scheduleBarSync(chatId, 0);
-        return;
-      }
-      if (event.type !== "todo/write" || !Array.isArray(event.data?.todos)) return;
-      const next = normalizeTodos(event.data.todos);
-      const hadBaseline = todoSnapshots.has(chatId);
-      const previous = todoSnapshots.get(chatId) ?? [];
-      todoSnapshots.set(chatId, next);
-      if (hadBaseline) notifyTodoChange(chatId, previous, next);
-      refreshActiveCards();
-      scheduleBarSync(chatId, 0);
-    }),
-  );
-
-  // Refresh-only subscribers for the events the web forwards over
-  // events.mux/events.host: open panels re-read their data source, closed
-  // chats get no message. Waterfall events keep flowing (we return void).
-  const onRefreshEvent = ctx.on.bind(ctx) as (name: string, listener: (...args: unknown[]) => void) => () => void;
-  for (const name of FORWARDED_EVENT_NAMES) {
-    refreshEventDisposers.push(
-      onRefreshEvent(name, () => {
-        refreshAllPanels();
-        refreshActiveCards();
-      }),
-    );
-  }
-  for (const name of HOST_EVENT_NAMES) {
-    refreshEventDisposers.push(
-      onRefreshEvent(name, () => {
-        refreshAllPanels();
-        refreshActiveCards();
-      }),
-    );
-  }
-  // Bounded per-session bookkeeping (LOOP_AUDIT #8): drop live counters as
-  // soon as the harness reports the session disposed.
-  refreshEventDisposers.push(
-    onRefreshEvent("session/disposed", (...args: unknown[]) => {
-      const session = args[0] as { id?: unknown } | undefined;
-      if (session?.id === undefined) return;
-      const id = String(session.id);
-      forgetStatusSession(id);
-      statusSubagentCounts.delete(id);
-      const chatId = state.bridge?.chatIdForAgent(id);
-      if (chatId !== undefined) todoSnapshots.delete(chatId);
-    }),
-  );
+  // Harness-event forwarding (session/event todo/bar sync, web-forwarded
+  // refresh events, session/disposed bookkeeping) lives in core/events.ts.
+  // Disposers join the same teardown list, in registration order.
+  refreshEventDisposers.push(...attachSessionEvents(ctx, {
+    state,
+    todoSnapshots,
+    statusSubagentCounts,
+    refreshActiveCards,
+    refreshAllPanels,
+    scheduleBarSync,
+    notifyTodoChange,
+  }));
 
   state.interactive = attachInteractive(
     ctx,
@@ -4451,147 +4227,13 @@ export function apply(ctx: Context, loaderConfig?: unknown): void | Promise<void
     },
   });
 
-  ctx.tools.register(defineTool({
-    name: "telegram_send",
-    description: "Send an HTML message to one Telegram chat the bridge knows about.",
-    parameters: {
-      chatId: { type: "string", required: true, description: "Target chat id." },
-      text: { type: "string", required: true, description: "Message body (HTML)." },
-      disableNotification: { type: "boolean", description: "Send silently." },
-    },
-    output: textOutput(),
-    async execute(args) {
-      const chatId = Number(args.chatId);
-      if (!Number.isInteger(chatId) || !state.chats.has(chatId)) {
-        return JSON.stringify({ ok: false, error: `chat ${args.chatId} is not in the allowed roster` });
-      }
-      const t = requireTransport();
-      const id = await t.sendText(chatId, args.text, {
-        parse_mode: "HTML",
-        disable_notification: args.disableNotification === true,
-      });
-      return JSON.stringify({ ok: true, messageId: id ?? null });
-    },
-  }));
-
-  // Agent outbound attachments (#25). `telegram_attach` matches pi-telegram's
-  // tool name for cross-project agent migration; `telegram_send_file` is the
-  // original issue name kept as a drop-in alias.
-  const attachToolParameters = {
-    paths: {
-      type: "array" as const,
-      required: true as const,
-      items: { type: "string" as const, description: "Workspace-relative file path (1-10 entries)." },
-      description: "One or more local files under the workspace root.",
-    },
-    chatId: { type: "string" as const, description: "Target chat id. Defaults to the executing agent's bound Telegram chat." },
-    caption: { type: "string" as const, description: "Optional caption shown above the file (HTML)." },
-  };
-  ctx.tools.register(defineTool({
-    name: "telegram_attach",
-    description: "Send 1-10 workspace files to a Telegram chat. Images (.jpg/.jpeg/.png) go as photos, .ogg/.opus as voice notes, other audio as audio, and everything else as a document. Paths outside the workspace root or chats outside the allowed roster are rejected.",
-    parameters: attachToolParameters,
-    output: textOutput(),
-    async execute(args, exec) {
-      return sendWorkspaceAttachments(args, exec);
-    },
-  }));
-  ctx.tools.register(defineTool({
-    name: "telegram_send_file",
-    description: "Alias of telegram_attach: send 1-10 workspace files to a Telegram chat as photo/voice/audio/document by extension.",
-    parameters: attachToolParameters,
-    output: textOutput(),
-    async execute(args, exec) {
-      return sendWorkspaceAttachments(args, exec);
-    },
-  }));
-
-  ctx.tools.register(defineTool({
-    name: "telegram_reply",
-    description: "Reply to the current inbound Telegram message. Fails when there is no pending inbound message.",
-    parameters: {
-      text: { type: "string", required: true, description: "Reply body (HTML)." },
-      disableNotification: { type: "boolean", description: "Send silently." },
-    },
-    output: textOutput(),
-    async execute(args, exec: ToolRunContext) {
-      const bridge = state.bridge;
-      // Route by the calling agent, not by the most-recently-touched chat:
-      // two sessions in two chats may run telegram_reply concurrently.
-      const agentId = exec.agent?.id === undefined ? undefined : String(exec.agent.id);
-      const inbound = agentId !== undefined ? bridge?.inboundForAgent(agentId) : undefined;
-      if (!bridge || !inbound) throw new Error(agentId === undefined ? "no agent context for telegram_reply" : "no active inbound message");
-      await bridge.sendOutbound(inbound.chatId, args.text, {
-        replyToInbound: true,
-        parseMode: "HTML",
-        disableNotification: args.disableNotification === true,
-      });
-      return JSON.stringify({ ok: true, chatId: inbound.chatId });
-    },
-  }));
-
-  ctx.tools.register(defineTool({
-    name: "telegram_broadcast",
-    description: "Send the same HTML message to several Telegram chats concurrently.",
-    parameters: {
-      targets: {
-        type: "array",
-        required: true,
-        items: {
-          type: "object",
-          additionalProperties: false,
-          properties: { chatId: { type: "string", required: true, description: "Target chat id." } },
-        },
-      },
-      text: { type: "string", required: true, description: "Message body (HTML)." },
-    },
-    output: textOutput(),
-    async execute(args) {
-      const t = requireTransport();
-      const targets = (args.targets as { chatId?: string }[]).map((x) => x.chatId).filter((x): x is string => typeof x === "string");
-      const results = await Promise.all(
-        targets.map(async (chatId) => {
-          const numeric = Number(chatId);
-          if (!Number.isInteger(numeric) || !state.chats.has(numeric)) {
-            return { chatId, ok: false, error: "chat is not in the allowed roster" };
-          }
-          try {
-            const id = await t.sendText(numeric, args.text, { parse_mode: "HTML" });
-            return { chatId, ok: true, messageId: id ?? null };
-          } catch (err) {
-            return { chatId, ok: false, error: err instanceof Error ? err.message : String(err) };
-          }
-        }),
-      );
-      return JSON.stringify({ ok: results.length > 0 && results.every((r) => r.ok), results });
-    },
-  }));
-
-  ctx.tools.register(defineTool({
-    name: "telegram_status",
-    description: "Report the bridge's current state: bot connectivity, agent status, inbox queue, and known chats.",
-    parameters: {},
-    output: textOutput(),
-    async execute() {
-      return renderStatus();
-    },
-  }));
-
-  ctx.tools.register(defineTool({
-    name: "telegram_mark_no_reply",
-    description: "Mark the current inbound Telegram message as intentionally not replied.",
-    parameters: {
-      reason: { type: "string", description: "Optional reason (not sent to the chat)." },
-    },
-    output: textOutput(),
-    async execute(args, exec: ToolRunContext) {
-      const bridge = state.bridge;
-      const agentId = exec.agent?.id === undefined ? undefined : String(exec.agent.id);
-      const inbound = agentId !== undefined ? bridge?.inboundForAgent(agentId) : undefined;
-      if (!bridge || !inbound) return JSON.stringify({ ok: false, text: agentId === undefined ? "no agent context for telegram_mark_no_reply" : "no active inbound message for this agent" });
-      return JSON.stringify(bridge.markNoReply(args.reason ?? undefined, inbound.chatId));
-    },
-  }));
+  // Model tools live in core/tools.ts; this is their single wiring point.
+  registerTelegramTools(ctx, {
+    state,
+    requireTransport,
+    renderStatus,
+    sendWorkspaceAttachments,
+  });
 
   ctx.effect(() => teardownMount);
 
