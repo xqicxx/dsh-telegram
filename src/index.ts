@@ -105,6 +105,7 @@ import { renderTrajectoryLines } from "./telegram/trajectory.js";
 import { findWorkspaceRoot } from "./workspace.js";
 import { makeAttachmentHandlers } from "./media/attachments.js";
 import { attachSessionEvents } from "./core/events.js";
+import { createChatHub } from "./core/chat-hub.js";
 import { registerTelegramTools } from "./core/tools.js";
 import { createCardRegistry, withTimeout, widenCard } from "./core/cards.js";
 import { createModelCards } from "./cards/models.js";
@@ -146,8 +147,6 @@ interface State {
   barCollapsed: Map<number, boolean>;
 }
 
-/** Latest durable todo snapshot per chat (todo/write is whole-list). */
-const todoSnapshots = new Map<number, TodoView[]>();
 /** Goal progress feed; constructed once the transport exists (control ops). */
 let goalProgress: GoalProgressFeed | undefined;
 /** Context-pressure compaction watcher (issue #8). */
@@ -174,6 +173,31 @@ const state: State = {
 /** Disposers for the refresh-only cordis event subscriptions above. */
 const refreshEventDisposers: (() => void)[] = [];
 
+/** Per-chat lifecycle hub (yellow-1 step 3): single owner of the per-chat
+ * containers teardown/eject used to hand-enumerate (and twice leaked,
+ * review 🔴-8). Groups migrate here step by step; teardownMount/ejectChat
+ * delegate to disposeAll()/disposeChat() so a new container cannot be
+ * forgotten at a second call site. All deps are late-bound closures: the
+ * transport and the `telegram` service are assigned later on apply. */
+const {
+  abortChatLoops,
+  setTurnRunning,
+  menuPageIndex,
+  cardOrigins,
+  sessionCreateChains,
+  statusSubagentCounts,
+  todoSnapshots,
+  pendingStartAfterAllow,
+  pending,
+  disposeChat,
+  disposeAll,
+} = createChatHub({
+  getTransport: () => state.transport,
+  currentAgent,
+  stopLiveFeed: (chatId) => telegramService?.stopLiveFeed?.(chatId),
+  log,
+});
+
 /** Reverse every live mount effect (hot unplug / HMR / config restart). */
 function teardownMount(): void {
   state.interactive?.detach();
@@ -195,20 +219,12 @@ function teardownMount(): void {
   state.watching = false;
   state.chats.clear();
   state.context = null;
-  pendingRename = undefined;
-  pendingSubagentPrompt = undefined;
-  pendingSteer = undefined;
-  pendingSearch = undefined;
-  pendingPresetCopy = undefined;
-  pendingMkdir = undefined;
-  pendingPluginAdd = undefined;
-  pendingStartAfterAllow.clear();
-  for (const timer of typingLoops.values()) clearInterval(timer);
-  typingLoops.clear();
-  runningTurns.clear();
-  // Stale rearm budgets must not survive a remount (#48): a same-chat long
-  // turn after hot reload would otherwise hit a budget it never spent.
-  typingRearms.clear();
+  // Every hub-owned per-chat container (typing loops + turn flags + rearm
+  // budgets, menu pages, card origins, session-create chains, pending
+  // inputs, start-after-allow flags, subagent counts, todo snapshots) is
+  // reversed by the hub's single disposal trunk — the hand enumeration that
+  // used to live here leaked twice (review 🔴-8) and cannot happen again.
+  disposeAll();
   for (const timer of todoCardTimers.values()) clearInterval(timer);
   todoCardTimers.clear();
   for (const timer of state.barTimers.values()) clearTimeout(timer);
@@ -221,16 +237,12 @@ function teardownMount(): void {
   releaseAllModelSelections();
   releaseSavedAttachments();
   tokens.reset();
-  statusSubagentCounts.clear();
   statusSubagentSync = undefined;
-  todoSnapshots.clear();
   goalProgress?.detach();
   goalProgress = undefined;
   compactionWatcher?.detach();
   compactionWatcher = undefined;
   activeCardRenderers.clear();
-  menuPageIndex.clear();
-  cardOrigins.clear();
   void safeWrap("session-lifecycle-dispose", () => sessionLifecycle.dispose(), log);
   ephemeral.reset();
   statusPanel.reset();
@@ -238,24 +250,24 @@ function teardownMount(): void {
 }
 
 /** Stop every Telegram-side artifact owned by a chat that just lost its
- * whitelist entry: bridge binding, roster slot, typing loop, bar count and
- * the debounced bar-carrier refresh. The dsh session itself stays live so a
- * re-allowed chat can be bound to it again explicitly. */
+ * whitelist entry: bridge binding, roster slot, every hub-owned per-chat
+ * container (typing loop, turn flag, rearm budget, menu page, card origin,
+ * session-create chain, armed pending inputs, start-after-allow replay,
+ * todo snapshot — one `disposeChat` call instead of a hand-enumerated list),
+ * the Todo auto-refresh loop and the bar counts + debounced carrier refresh.
+ * The dsh session itself stays live so a re-allowed chat can be bound to it
+ * again explicitly. Like before, an ejected chat must not touch the
+ * live-feed seam, so abortChatLoops() is still not reused here. */
 function ejectChat(chatId: number): void {
   state.bridge?.bindAgent(chatId, undefined);
   state.chats.delete(chatId);
-  stopTyping(chatId);
-  runningTurns.delete(chatId);
   // The rearm budget is per-chat loop state too; leaving it behind would
-  // throttle typing on the chat's next mount (#48). abortChatLoops() is not
-  // reused here because an ejected chat must not touch the live-feed seam.
-  typingRearms.delete(chatId);
-  menuPageIndex.delete(chatId);
+  // throttle typing on the chat's next mount (#48) — the hub drops it here.
+  disposeChat(chatId);
   const todoTimer = todoCardTimers.get(chatId);
   if (todoTimer !== undefined) clearInterval(todoTimer);
   todoCardTimers.delete(chatId);
   activeCardRenderers.delete(chatId);
-  cardOrigins.delete(chatId);
   state.barCounts.delete(chatId);
   state.barTodoCounts.delete(chatId);
   const timer = state.barTimers.get(chatId);
@@ -449,93 +461,27 @@ function notifyDispatchFailure(chatId: number, label: string, err: unknown): voi
   void uiSend(chatId, `\u274C ${label} failed \u2014 please retry.`, { parse_mode: "HTML" });
 }
 
-/** Per-chat typing refreshers: Telegram's "typing" action expires after ~5s,
- * so long agent turns re-assert it every 4s until turn/end stops it. A hard
- * cap clears a leaked loop when an agent is disposed without turn/end. */
-const typingLoops = new Map<number, ReturnType<typeof setInterval>>();
-/** Chats whose latest turn/start has not yet seen turn/end (issue #17). */
-const runningTurns = new Set<number>();
-const TYPING_KEEPALIVE_MAX_MS = 10 * 60_000;
-/** Self-rearm budget (#48): a lost turn/end used to re-arm the keepalive
- * forever. Three windows (30 min) per turn/start is generous; a genuinely
- * running turn resets the budget whenever it re-asserts typing. */
-const TYPING_REARM_LIMIT = 3;
-const typingRearms = new Map<number, number>();
-
 /** Keepalive decision (#48): a live agent's own status is authoritative —
- * the sticky `runningTurns` flag goes stale when a turn/end event is lost,
+ * the sticky running-turn flag goes stale when a turn/end event is lost,
  * which used to re-arm the typing loop forever. The flag is only trusted
  * when no live agent can answer, and the rearm budget caps that stale path.
  * A genuinely running agent is never budget-killed: turns legitimately
- * outlast a few windows, so the budget must not fire before the agent check. */
-export function typingKeepaliveActive(agentRunning: boolean | undefined, stickyRunning: boolean, rearmCount: number, rearmLimit = TYPING_REARM_LIMIT): boolean {
-  if (agentRunning === true) return true;
-  if (agentRunning === false) return false;
-  if (rearmCount > rearmLimit) return false;
-  return stickyRunning;
-}
-
-function turnStillRunning(chatId: number): boolean {
-  const agent = currentAgent(chatId);
-  const agentRunning = agent === undefined ? undefined : agent.status === "running";
-  return typingKeepaliveActive(agentRunning, runningTurns.has(chatId), typingRearms.get(chatId) ?? 0);
-}
-
-function startTyping(chatId: number): void {
-  stopTyping(chatId);
-  const transport = state.transport;
-  if (!transport) return;
-  const fire = () => safeWrap(`typing(${chatId})`, () => transport.sendChatActionControl(chatId, "typing"), log);
-  void fire();
-  const timer = setInterval(() => {
-    void fire();
-  }, 4000);
-  typingLoops.set(chatId, timer);
-  // Self-arming one-shot guard: if turn/end was lost the loop must still die.
-  // When the turn is genuinely still running, renew one more keep-alive
-  // window instead of silently dropping the typing indicator (#17) — but
-  // never beyond the rearm budget (#48).
-  typingRearms.set(chatId, (typingRearms.get(chatId) ?? 0) + 1);
-  setTimeout(() => {
-    if (typingLoops.get(chatId) !== timer) return;
-    // A genuinely running turn RENEWS its budget instead of spending it (#48):
-    // the cap exists for the stale no-live-agent path, not to kill typing on
-    // a single turn that legitimately outlasts ~30-40 minutes.
-    const agent = currentAgent(chatId);
-    if (agent?.status === "running") typingRearms.delete(chatId);
-    if (turnStillRunning(chatId)) startTyping(chatId);
-    else stopTyping(chatId);
-  }, TYPING_KEEPALIVE_MAX_MS);
-}
+ * outlast a few windows, so the budget must not fire before the agent check.
+ * Lives in core/chat-hub.ts (yellow-1 step 3); re-exported so the public
+ * dist/index.js contract (test/issue-47-48.test.mjs) is unchanged. */
+export { typingKeepaliveActive } from "./core/chat-hub.js";
 
 /** The provided `telegram` service instance (assigned on plugin apply) so
  * core paths can reach renderer-assigned seams like stopLiveFeed (#48). */
 let telegramService: (ExtensionHost & Record<string, unknown>) | undefined;
 
-/** Terminal cleanup for one chat's background loops (#48): Abort must kill
- * the typing keepalive, the sticky turn flag, its rearm budget, and every
- * live-feed timer — not just hide the UI. */
-function abortChatLoops(chatId: number): void {
-  stopTyping(chatId);
-  runningTurns.delete(chatId);
-  typingRearms.delete(chatId);
-  telegramService?.stopLiveFeed?.(chatId);
-}
-
-function stopTyping(chatId: number): void {
-  const timer = typingLoops.get(chatId);
-  if (timer !== undefined) {
-    clearInterval(timer);
-    typingLoops.delete(chatId);
-  }
-}
+/** Terminal loop cleanup for one chat (#48) lives in core/chat-hub.ts and is
+ * destructured from the hub above; the live-feed seam arrives as a dep. */
 
 export { renderStatsStrip };
 
-/** Live subagent counts per agent id. `subagents.listChildren` is async, so
- * the Status card renders the latest snapshot and refreshAllPanels updates it
- * before the next in-place edit. */
-const statusSubagentCounts = new Map<string, number>();
+/** Live subagent counts per agent id live in core/chat-hub.ts (yellow-1
+ * step 3) and are destructured from the hub above. */
 let statusSubagentSync: Promise<void> | undefined;
 
 /** Bound one in-process service promise so `refreshStatusSubagents` always
@@ -639,10 +585,8 @@ function boundSessionCwd(ctx: Context, agentId: string | undefined): string | un
   return typeof cwd === "string" && cwd !== "" ? cwd : undefined;
 }
 
-/** Per-chat serialization for session creation. With router UI lanes, a
- * first inbound message and a fast `✨ New` / model-select tap can run
- * concurrently; this gate guarantees they still produce one session. */
-const sessionCreateChains = new Map<number, Promise<unknown>>();
+/** Per-chat serialization for session creation lives in core/chat-hub.ts
+ * (yellow-1 step 3) and is destructured from the hub above. */
 
 /**
  * Create this chat's next session. The old chat-owned agent (and only that
@@ -722,10 +666,8 @@ const { activeCardRenderers, openCard, refreshActiveCards, askConfirm, cardLoad 
   uiSend,
 });
 
-const menuPageIndex = new Map<number, number>();
-/** Which entry point opened the current card: bar-opened cards close on Back,
- * menu-opened cards return to the last menu page (issue #16). */
-const cardOrigins = new Map<number, "menu" | "bar">();
+// Menu page + card origin bookkeeping live in core/chat-hub.ts (yellow-1
+// step 3) and are destructured from the hub above.
 
 /** Paginated core menu. Page 0 = non-bar frequent actions; bar-mirrored
  * functions live on page 1; display-only/rare cards on pages 2-3. */
@@ -1030,7 +972,7 @@ async function dispatchToken(chatId: number, payload: Record<string, string>): P
       return openHostDirectoryCard(chatId, payload["path"] ?? state.workspaceRoot);
     case "host-mkdir-prompt": {
       const path = payload["path"] ?? state.workspaceRoot;
-      pendingMkdir = { chatId, path };
+      pending.mkdir = { chatId, path };
       await uiSend(chatId, `\u{1F4C1} Reply with the new folder name under ${plain(truncate(path, 48))} (or /cancel):`, {
         parse_mode: "HTML",
         reply_markup: inputPromptKeyboard("New folder name\u2026"),
@@ -1150,7 +1092,7 @@ async function dispatchToken(chatId: number, payload: Record<string, string>): P
         parse_mode: "HTML",
         reply_markup: inputPromptKeyboard("Prompt for subagent\u2026"),
       });
-      pendingSubagentPrompt = { chatId, parentId, childId };
+      pending.subagentPrompt = { chatId, parentId, childId };
       return;
     }
     case "subagent-interrupt": {
@@ -1314,7 +1256,7 @@ async function dispatchToken(chatId: number, payload: Record<string, string>): P
     }
     case "preset-copy": {
       const sourceId = payload["presetId"] ?? "";
-      pendingPresetCopy = { chatId, sourceId };
+      pending.presetCopy = { chatId, sourceId };
       await uiSend(chatId, `\u{1F4CB} Reply with the new preset id for a copy of ${plain(truncate(sourceId, 32))} (or /cancel):`, {
         parse_mode: "HTML",
         reply_markup: inputPromptKeyboard("New preset id\u2026"),
@@ -1451,14 +1393,6 @@ async function dispatchToken(chatId: number, payload: Record<string, string>): P
   }
 }
 
-let pendingSubagentPrompt: { chatId: number; parentId: string; childId: string } | undefined;
-let pendingSteer: { chatId: number; sessionId: string } | undefined;
-let pendingSearch: { chatId: number } | undefined;
-let pendingPresetCopy: { chatId: number; sourceId: string } | undefined;
-let pendingMkdir: { chatId: number; path: string } | undefined;
-/** Issue #50: awaiting the plugin-definition JSON reply. */
-let pendingPluginAdd: { chatId: number } | undefined;
-
 async function dispatchCallback(chatId: number, data: string): Promise<void> {
   const ext = extensionForCallback(data);
   if (ext) {
@@ -1547,7 +1481,7 @@ async function dispatchCallback(chatId: number, data: string): Promise<void> {
         parse_mode: "HTML",
         reply_markup: inputPromptKeyboard("New session title\u2026"),
       });
-      pendingRename = { chatId, sessionId: id };
+      pending.rename = { chatId, sessionId: id };
       return;
     }
     if (sub === "fork") {
@@ -1577,7 +1511,7 @@ async function dispatchCallback(chatId: number, data: string): Promise<void> {
       );
     }
     if (sub === "steer") {
-      pendingSteer = { chatId, sessionId: id };
+      pending.steer = { chatId, sessionId: id };
       await uiSend(chatId, `\u{1F3AF} Steer ${plain(truncate(id, 24))} \u2014 send the steer text:`, {
         parse_mode: "HTML",
         reply_markup: inputPromptKeyboard("Steer text\u2026"),
@@ -1708,7 +1642,7 @@ async function dispatchCallback(chatId: number, data: string): Promise<void> {
   if (data.startsWith("p:")) {
     const sub = data.slice(2);
     if (sub === "add") {
-      pendingPluginAdd = { chatId };
+      pending.pluginAdd = { chatId };
       await uiSend(
         chatId,
         [
@@ -1777,7 +1711,7 @@ async function dispatchCallback(chatId: number, data: string): Promise<void> {
     case "sessions":
       return actions["sessions"](actionCtx);
     case "search": {
-      pendingSearch = { chatId };
+      pending.search = { chatId };
       await uiSend(chatId, "\u{1F50D} Reply with the search query:", {
         parse_mode: "HTML",
         reply_markup: inputPromptKeyboard("Search query\u2026"),
@@ -1873,10 +1807,9 @@ async function dispatchCallback(chatId: number, data: string): Promise<void> {
   }
 }
 
-let pendingRename: { chatId: number; sessionId: string } | undefined;
-/** Chats whose first touch was `/start` while unauthorized: once they tap
- * Allow, replay the welcome instead of making them resend the command. */
-const pendingStartAfterAllow = new Set<number>();
+// Pending single-slot prompt inputs + the start-after-allow replay set live
+// in core/chat-hub.ts (yellow-1 step 3) and are destructured from the hub
+// above (`pending.rename`, `pending.steer`, …).
 
 // ---------------------------------------------------------------------------
 // Bar + command dispatch
@@ -2047,14 +1980,14 @@ async function dispatchCommand(chatId: number, command: string, args: string, me
       return;
     }
     case "cancel": {
-      if (pendingPresetCopy && pendingPresetCopy.chatId === chatId) {
-        pendingPresetCopy = undefined;
+      if (pending.presetCopy && pending.presetCopy.chatId === chatId) {
+        pending.presetCopy = undefined;
         await send("Preset copy cancelled.");
-      } else if (pendingMkdir && pendingMkdir.chatId === chatId) {
-        pendingMkdir = undefined;
+      } else if (pending.mkdir && pending.mkdir.chatId === chatId) {
+        pending.mkdir = undefined;
         await send("New-folder cancelled.");
-      } else if (pendingPluginAdd && pendingPluginAdd.chatId === chatId) {
-        pendingPluginAdd = undefined;
+      } else if (pending.pluginAdd && pending.pluginAdd.chatId === chatId) {
+        pending.pluginAdd = undefined;
         await send("Plugin add cancelled.");
       } else {
         await send("Nothing to cancel.");
@@ -2069,7 +2002,7 @@ async function dispatchCommand(chatId: number, command: string, args: string, me
       }
       const json = args.trim();
       if (json === "") {
-        pendingPluginAdd = { chatId };
+        pending.pluginAdd = { chatId };
         await send(
           [
             "\u{1F9E9} Reply with the plugin JSON (or /cancel):",
@@ -2254,7 +2187,7 @@ async function dispatchCommand(chatId: number, command: string, args: string, me
         return;
       }
       if (!title) {
-        pendingRename = { chatId, sessionId };
+        pending.rename = { chatId, sessionId };
         await send(`Reply with just the title to rename ${plain(truncate(sessionId, 24))}:`);
         return;
       }
@@ -2556,12 +2489,12 @@ async function dispatchCommand(chatId: number, command: string, args: string, me
       return;
     }
     case "subagentprompt": {
-      if (!pendingSubagentPrompt || pendingSubagentPrompt.chatId !== chatId) {
+      if (!pending.subagentPrompt || pending.subagentPrompt.chatId !== chatId) {
         await send("Open a subagent first, then reply with the prompt text.");
         return;
       }
-      const res = await promptSubagent(ctx, pendingSubagentPrompt.parentId, pendingSubagentPrompt.childId, args.trim());
-      pendingSubagentPrompt = undefined;
+      const res = await promptSubagent(ctx, pending.subagentPrompt.parentId, pending.subagentPrompt.childId, args.trim());
+      pending.subagentPrompt = undefined;
       await send(res.text, res.ok);
       return;
     }
@@ -2812,18 +2745,7 @@ async function mountTransport(ctx: Context): Promise<void> {
     transport: state.transport,
     getConfig: () => state.config,
     onStateChange: refreshAllPanels,
-    onTurnRunning: (chatId, running) => {
-      if (running) {
-        runningTurns.add(chatId);
-        // A genuine new turn gets a fresh keepalive budget (#48).
-        typingRearms.delete(chatId);
-        startTyping(chatId);
-      } else {
-        runningTurns.delete(chatId);
-        typingRearms.delete(chatId);
-        stopTyping(chatId);
-      }
-    },
+    onTurnRunning: setTurnRunning,
     log,
   });
   state.bridge.attach();
@@ -2972,14 +2894,14 @@ async function mountTransport(ctx: Context): Promise<void> {
     },
     onUserText: async (chatId, text, messageId) => {
       if (state.transport) void safeWrap(`typing(${chatId})`, () => state.transport!.sendChatActionControl(chatId, "typing"), log);
-      if (pendingSearch && pendingSearch.chatId === chatId) {
-        pendingSearch = undefined;
+      if (pending.search && pending.search.chatId === chatId) {
+        pending.search = undefined;
         void openSearchCard(chatId, text);
         return;
       }
-      if (pendingMkdir && pendingMkdir.chatId === chatId) {
-        const { path } = pendingMkdir;
-        pendingMkdir = undefined;
+      if (pending.mkdir && pending.mkdir.chatId === chatId) {
+        const { path } = pending.mkdir;
+        pending.mkdir = undefined;
         const name = text.trim();
         if (!name || name.includes("/") || name.includes("\\")) {
           void uiSend(chatId, "\u274C Folder name must be a single path segment (no / or \\).", { parse_mode: "HTML" });
@@ -2992,23 +2914,23 @@ async function mountTransport(ctx: Context): Promise<void> {
         })().catch((err) => log("new folder failed", err));
         return;
       }
-      if (pendingSteer && pendingSteer.chatId === chatId) {
-        const { sessionId } = pendingSteer;
-        pendingSteer = undefined;
+      if (pending.steer && pending.steer.chatId === chatId) {
+        const { sessionId } = pending.steer;
+        pending.steer = undefined;
         const res = promptSession(requireCtx(), sessionId, text, "steer");
         void uiSend(chatId, res.ok ? plain(res.text) : `\u274C ${plain(res.text)}`, { parse_mode: "HTML" });
         return;
       }
-      if (pendingRename && pendingRename.chatId === chatId) {
-        const sessionId = pendingRename.sessionId;
-        pendingRename = undefined;
+      if (pending.rename && pending.rename.chatId === chatId) {
+        const sessionId = pending.rename.sessionId;
+        pending.rename = undefined;
         const res = renameSession(requireCtx(), sessionId, text);
         void uiSend(chatId, res.ok ? plain(res.text) : `\u274C ${plain(res.text)}`, { parse_mode: "HTML" });
         return;
       }
-      if (pendingSubagentPrompt && pendingSubagentPrompt.chatId === chatId) {
-        const { parentId, childId } = pendingSubagentPrompt;
-        pendingSubagentPrompt = undefined;
+      if (pending.subagentPrompt && pending.subagentPrompt.chatId === chatId) {
+        const { parentId, childId } = pending.subagentPrompt;
+        pending.subagentPrompt = undefined;
         void safeWrap("subagent-prompt", () =>
           promptSubagent(requireCtx(), parentId, childId, text).then((res) =>
             uiSend(chatId, res.ok ? plain(res.text) : `\u274C ${plain(res.text)}`, { parse_mode: "HTML" }),
@@ -3018,9 +2940,9 @@ async function mountTransport(ctx: Context): Promise<void> {
         });
         return;
       }
-      if (pendingPresetCopy && pendingPresetCopy.chatId === chatId) {
-        const { sourceId } = pendingPresetCopy;
-        pendingPresetCopy = undefined;
+      if (pending.presetCopy && pending.presetCopy.chatId === chatId) {
+        const { sourceId } = pending.presetCopy;
+        pending.presetCopy = undefined;
         const newId = text.trim();
         if (!newId) {
           void uiSend(chatId, "\u274C Preset id must not be blank.", { parse_mode: "HTML" });
@@ -3036,8 +2958,8 @@ async function mountTransport(ctx: Context): Promise<void> {
         });
         return;
       }
-      if (pendingPluginAdd && pendingPluginAdd.chatId === chatId) {
-        pendingPluginAdd = undefined;
+      if (pending.pluginAdd && pending.pluginAdd.chatId === chatId) {
+        pending.pluginAdd = undefined;
         const agentId = boundAgentId(chatId);
         if (agentId === undefined) {
           void uiSend(chatId, "\u274C No live session in this chat \u2014 send a message first to create one, then /pluginadd.", { parse_mode: "HTML" });
@@ -3052,7 +2974,7 @@ async function mountTransport(ctx: Context): Promise<void> {
           parsed = value as Record<string, unknown>;
         } catch {
           void uiSend(chatId, '\u274C That is not a JSON object. Expected {"name", "purpose", "host"/"client"} — try again or /cancel.', { parse_mode: "HTML" });
-          pendingPluginAdd = { chatId };
+          pending.pluginAdd = { chatId };
           return;
         }
         const str = (key: string): string | undefined => (typeof parsed[key] === "string" ? (parsed[key] as string) : undefined);
