@@ -135,3 +135,60 @@ test('session disposal drops watcher state so a new episode can compact again (#
   assert.deepEqual(calls, ['compact', 'compact'], 'cooldown latch was forgotten with the session');
   watcher.detach();
 });
+
+test('ask policy on a session with no bound chat skips cleanly and fires once bound (#6)', async () => {
+  const listeners = new Map();
+  const calls = [];
+  const logs = [];
+  let chatId;
+  const ctx = {
+    agents: { get: () => ({ id: 'agent-1', session: { events: [] }, options: {} }) },
+    compaction: {
+      async compactIfNeeded() {
+        calls.push('compact');
+        return {};
+      },
+    },
+    on: (name, cb) => {
+      if (!listeners.has(name)) listeners.set(name, []);
+      listeners.get(name).push(cb);
+      return () => {};
+    },
+  };
+  const watcher = new CompactionWatcher({
+    ctx,
+    log: (message) => logs.push(message),
+    chatIdForAgent: () => chatId,
+    threshold: () => 0.8,
+    policy: () => 'ask',
+    cooldownMs: () => 60_000,
+    askApproval: (bound) => calls.push(`ask:${bound}`),
+    notify: () => {},
+    now: () => Date.now(),
+  });
+  watcher.attach();
+  const emit = (event) => {
+    for (const cb of listeners.get('session/event') ?? []) cb({ id: 'agent-1' }, event);
+  };
+  emit(ev('request/context', { contextWindow: 1000 }));
+  emit(ev('assistant/chunk', { chunk: { type: 'usage', usage: { inputTokens: 900 } } }));
+  // Pressure crosses the threshold with no chat bound: nothing may latch.
+  emit(ev('step/end', {}));
+  assert.deepEqual(calls, [], 'no card can be delivered without a bound chat');
+  assert.ok(logs.some((line) => line.includes('no chat is bound')), 'the skip is logged like other unavailable fallbacks');
+
+  // The chat binds afterwards: the next evaluation must still fire the ask
+  // (pendingApproval was never stuck), even though less than one cooldown has
+  // elapsed since the unbound trigger (the window was never burned).
+  chatId = 7;
+  emit(ev('step/end', {}));
+  assert.deepEqual(calls, ['ask:7'], 'a later trigger on the now-bound session still fires');
+  emit(ev('step/end', {}));
+  assert.deepEqual(calls, ['ask:7'], 'the armed ask is not repeated while it pends');
+
+  // And the armed episode settles normally: approving compacts.
+  watcher.approve('agent-1');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(calls, ['ask:7', 'compact']);
+  watcher.detach();
+});

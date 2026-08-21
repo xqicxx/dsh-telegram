@@ -398,8 +398,8 @@ function askViaTelegram(delivery: InteractiveDelivery, request: QuestionRequestL
     pending.questions.forEach((question) => pending.selections.set(question.id, []));
     questions.set(id, pending);
     request.signal?.addEventListener("abort", onAbort, { once: true });
-    void broadcastForSession(delivery, sessionId, renderQuestions(pending, 0), questionKeyboard(id, 0))
-      .then((delivered) => {
+    void broadcastForSession(delivery, sessionId, renderQuestions(pending, 0), questionKeyboard(id, 0)).then(
+      (delivered) => {
         for (const entry of delivered) pending.messageIds.set(entry.chatId, entry.messageId);
         pending.answerer = delivered[0]?.chatId;
         // Zero deliveries would leave the tool execution waiting forever for
@@ -407,8 +407,16 @@ function askViaTelegram(delivery: InteractiveDelivery, request: QuestionRequestL
         if (delivered.length === 0 && questions.delete(id)) {
           reject(new Error("no allowed Telegram chat is available to answer this question"));
         }
-      })
-      .catch(() => {});
+      },
+      // A rejected broadcast delivered nothing either: take the same path as
+      // zero deliveries so the tool execution cannot wait on a card that was
+      // never sent.
+      () => {
+        if (questions.delete(id)) {
+          reject(new Error("no allowed Telegram chat is available to answer this question"));
+        }
+      },
+    );
   });
 }
 
@@ -474,14 +482,17 @@ export function attachInteractive(ctx: Context, delivery: InteractiveDelivery, o
           const pending: PendingApproval = { id, approvalId, sessionId: req.agent.id, toolName: req.toolName, ...(req.reason === undefined ? {} : { reason: req.reason }), ...(goalId === undefined ? {} : { goalId }), resolve: settle, messageIds: new Map(), cardText };
           approvals.set(id, pending);
           req.signal?.addEventListener("abort", onAbort, { once: true });
-          void broadcastForSession(delivery, req.agent.id, cardText, approvalKeyboard(id, goalId, req.toolName))
-            .then((delivered) => {
+          void broadcastForSession(delivery, req.agent.id, cardText, approvalKeyboard(id, goalId, req.toolName)).then(
+            (delivered) => {
               for (const entry of delivered) pending.messageIds.set(entry.chatId, entry.messageId);
               // Zero deliveries would block the agent forever on a card no
               // chat can answer (LOOP_AUDIT #4): cancel instead.
               if (delivered.length === 0) settle("cancelled");
-            })
-            .catch(() => {});
+            },
+            // A rejected broadcast delivered nothing either: settle the same
+            // way as zero deliveries instead of blocking the agent forever.
+            () => settle("cancelled"),
+          );
         });
       }),
     );

@@ -254,6 +254,9 @@ function teardownMount(): void {
   for (const timer of typingLoops.values()) clearInterval(timer);
   typingLoops.clear();
   runningTurns.clear();
+  // Stale rearm budgets must not survive a remount (#48): a same-chat long
+  // turn after hot reload would otherwise hit a budget it never spent.
+  typingRearms.clear();
   for (const timer of todoCardTimers.values()) clearInterval(timer);
   todoCardTimers.clear();
   for (const timer of state.barTimers.values()) clearTimeout(timer);
@@ -291,6 +294,11 @@ function ejectChat(chatId: number): void {
   state.chats.delete(chatId);
   stopTyping(chatId);
   runningTurns.delete(chatId);
+  // The rearm budget is per-chat loop state too; leaving it behind would
+  // throttle typing on the chat's next mount (#48). abortChatLoops() is not
+  // reused here because an ejected chat must not touch the live-feed seam.
+  typingRearms.delete(chatId);
+  menuPageIndex.delete(chatId);
   const todoTimer = todoCardTimers.get(chatId);
   if (todoTimer !== undefined) clearInterval(todoTimer);
   todoCardTimers.delete(chatId);
@@ -2643,6 +2651,10 @@ async function dispatchCallback(chatId: number, data: string): Promise<void> {
   switch (action) {
     case "close":
       stopTodoCardRefresh(chatId);
+      // The menu is no longer open: drop the remembered page so an extension
+      // hot-plug cannot resurrect a card the user already closed, and so the
+      // per-chat map cannot grow without bound.
+      menuPageIndex.delete(chatId);
       cardOrigins.delete(chatId);
       activeCardRenderers.delete(chatId);
       await ephemeral.clear(chatId, uiOps(requireTransport()));
@@ -2916,6 +2928,8 @@ async function dispatchBarButton(chatId: number, label: string): Promise<void> {
         return;
       }
       const res = sessionLifecycle.stop(requireCtx(), agentId);
+      // Abort is terminal for background loops too, not just the UI (#48).
+      abortChatLoops(chatId);
       await uiSend(chatId, res.ok ? plain(res.text) : `\u274C ${plain(res.text)}`, { parse_mode: "HTML" });
       return;
     }

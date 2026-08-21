@@ -80,6 +80,38 @@ test('readTrajectory returns empty for an unknown session without persistence', 
   assert.deepEqual(result, { turns: [], hasMore: false });
 });
 
+test('readTrajectory parses the real readRaw JSONL content shape for a cold session', async () => {
+  // Production `readRaw` returns `{ meta, filename, content }` — verbatim
+  // JSONL text with no `events` field. Cold trajectory paging must parse
+  // that text instead of silently returning no turns.
+  const content = [
+    JSON.stringify({ seq: 0, type: 'turn/start', at: 1000, data: {} }),
+    JSON.stringify({ seq: 1, type: 'user/message', at: 1100, data: { content: [{ type: 'text', text: 'cold question' }] } }),
+    JSON.stringify({ seq: 2, type: 'assistant/message', at: 1500, data: { message: { content: [{ type: 'text', text: 'cold answer' }] } } }),
+    JSON.stringify({ seq: 3, type: 'turn/end', at: 2000, data: { reason: { kind: 'completed' } } }),
+  ].join('\n');
+  const persistence = {
+    list: async () => [{ id: 'cold', cwd: '/proj/cold' }],
+    readRaw: async () => ({ meta: {}, filename: 'session.jsonl', content }),
+  };
+  const ctx = {
+    sessions: { list: () => [], get: () => undefined },
+    agents: { list: () => [], get: () => undefined },
+    get: (name) => {
+      if (name === 'sessions') return ctx.sessions;
+      if (name === 'sessionPersistence') return persistence;
+      return undefined;
+    },
+  };
+  const result = await readTrajectory(ctx, 'cold', 6);
+  assert.equal(result.hasMore, false);
+  assert.equal(result.turns.length, 1);
+  assert.equal(result.turns[0].index, 1);
+  assert.equal(result.turns[0].outcome, 'completed');
+  assert.equal(result.turns[0].seconds, 1);
+  assert.deepEqual(result.turns[0].steps.map((step) => step.kind), ['user', 'assistant']);
+});
+
 test('renderTrajectoryLines renders turn headers, step icons and escapes HTML', () => {
   const result = {
     turns: [{

@@ -357,6 +357,23 @@ function parseRawEvents(content: string): SessionEventLike[] {
   return events;
 }
 
+/**
+ * Events for one session: the live log while resident in memory, else the
+ * persisted raw log parsed back to structural events. Production
+ * `PersistenceLike.readRaw` returns JSONL text under `content`; older test
+ * seams hand back parsed `events` (see the interface comment above). Returns
+ * `undefined` when neither source can serve this session.
+ */
+async function loadSessionEvents(ctx: Context, sessionId: string): Promise<readonly SessionEventLike[] | undefined> {
+  const session = sessionById(ctx, sessionId);
+  if (session) return session.events;
+  const persistence = persistenceOf(ctx);
+  if (!persistence) return undefined;
+  const raw = await persistence.readRaw(SessionId(sessionId)).catch(() => undefined);
+  if (raw === undefined) return undefined;
+  return raw.events ?? (typeof raw.content === "string" ? parseRawEvents(raw.content) : []);
+}
+
 function scanMeta(session: SessionLike): { blank: boolean; lastPromptAt?: number; eventCount: number } {
   let blank = true;
   let lastPromptAt: number | undefined;
@@ -494,8 +511,8 @@ export async function searchSessions(ctx: Context, query: string, limit = 20): P
         const id = String(header.id);
         if (live.has(id)) continue;
         try {
-          const raw = await persistence.readRaw(header.id);
-          if (raw) pushHits(id, raw.events ?? [], false);
+          const events = await loadSessionEvents(ctx, id);
+          if (events !== undefined) pushHits(id, events, false);
         } catch {
           /* skip unreadable logs */
         }
@@ -517,19 +534,7 @@ export interface HistoryItem {
 
 /** session.history: read a flat window of events (legacy; prefer readTrajectory). */
 export async function readHistory(ctx: Context, sessionId: string, limit = 20, beforeSeq?: number): Promise<HistoryItem[]> {
-  let events: readonly SessionEventLike[] | undefined;
-  let live = true;
-  const session = sessionById(ctx, sessionId);
-  if (session) {
-    events = session.events;
-  } else {
-    const persistence = persistenceOf(ctx);
-    if (!persistence) return [];
-    const raw = await persistence.readRaw(SessionId(sessionId)).catch(() => undefined);
-    events = raw?.events ?? [];
-    live = false;
-  }
-  void live;
+  const events = (await loadSessionEvents(ctx, sessionId)) ?? [];
   const end = beforeSeq === undefined ? events.length : events.findIndex((e) => e.seq >= beforeSeq);
   const start = Math.max(0, (end === -1 ? events.length : end) - limit);
   const out: HistoryItem[] = [];
@@ -575,16 +580,7 @@ export async function readTrajectory(
   maxTurns = 6,
   beforeSeq?: number,
 ): Promise<TrajectoryResult> {
-  let events: readonly SessionEventLike[] | undefined;
-  const session = sessionById(ctx, sessionId);
-  if (session) {
-    events = session.events;
-  } else {
-    const persistence = persistenceOf(ctx);
-    if (!persistence) return { turns: [], hasMore: false };
-    const raw = await persistence.readRaw(SessionId(sessionId)).catch(() => undefined);
-    events = raw?.events ?? [];
-  }
+  const events = (await loadSessionEvents(ctx, sessionId)) ?? [];
   if (events.length === 0) return { turns: [], hasMore: false };
 
   // Build turns: one turn spans turn/start .. turn/end. Events before the
@@ -1128,8 +1124,9 @@ export class SessionLifecycle {
       this.handles.set(handle.agent.id, handle);
       const replaced = options?.replaceSessionId;
       if (replaced !== undefined && replaced !== handle.agent.id) {
+        // close() owns the model-selection release for every destroy path
+        // that passes through it.
         await this.close(replaced, ctx).catch((err) => console.error("[dsh-telegram] failed to dispose replaced agent", err));
-        releaseModelSelection(replaced);
       }
       return {
         result: ok(`\u2728 New session ${handle.agent.id} in ${cwd}`),
@@ -1152,8 +1149,13 @@ export class SessionLifecycle {
   }
 
   /** Close (dispose) one live agent. Tracked handles are preferred; a live
-   * agent this plugin adopted externally falls back to its own dispose. */
+   * agent this plugin adopted externally falls back to its own dispose. The
+   * per-session model selection is released here so every destroy path that
+   * funnels through close() drops it exactly once (`releaseModelSelection`
+   * is idempotent; deleteSession disposes outside close() and keeps its own
+   * release call). */
   async close(agentId: string, ctx?: Context): Promise<AdapterResult> {
+    releaseModelSelection(agentId);
     const handle = this.handles.get(agentId);
     if (handle !== undefined) {
       this.handles.delete(agentId);

@@ -182,15 +182,24 @@ export class CompactionWatcher {
     const now = this.deps.now?.() ?? Date.now();
     if (state.used === undefined || state.window === undefined) return;
     if (!shouldCompact(state.used, state.window, this.deps.threshold(), state.lastTriggerAt, now, this.deps.cooldownMs())) return;
-    state.lastTriggerAt = now;
     if (policy === "ask") {
+      const chatId = this.deps.chatIdForAgent(sessionId);
+      // Arm the ask only once a bound chat can actually receive the card: an
+      // unbound session must neither leave pendingApproval stuck (it would
+      // block every later step/end evaluation forever) nor burn the cooldown
+      // window on a question nobody will ever see.
+      if (chatId === undefined) {
+        this.deps.log("context compaction ask skipped: no chat is bound to the session", { sessionId });
+        return;
+      }
       if (!state.pendingApproval) {
         state.pendingApproval = true;
-        const chatId = this.deps.chatIdForAgent(sessionId);
-        if (chatId !== undefined) this.deps.askApproval(chatId, sessionId, contextUsageOf(this.agentFor(sessionId)));
+        state.lastTriggerAt = now;
+        this.deps.askApproval(chatId, sessionId, contextUsageOf(this.agentFor(sessionId)));
       }
       return;
     }
+    state.lastTriggerAt = now;
     this.runAuto(sessionId, state);
   }
 

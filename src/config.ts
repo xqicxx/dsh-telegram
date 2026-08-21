@@ -477,18 +477,40 @@ const CONFIG_SECTIONS: readonly ConfigSection[] = ["security", "watch", "inbound
  * Overlay a raw loader-provided config (from `ctx.config` / `internal/update`)
  * on top of an already-normalized config. Only keys present in the raw patch
  * are touched — the rest of the running config stays untouched (hot update).
+ * Keys unknown to the schema are skipped (never written as `undefined`), and a
+ * patched plain-object value overlays one level deeper so sibling leaves in
+ * the running config survive (depth 2 covers the entire schema).
  */
 export function overlayConfig(current: TelegramConfig, raw: unknown): { config: TelegramConfig; changed: ConfigSection[] } {
   if (raw === undefined || raw === null || !isRecord(raw)) return { config: current, changed: [] };
   const normalized = normalizeConfig(raw);
-  const changed = CONFIG_SECTIONS.filter((section) => isRecord(raw[section]));
   const merged: TelegramConfig = { ...current };
-  for (const section of changed) {
-    const rawSection = raw[section] as Record<string, unknown>;
+  const changed: ConfigSection[] = [];
+  for (const section of CONFIG_SECTIONS) {
+    const rawSection = raw[section];
+    if (!isRecord(rawSection)) continue;
     const normalizedSection = normalized[section] as Record<string, unknown>;
     const out: Record<string, unknown> = { ...(current[section] as Record<string, unknown>) };
-    for (const key of Object.keys(rawSection)) out[key] = normalizedSection[key];
-    merged[section] = out as never;
+    let applied = false;
+    for (const key of Object.keys(rawSection)) {
+      const next = normalizedSection[key];
+      if (next === undefined) continue; // unknown key: skip instead of writing undefined
+      const prev = out[key];
+      if (isRecord(next) && isRecord(prev)) {
+        // Plain-object value (media.transcribe is the only one today): overlay
+        // per sub-key so sibling leaves in the running config survive.
+        const deep: Record<string, unknown> = { ...prev };
+        for (const subKey of Object.keys(next)) deep[subKey] = next[subKey];
+        out[key] = deep;
+      } else {
+        out[key] = next;
+      }
+      applied = true;
+    }
+    if (applied) {
+      merged[section] = out as never;
+      changed.push(section);
+    }
   }
   return { config: merged, changed };
 }

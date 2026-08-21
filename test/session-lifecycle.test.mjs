@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { SessionLifecycle } from '../dist/harness/adapters/sessions.js';
+import { SessionLifecycle, selectSessionModel, currentSessionModel } from '../dist/harness/adapters/sessions.js';
 
 function makeCtx({ liveAgents = [], defaultSelection = { provider: 'opencode-go', model: 'deepseek-v4-flash' } } = {}) {
   const created = [];
@@ -98,4 +98,27 @@ test('a hung agent dispose cannot wedge session close/create forever (#20)', asy
   const res = await closing;
   assert.equal(res.ok, true, 'close returns after the 10s dispose deadline');
   await lifecycle.dispose().catch(() => {});
+});
+
+test('SessionLifecycle.close releases the per-session model selection', async () => {
+  // /model then close used to leak the selections entry and its dispose
+  // closure; every destroy path through close() must release it exactly once.
+  const agent = { id: 'sel-lc', options: { provider: 'default-p', model: 'default-m' }, ctx: { on: () => () => {} } };
+  const ctx = {
+    agents: { list: () => [], get: (id) => (String(id) === 'sel-lc' ? agent : undefined) },
+    get: (name) => (name === 'llm' ? { resolveCallConfig: async (config) => config } : undefined),
+  };
+  const picked = await selectSessionModel(ctx, 'sel-lc', 'picked-p', 'picked-m');
+  assert.equal(picked.ok, true);
+  assert.equal(currentSessionModel(ctx, 'sel-lc').model, 'picked-m', 'selection is active before close');
+
+  const lifecycle = new SessionLifecycle();
+  lifecycle.adopt({ agent: { id: 'sel-lc' }, dispose: async () => {} });
+  const res = await lifecycle.close('sel-lc');
+  assert.equal(res.ok, true);
+  assert.equal(
+    currentSessionModel(ctx, 'sel-lc').model,
+    'default-m',
+    'close() releases the selection — the live agent default shows through again',
+  );
 });

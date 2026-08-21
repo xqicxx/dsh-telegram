@@ -213,6 +213,40 @@ test('listSessionDetails parses the real readRaw JSONL content shape for cold ti
   assert.equal(details[0].cwd, '/proj/beta');
 });
 
+test('cold-session history and search parse the real readRaw JSONL content shape', async () => {
+  // Production `readRaw` returns `{ meta, filename, content }` — verbatim
+  // JSONL text with no `events` field. Cold /history and cold-log search
+  // must parse that text instead of silently returning empty.
+  const content = [
+    JSON.stringify({ seq: 0, type: 'user/message', at: 100, data: { content: [{ type: 'text', text: 'needle in a cold log' }] } }),
+    JSON.stringify({ seq: 1, type: 'assistant/message', at: 200, data: { content: [{ type: 'text', text: 'cold answer' }] } }),
+    JSON.stringify({ seq: 2, type: 'tool/call', at: 300, data: { name: 'bash', arguments: '{"command":"ls"}' } }),
+  ].join('\n');
+  const persistence = {
+    list: async () => [{ id: 'cold', cwd: '/proj/cold' }],
+    readRaw: async () => ({ meta: {}, filename: 'session.jsonl', content }),
+  };
+  const ctx = {
+    sessions: { list: () => [], get: () => undefined },
+    agents: { list: () => [], get: () => undefined },
+    get: (name) => {
+      if (name === 'sessions') return ctx.sessions;
+      if (name === 'sessionPersistence') return persistence;
+      return undefined;
+    },
+  };
+  const history = await readHistory(ctx, 'cold');
+  assert.deepEqual(history.map((item) => item.seq), [0, 1, 2], '/history reads the parsed cold log');
+  assert.equal(history[0].role, 'user');
+  assert.match(history[2].text, /bash/);
+
+  const hits = await searchSessions(ctx, 'needle in a cold log');
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].sessionId, 'cold');
+  assert.equal(hits[0].seq, 0);
+  assert.equal(hits[0].live, false);
+});
+
 test('displayTitleFor mirrors the web title → cwd basename → id chain', () => {
   assert.equal(displayTitleFor('  Continue  ', '/proj/alpha', 's1'), 'Continue');
   assert.equal(displayTitleFor(undefined, '/proj/alpha/', 's1'), 'alpha');

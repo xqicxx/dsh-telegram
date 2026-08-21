@@ -61,3 +61,38 @@ test('ensureOpencodeGoResponsesRoute adds one additive settings route and is ide
   assert.equal(await ensureOpencodeGoResponsesRoute(ctx, () => {}), true);
   assert.equal(writes.length, 1, 'an existing route is never rewritten');
 });
+
+test('a throwing settings service degrades probing to a no-op and the next probe retries (#3)', async () => {
+  let describeThrows = true;
+  const providerConfig = { 'opencode-go': { apiKeyEnv: 'OPENCODE_GO_API_KEY' } };
+  const llmProviders = ['opencode-go'];
+  const writes = [];
+  const settings = {
+    writable: true,
+    describe: () => {
+      if (describeThrows) throw new Error('settings store offline');
+      return [{ ns: 'llm-pi-ai', revision: 7, value: { providers: providerConfig } }];
+    },
+    update: async (ns, patch) => {
+      writes.push(patch);
+      providerConfig[OPENCODE_GO_RESPONSES_ROUTE] = patch.providers[OPENCODE_GO_RESPONSES_ROUTE];
+      llmProviders.push(OPENCODE_GO_RESPONSES_ROUTE);
+    },
+  };
+  const ctx = {
+    get: (name) => {
+      if (name === 'llm') return { listProviders: () => llmProviders.map((id) => ({ id })) };
+      if (name === 'settings') return settings;
+      return undefined;
+    },
+  };
+  const logs = [];
+  // The first probe fails cleanly instead of rejecting into a poisoned latch.
+  assert.equal(await ensureOpencodeGoResponsesRoute(ctx, (message) => logs.push(message)), false);
+  assert.match(logs.at(-1), /settings\.describe failed/);
+  // The singleton was released on failure: a repaired settings service lets
+  // the very next model-selection attempt retry and succeed.
+  describeThrows = false;
+  assert.equal(await ensureOpencodeGoResponsesRoute(ctx, (message) => logs.push(message)), true);
+  assert.equal(writes.length, 1, 'the retried probe performs the provisioning write');
+});

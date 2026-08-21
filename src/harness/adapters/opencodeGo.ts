@@ -79,7 +79,15 @@ async function provisionOnce(ctx: Context, log: (message: string, error?: unknow
     return false;
   }
   for (let attempt = 0; attempt < 3; attempt += 1) {
-    const descriptor = settings.describe({ redactSecrets: true }).find((entry) => entry.ns === "llm-pi-ai");
+    // A throwing settings service must degrade probing to a clean no-op, not
+    // reject the shared provisioning promise for every later model selection.
+    let descriptor: { ns: string; value: unknown; revision?: number } | undefined;
+    try {
+      descriptor = settings.describe({ redactSecrets: true }).find((entry) => entry.ns === "llm-pi-ai");
+    } catch (err) {
+      log(`skipped ${OPENCODE_GO_RESPONSES_ROUTE} provisioning: settings.describe failed`, err);
+      return false;
+    }
     if (descriptor === undefined) return false;
     const value = (descriptor.value ?? {}) as { providers?: Record<string, { apiKeyEnv?: string }> };
     const providers = value.providers ?? {};
@@ -151,8 +159,17 @@ export function ensureOpencodeGoResponsesRoute(ctx: Context, log: (message: stri
       if (timer !== undefined) clearTimeout(timer);
     }
   })();
-  void provisioning.then(() => {
-    provisioning = undefined;
-  });
+  // Clear the singleton on BOTH outcomes (the old success-only clear left a
+  // rejected probe pinned forever). The two-arg then keeps this bookkeeping
+  // chain handled, so no unhandled rejection is raised here; callers still
+  // receive the original outcome through the returned promise.
+  void provisioning.then(
+    () => {
+      provisioning = undefined;
+    },
+    () => {
+      provisioning = undefined;
+    },
+  );
   return provisioning;
 }

@@ -224,3 +224,38 @@ test('normalizeConfig validates the media transcription section (#9)', () => {
   assert.ok(live.changed.includes('media'));
   assert.equal(live.config.media.transcribe.model, 'whisper-2');
 });
+
+test('overlayConfig overlays plain-object values per sub-key so sibling leaves survive', () => {
+  const base = normalizeConfig({ media: { transcribe: { baseUrl: 'https://x/v1', model: 'whisper-large' } } });
+  const { config, changed } = overlayConfig(base, { media: { transcribe: { apiKey: 'sk-x' } } });
+  assert.deepEqual(changed, ['media']);
+  assert.deepEqual(
+    config.media.transcribe,
+    { baseUrl: 'https://x/v1', model: 'whisper-large', apiKey: 'sk-x' },
+    'patching one transcribe leaf must not wipe the configured siblings',
+  );
+  assert.equal(base.media.transcribe.apiKey, undefined, 'overlayConfig must not mutate the input config');
+});
+
+test('overlayConfig skips unknown keys and reports no change for unknown-only patches', () => {
+  const base = normalizeConfig(undefined);
+  const typo = overlayConfig(base, { outbound: { typoKey: 1 } });
+  assert.deepEqual(typo.changed, [], 'unknown-only patches are not reported as applied');
+  assert.equal('typoKey' in typo.config.outbound, false, 'unknown keys are never written as undefined');
+  assert.deepEqual(typo.config.outbound, base.outbound);
+  const mixed = overlayConfig(base, { watch: { autoStart: true, nope: 1 } });
+  assert.deepEqual(mixed.changed, ['watch'], 'a known key alongside unknown ones still applies');
+  assert.equal(mixed.config.watch.autoStart, true);
+  assert.equal('nope' in mixed.config.watch, false);
+});
+
+test('overlayConfig keeps flat-key overlay semantics unchanged', () => {
+  const base = normalizeConfig({ outbound: { sendRatePerSecond: 5, maxRetries: 2 } });
+  const { config, changed } = overlayConfig(base, { outbound: { maxRetries: 7 } });
+  assert.deepEqual(changed, ['outbound']);
+  assert.equal(config.outbound.maxRetries, 7);
+  assert.equal(config.outbound.sendRatePerSecond, 5, 'unpatched flat siblings stay untouched');
+  const arrays = overlayConfig(base, { security: { allowedChatIds: [3] } });
+  assert.deepEqual(arrays.changed, ['security']);
+  assert.deepEqual(arrays.config.security.allowedChatIds, [3], 'array values still replace wholesale');
+});

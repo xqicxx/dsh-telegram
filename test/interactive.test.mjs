@@ -452,6 +452,54 @@ test('an approval nobody receives cancels instead of blocking the tool (#20)', a
   interactive.detach();
 });
 
+test('a broadcast rejection rejects the question instead of waiting forever (#2)', async () => {
+  const delivery = fakeDelivery();
+  let mintedId;
+  delivery.broadcast = async (text, keyboard) => {
+    // The card keyboard is built before delivery, so it carries the minted
+    // pending id even though the send itself fails.
+    mintedId = Number(keyboard.inline_keyboard.at(-1)[0].callback_data.split(':')[1]);
+    throw new Error('network down');
+  };
+  let provider;
+  const ctx = {
+    get: (name) => (name === 'userQuestions' ? { provider: undefined, registerProvider(p) { provider = p; return () => {}; } } : undefined),
+  };
+  const interactive = attachInteractive(ctx, delivery);
+  await assert.rejects(
+    provider.ask(questionRequest('s1', [{ id: 'q1', question: 'Pick one' }])),
+    /no allowed Telegram chat is available/,
+    'the tool promise settles with the same error as the zero-delivery path',
+  );
+  assert.notEqual(mintedId, undefined);
+  assert.equal(questionIdAt(mintedId, 0), undefined, 'the rejected question leaves no pending entry behind');
+  interactive.detach();
+});
+
+test('a broadcast rejection cancels the approval instead of blocking the tool (#2)', async () => {
+  const delivery = fakeDelivery();
+  let mintedId;
+  delivery.broadcast = async (text, keyboard) => {
+    mintedId = Number(keyboard.inline_keyboard[0][0].callback_data.split(':')[1]);
+    throw new Error('network down');
+  };
+  const events = fakeEvents();
+  const ctx = { get: (name) => (name === 'approval' ? {} : undefined), on: events.on.bind(events) };
+  const interactive = attachInteractive(ctx, delivery);
+  const listener = events.listeners.get('approval/request');
+  const req = {
+    agent: { id: 's1', session: { events: [{ seq: 0, type: 'approval/asked', data: { id: 'app-net', callId: 'c-net' } }] } },
+    toolName: 'bash',
+    callId: 'c-net',
+    signal: undefined,
+  };
+  const outcome = await listener(req, async () => 'fallback');
+  assert.equal(outcome, 'cancelled', 'the tool promise settles instead of waiting forever');
+  assert.notEqual(mintedId, undefined);
+  assert.equal(interactive.answerApproval(mintedId, 'allowed-once'), false, 'the settled approval leaves no pending entry behind');
+  interactive.detach();
+});
+
 test('telegram ownership answers ask_user_question at tools/execute when the web proxy owns the provider seam', async () => {
   const delivery = fakeDelivery();
   delivery.chatForSession = (sessionId) => (sessionId === 's-owner' ? 555 : undefined);
