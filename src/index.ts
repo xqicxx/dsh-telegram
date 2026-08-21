@@ -1922,6 +1922,116 @@ async function openAboutCard(chatId: number): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// Action registry (structural yellow-2)
+// ---------------------------------------------------------------------------
+// ONE home for every action reachable from more than one dispatch surface.
+// The dispatchers resolve their own case to a registry key and thin-route
+// here, so behavior cannot drift between origins. Origin differences are
+// explicit in the entries instead of duplicated case bodies:
+//  - `reply(text, ok)` mirrors each surface's historical send path:
+//    callback/bar = `uiSend(ok ? plain : ❌plain, HTML)`; command = the
+//    dispatcher's logging `send()` wrapper. Byte-identical output per origin.
+//  - `new` has THREE behaviors: callback `new` only opens the picker card,
+//    while callback `new-default` / bar ✨ / /new all create+bind and differ
+//    only in the announcement (sendWithLiveBar + ✨ vs a plain send() reply).
+//    `new-default` stays a distinct key because the callback surface carries
+//    two separate actions; `new` origin-branches between opener and create.
+//  - `abort` covers callback abort/stop, bar ⏹/🛑 and /abort: one core
+//    (sessionLifecycle.stop + abortChatLoops) with an origin branch — only the
+//    callback navigates back to the remembered menu page afterwards, and the
+//    no-agent line is historically RAW from callback/bar but escaped (via
+//    send()) from /abort, so both byte shapes are preserved.
+//  - `close-session` is command /stop ONLY (sessionLifecycle.close + unbind +
+//    its own texts). Deliberately NOT merged with `abort`: callback/bar
+//    "stop" mean abort, the command means close — a semantic split.
+
+type ActionOrigin = "token" | "callback" | "bar" | "command";
+type ActionReply = (text: string, ok?: boolean) => Promise<void>;
+interface ActionContext {
+  chatId: number;
+  origin: ActionOrigin;
+  reply: ActionReply;
+  payload?: Record<string, string>;
+  args?: string;
+  messageId?: number;
+}
+
+/** The callback/bar reply shape: inline ❌ on failure, HTML parse mode. */
+function uiReply(chatId: number): ActionReply {
+  return async (text, ok = true) => {
+    await uiSend(chatId, ok ? plain(text) : `❌ ${plain(text)}`, { parse_mode: "HTML" });
+  };
+}
+
+/** Shared create+bind behind callback `new-default`, bar ✨ and /new. Only the
+ * announcement differs: surfaces with a live bar get ✨ and a bar refresh;
+ * /new gets a plain send() reply (no ✨, no bar refresh). */
+async function runNewSessionCreate(c: ActionContext): Promise<void> {
+  const { result: res, agentId } = await createSessionForChat(c.chatId);
+  const bound = bindCreatedSession(c.chatId, agentId);
+  if (c.origin === "command") {
+    await c.reply(res.ok && !bound ? "Session created but the chat binding is not live yet — send any message to rebind." : res.text, res.ok);
+    return;
+  }
+  await sendWithLiveBar(c.chatId, res.ok
+    ? (bound ? `✨ ${plain(res.text)}` : "❌ Session created but the chat binding is not live yet — send any message to rebind.")
+    : `❌ ${plain(res.text)}`);
+}
+
+const actions: Record<string, (c: ActionContext) => Promise<void> | void> = {
+  // Card openers — verbatim identical on every surface that carries them.
+  "menu": (c) => openMenuAt(c.chatId, 0),
+  "sessions": (c) => openSessionsCard(c.chatId, lastProjectKey(c.chatId)),
+  "models": (c) => openModelsCard(c.chatId),
+  "status": (c) => openStatusPanel(c.chatId),
+  "queue": (c) => openQueueCard(c.chatId),
+  "todos": (c) => openTodosCard(c.chatId),
+  "goals": (c) => openGoalsCard(c.chatId),
+  "presets": (c) => openPresetsCard(c.chatId),
+  "plugins": (c) => openPluginsCard(c.chatId),
+  "mode": (c) => openModeCard(c.chatId),
+  "workspaces": (c) => openWorkspacesCard(c.chatId),
+  "skills": (c) => openSkillsCard(c.chatId),
+  "jobs": (c) => openJobsCard(c.chatId),
+  "host": (c) => openHostCard(c.chatId),
+  // Core actions.
+  "compact": async (c) => {
+    const res = await compactCurrent(requireCtx(), boundAgentId(c.chatId));
+    await c.reply(res.text, res.ok);
+  },
+  "new": (c) => {
+    if (c.origin === "callback") return openNewSessionCard(c.chatId);
+    return runNewSessionCreate(c);
+  },
+  "new-default": (c) => runNewSessionCreate(c),
+  "abort": async (c) => {
+    const agentId = boundAgentId(c.chatId);
+    if (agentId === undefined) {
+      if (c.origin === "command") await c.reply("No live agent in this session — Abort only stops this chat's current turn.", false);
+      else await uiSend(c.chatId, "❌ No live agent in this session — Abort only stops this chat's current turn.", { parse_mode: "HTML" });
+      if (c.origin === "callback") return openMenuAt(c.chatId, menuPageIndex.get(c.chatId) ?? 0);
+      return;
+    }
+    const res = sessionLifecycle.stop(requireCtx(), agentId);
+    // Abort is terminal for background loops too, not just the UI (#48).
+    abortChatLoops(c.chatId);
+    await c.reply(res.text, res.ok);
+    if (c.origin === "callback") return openMenuAt(c.chatId, menuPageIndex.get(c.chatId) ?? 0);
+  },
+  "close-session": async (c) => {
+    const agentId = boundAgentId(c.chatId);
+    if (agentId === undefined) {
+      await c.reply("No live agent in this session.", false);
+      return;
+    }
+    const res = await sessionLifecycle.close(agentId, requireCtx());
+    abortChatLoops(c.chatId);
+    state.bridge?.bindAgent(c.chatId, undefined);
+    await c.reply(res.ok ? `${res.text} — send any message to start a new session.` : res.text, res.ok);
+  },
+};
+
+// ---------------------------------------------------------------------------
 // Callback dispatch
 // ---------------------------------------------------------------------------
 
@@ -2646,6 +2756,7 @@ async function dispatchCallback(chatId: number, data: string): Promise<void> {
   if (!match) return;
   const action = match[1]!;
   const payload = match[2] !== undefined ? decodeCallbackValue(match[2]) : undefined;
+  const actionCtx: ActionContext = { chatId, origin: "callback", reply: uiReply(chatId) };
   switch (action) {
     case "close":
       stopTodoCardRefresh(chatId);
@@ -2676,18 +2787,8 @@ async function dispatchCallback(chatId: number, data: string): Promise<void> {
     case "page":
       return;
     case "abort":
-    case "stop": {
-      const agentId = boundAgentId(chatId);
-      if (agentId === undefined) {
-        await uiSend(chatId, "\u274C No live agent in this session \u2014 Abort only stops this chat's current turn.", { parse_mode: "HTML" });
-        return openMenuAt(chatId, menuPageIndex.get(chatId) ?? 0);
-      }
-      const res = sessionLifecycle.stop(requireCtx(), agentId);
-      // Abort is terminal for background loops too, not just the UI (#48).
-      abortChatLoops(chatId);
-      await uiSend(chatId, res.ok ? plain(res.text) : `\u274C ${plain(res.text)}`, { parse_mode: "HTML" });
-      return openMenuAt(chatId, menuPageIndex.get(chatId) ?? 0);
-    }
+    case "stop":
+      return actions["abort"](actionCtx);
     case "collapsebar":
       return setBarCollapsed(chatId, true);
     case "returnbar":
@@ -2698,11 +2799,11 @@ async function dispatchCallback(chatId: number, data: string): Promise<void> {
     case "project":
       return openProjectCard(chatId);
     case "models":
-      return openModelsCard(chatId);
+      return actions["models"](actionCtx);
     case "plugins":
-      return openPluginsCard(chatId);
+      return actions["plugins"](actionCtx);
     case "sessions":
-      return openSessionsCard(chatId, lastProjectKey(chatId));
+      return actions["sessions"](actionCtx);
     case "search": {
       pendingSearch = { chatId };
       await uiSend(chatId, "\u{1F50D} Reply with the search query:", {
@@ -2723,9 +2824,9 @@ async function dispatchCallback(chatId: number, data: string): Promise<void> {
       return openSessionsCard(chatId, lastProjectKey(chatId));
     }
     case "mode":
-      return openModeCard(chatId);
+      return actions["mode"](actionCtx);
     case "queue":
-      return openQueueCard(chatId);
+      return actions["queue"](actionCtx);
     case "allowed":
       return openAllowedCard(chatId);
     case "watch":
@@ -2735,22 +2836,13 @@ async function dispatchCallback(chatId: number, data: string): Promise<void> {
     case "about":
       return openAboutCard(chatId);
     case "status":
-      return openStatusPanel(chatId);
+      return actions["status"](actionCtx);
     case "new":
-      return openNewSessionCard(chatId);
-    case "new-default": {
-      const { result: res, agentId } = await createSessionForChat(chatId);
-      const bound = bindCreatedSession(chatId, agentId);
-      await sendWithLiveBar(chatId, res.ok
-        ? (bound ? `\u2728 ${plain(res.text)}` : "\u274C Session created but the chat binding is not live yet \u2014 send any message to rebind.")
-        : `\u274C ${plain(res.text)}`);
-      return;
-    }
-    case "compact": {
-      const res = await compactCurrent(requireCtx(), boundAgentId(chatId));
-      await uiSend(chatId, res.ok ? plain(res.text) : `\u274C ${plain(res.text)}`, { parse_mode: "HTML" });
-      return;
-    }
+      return actions["new"](actionCtx);
+    case "new-default":
+      return actions["new-default"](actionCtx);
+    case "compact":
+      return actions["compact"](actionCtx);
     case "allowthis": {
       if (!isChatAllowed(state.config, chatId)) {
         state.config.security.allowedChatIds.push(chatId);
@@ -2775,25 +2867,25 @@ async function dispatchCallback(chatId: number, data: string): Promise<void> {
       );
       return openWatchCard(chatId);
     case "workspaces":
-      return openWorkspacesCard(chatId);
+      return actions["workspaces"](actionCtx);
     case "goals":
-      return openGoalsCard(chatId);
+      return actions["goals"](actionCtx);
     case "todos":
-      return openTodosCard(chatId);
+      return actions["todos"](actionCtx);
     case "skills":
-      return openSkillsCard(chatId);
+      return actions["skills"](actionCtx);
     case "subagents":
       return openSubagentsCard(chatId);
     case "presets":
-      return openPresetsCard(chatId);
+      return actions["presets"](actionCtx);
     case "hostsettings":
       return openHostSettingsCard(chatId);
     case "credentials":
       return openCredentialsCard(chatId);
     case "host":
-      return openHostCard(chatId);
+      return actions["host"](actionCtx);
     case "jobs":
-      return openJobsCard(chatId);
+      return actions["jobs"](actionCtx);
     case "dynamic":
       return openDynamicCordisCard(chatId);
     case "capabilities":
@@ -2877,40 +2969,32 @@ async function dispatchBarButton(chatId: number, label: string): Promise<void> {
     const host = buildExtensionHost();
     return ext.handler(chatId, host);
   }
+  const actionCtx: ActionContext = { chatId, origin: "bar", reply: uiReply(chatId) };
   switch (label) {
     case MENU_BTN:
-      return openMenuAt(chatId, 0);
-    case NEW_BTN: {
-      const { result: res, agentId } = await createSessionForChat(chatId);
-      const bound = bindCreatedSession(chatId, agentId);
-      await sendWithLiveBar(chatId, res.ok
-        ? (bound ? `\u2728 ${plain(res.text)}` : "\u274C Session created but the chat binding is not live yet \u2014 send any message to rebind.")
-        : `\u274C ${plain(res.text)}`);
-      return;
-    }
-    case COMPACT_BTN: {
-      const res = await compactCurrent(requireCtx(), boundAgentId(chatId));
-      await uiSend(chatId, res.ok ? plain(res.text) : `\u274C ${plain(res.text)}`, { parse_mode: "HTML" });
-      return;
-    }
+      return actions["menu"](actionCtx);
+    case NEW_BTN:
+      return actions["new"](actionCtx);
+    case COMPACT_BTN:
+      return actions["compact"](actionCtx);
     case MODELS_BTN:
-      return openModelsCard(chatId);
+      return actions["models"](actionCtx);
     case PLUGINS_BTN:
-      return openPluginsCard(chatId);
+      return actions["plugins"](actionCtx);
     case MODE_BTN:
-      return openModeCard(chatId);
+      return actions["mode"](actionCtx);
     case SESSIONS_BTN:
-      return openSessionsCard(chatId, lastProjectKey(chatId));
+      return actions["sessions"](actionCtx);
     case STATUS_BTN:
-      return openStatusPanel(chatId);
+      return actions["status"](actionCtx);
     case QUEUE_BTN:
-      return openQueueCard(chatId);
+      return actions["queue"](actionCtx);
     case TODO_BTN:
-      return openTodosCard(chatId);
+      return actions["todos"](actionCtx);
     case GOAL_BTN:
-      return openGoalsCard(chatId);
+      return actions["goals"](actionCtx);
     case PRESETS_BTN:
-      return openPresetsCard(chatId);
+      return actions["presets"](actionCtx);
     case THINKING_BTN:
       return dispatchBarButton(chatId, REASONING_BTN);
     case COLLAPSE_BTN:
@@ -2918,18 +3002,8 @@ async function dispatchBarButton(chatId: number, label: string): Promise<void> {
     case RETURN_BTN:
       return setBarCollapsed(chatId, false);
     case ABORT_BTN:
-    case STOP_BTN: {
-      const agentId = boundAgentId(chatId);
-      if (agentId === undefined) {
-        await uiSend(chatId, "\u274C No live agent in this session \u2014 Abort only stops this chat's current turn.", { parse_mode: "HTML" });
-        return;
-      }
-      const res = sessionLifecycle.stop(requireCtx(), agentId);
-      // Abort is terminal for background loops too, not just the UI (#48).
-      abortChatLoops(chatId);
-      await uiSend(chatId, res.ok ? plain(res.text) : `\u274C ${plain(res.text)}`, { parse_mode: "HTML" });
-      return;
-    }
+    case STOP_BTN:
+      return actions["abort"](actionCtx);
     default:
       return;
   }
@@ -2951,6 +3025,7 @@ async function dispatchCommand(chatId: number, command: string, args: string, me
     log(`command reply chatId=${chatId} command=${command} kind=${okResult ? "ok" : "error"}`);
     await uiSend(chatId, okResult ? plain(text) : `\u274C ${plain(text)}`, { parse_mode: "HTML" });
   };
+  const actionCtx: ActionContext = { chatId, origin: "command", args, messageId, reply: send };
   switch (command) {
     case "start":
       state.chats.add(chatId);
@@ -2980,7 +3055,7 @@ async function dispatchCommand(chatId: number, command: string, args: string, me
       );
       return;
     case "menu":
-      return openMenuAt(chatId, 0);
+      return actions["menu"](actionCtx);
     case "answer": {
       const [idText, numberText, ...rest] = args.trim().split(/\s+/);
       const id = Number(idText);
@@ -3055,46 +3130,20 @@ async function dispatchCommand(chatId: number, command: string, args: string, me
       if (res.ok) refreshAllPanels();
       return;
     }
-    case "new": {
-      const { result: res, agentId } = await createSessionForChat(chatId);
-      const bound = bindCreatedSession(chatId, agentId);
-      await send(res.ok && !bound ? "Session created but the chat binding is not live yet \u2014 send any message to rebind." : res.text, res.ok);
-      return;
-    }
-    case "compact": {
-      const res = await compactCurrent(ctx, boundAgentId(chatId));
-      await send(res.text, res.ok);
-      return;
-    }
+    case "new":
+      return actions["new"](actionCtx);
+    case "compact":
+      return actions["compact"](actionCtx);
     case "models":
-      return openModelsCard(chatId);
+      return actions["models"](actionCtx);
     case "status":
-      return openStatusPanel(chatId);
-    case "abort": {
-      const agentId = boundAgentId(chatId);
-      if (agentId === undefined) {
-        await send("No live agent in this session \u2014 Abort only stops this chat's current turn.", false);
-        return;
-      }
-      const res = sessionLifecycle.stop(ctx, agentId);
-      abortChatLoops(chatId);
-      await send(res.text, res.ok);
-      return;
-    }
-    case "stop": {
-      const agentId = boundAgentId(chatId);
-      if (agentId === undefined) {
-        await send("No live agent in this session.", false);
-        return;
-      }
-      const res = await sessionLifecycle.close(agentId, ctx);
-      abortChatLoops(chatId);
-      state.bridge?.bindAgent(chatId, undefined);
-      await send(res.ok ? `${res.text} \u2014 send any message to start a new session.` : res.text, res.ok);
-      return;
-    }
+      return actions["status"](actionCtx);
+    case "abort":
+      return actions["abort"](actionCtx);
+    case "stop":
+      return actions["close-session"](actionCtx);
     case "sessions":
-      return openSessionsCard(chatId, lastProjectKey(chatId));
+      return actions["sessions"](actionCtx);
     case "bar": {
       const target = args.trim().toLowerCase();
       const collapsed = target === "on"
@@ -3107,30 +3156,30 @@ async function dispatchCommand(chatId: number, command: string, args: string, me
       return;
     }
     case "workspaces":
-      return openWorkspacesCard(chatId);
+      return actions["workspaces"](actionCtx);
     case "project":
       if (args.trim() !== "") return applyProjectPath(chatId, args.trim());
       return openProjectCard(chatId);
     case "goals":
-      return openGoalsCard(chatId);
+      return actions["goals"](actionCtx);
     case "todos":
-      return openTodosCard(chatId);
+      return actions["todos"](actionCtx);
     case "skills":
-      return openSkillsCard(chatId);
+      return actions["skills"](actionCtx);
     case "subagents":
       return openSubagentsCard(chatId);
     case "presets":
-      return openPresetsCard(chatId);
+      return actions["presets"](actionCtx);
     case "plugins":
-      return openPluginsCard(chatId);
+      return actions["plugins"](actionCtx);
     case "hostsettings":
       return openHostSettingsCard(chatId);
     case "credentials":
       return openCredentialsCard(chatId);
     case "host":
-      return openHostCard(chatId);
+      return actions["host"](actionCtx);
     case "jobs":
-      return openJobsCard(chatId);
+      return actions["jobs"](actionCtx);
     case "capabilities":
       return openCapabilitiesCard(chatId);
     case "menucheck": {
@@ -3291,7 +3340,7 @@ async function dispatchCommand(chatId: number, command: string, args: string, me
       return;
     }
     case "queue":
-      return openQueueCard(chatId);
+      return actions["queue"](actionCtx);
     case "queueedit": {
       const [itemId, ...rest] = args.trim().split(/\s+/);
       const text = rest.join(" ");
