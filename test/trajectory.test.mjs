@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readTrajectory } from '../dist/harness/adapters/sessions.js';
-import { renderTrajectoryLines, TRAJECTORY_MAX_STEPS_PER_TURN } from '../dist/telegram/trajectory.js';
+import { renderTrajectoryLines, formatToolCallText, TRAJECTORY_MAX_STEPS_PER_TURN } from '../dist/telegram/trajectory.js';
 
 function trajectoryCtx(events) {
   const ctx = {
@@ -113,15 +113,14 @@ test('renderTrajectoryLines marks errors, running turns and folds long step list
   const manySteps = Array.from({ length: TRAJECTORY_MAX_STEPS_PER_TURN + 3 }, (_, i) => ({ seq: i + 1, kind: 'tool-call', text: `tool ${i}` }));
   const result = {
     turns: [
-      { startSeq: 1, index: 1, outcome: 'error: boom', steps: [] },
-      { startSeq: 2, index: 2, steps: manySteps },
+      { startSeq: 1, index: 1, outcome: 'error: boom', steps: [{ seq: 2, kind: 'user', text: 'go' }] },
+      { startSeq: 3, index: 2, steps: manySteps },
     ],
     hasMore: true,
   };
   const text = renderTrajectoryLines('s1', result).join('\n');
   assert.match(text, /\(2 turns\+\)/);
   assert.match(text, /❌ error: boom/);
-  assert.match(text, /\(no steps\)/);
   assert.match(text, /⏳ running/);
   assert.match(text, /… 3 more step\(s\)/);
 });
@@ -130,4 +129,61 @@ test('renderTrajectoryLines renders the empty state', () => {
   const text = renderTrajectoryLines('s1', { turns: [], hasMore: false }).join('\n');
   assert.match(text, /\(0 turns\)/);
   assert.match(text, /\(no events\)/);
+});
+
+test('multi-line step text folds to a single line (#history rendering)', () => {
+  const result = {
+    turns: [{
+      startSeq: 1, index: 1, outcome: 'completed',
+      steps: [
+        { seq: 1, kind: 'assistant', text: 'line one\n\nline two\n  line three' },
+        { seq: 2, kind: 'tool-result', text: '# Title\n\nbody text\n\n## Section' },
+      ],
+    }],
+    hasMore: false,
+  };
+  for (const line of renderTrajectoryLines('s1', result)) {
+    if (line.startsWith('  ')) assert.doesNotMatch(line, /\n/, 'step lines never contain newlines');
+  }
+  const text = renderTrajectoryLines('s1', result).join('\n');
+  assert.match(text, /🤖 line one line two line three/);
+  assert.match(text, /📥 # Title body text ## Section/, 'tool-result is a folded single-line summary');
+});
+
+test('formatToolCallText extracts the semantic argument from raw JSON (#history)', () => {
+  assert.equal(formatToolCallText('read {"path":"/home/ubuntu/project/README.md"}'), 'read /home/ubuntu/project/README.md');
+  assert.equal(formatToolCallText('bash {"command":"npm test"}'), 'bash npm test');
+  assert.equal(formatToolCallText('search {"query":"deepseek harness"}'), 'search deepseek harness');
+  assert.equal(formatToolCallText('curl {"url":"https://example.com"}'), 'curl https://example.com');
+  // Unknown keys fall back to compact JSON; unparseable text passes through.
+  assert.equal(formatToolCallText('weird {"a":1,"b":"x"}'), 'weird {"a":1,"b":"x"}');
+  assert.equal(formatToolCallText('plain text no json'), 'plain text no json');
+  assert.equal(formatToolCallText('broken {"path":"unterminated'), 'broken {"path":"unterminated');
+  // Multi-line JSON args fold too.
+  assert.equal(formatToolCallText('edit {"path":"/a/b.txt"}'), 'edit /a/b.txt');
+});
+
+test('empty turns are skipped and turns are separated by a thin divider (#history)', () => {
+  const result = {
+    turns: [
+      { startSeq: 1, index: 0, outcome: undefined, steps: [] },
+      { startSeq: 2, index: 1, outcome: 'completed', steps: [{ seq: 3, kind: 'user', text: 'hi' }] },
+      { startSeq: 5, index: 2, outcome: 'completed', steps: [{ seq: 6, kind: 'assistant', text: 'hello' }] },
+    ],
+    hasMore: false,
+  };
+  const lines = renderTrajectoryLines('s1', result);
+  const text = lines.join('\n');
+  assert.doesNotMatch(text, /\(no steps\)/, 'empty turns are not rendered at all');
+  assert.doesNotMatch(text, /Prelude/, 'the empty Prelude header is gone');
+  assert.ok(lines.some((line) => /^─+$/.test(line)), 'a thin divider separates consecutive turns');
+});
+
+test('all-empty turns degrade to a single placeholder instead of nothing', () => {
+  const result = {
+    turns: [{ startSeq: 1, index: 0, steps: [] }],
+    hasMore: false,
+  };
+  const text = renderTrajectoryLines('s1', result).join('\n');
+  assert.match(text, /\(no steps\)/);
 });

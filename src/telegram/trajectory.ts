@@ -21,6 +21,37 @@ const STEP_ICONS: Record<TrajectoryStep["kind"], string> = {
  * message ceiling. */
 export const TRAJECTORY_MAX_STEPS_PER_TURN = 8;
 
+/** Tool-call argument keys worth showing verbatim, in priority order: the
+ * web trajectory surfaces the semantic argument (`read <path>`), not raw
+ * JSON. */
+const TOOL_ARG_KEYS = ["path", "cmd", "command", "query", "url", "file", "pattern", "id", "name", "objective"] as const;
+
+/** Fold every whitespace run (including newlines) into one space — a step is
+ * a single ledger line; multi-line text blew up the turn layout (#history). */
+function foldWhitespace(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
+}
+
+/** `read {"path":"…"}` → `read …`: parse the JSON argument blob and show the
+ * meaningful value instead of raw JSON. Unknown shapes fall back to compact
+ * JSON; unparseable text falls back to the folded original. */
+export function formatToolCallText(text: string): string {
+  const folded = foldWhitespace(text);
+  const match = folded.match(/^(\S+)\s+(\{.+\})$/);
+  if (!match) return folded;
+  const [, name, json] = match;
+  try {
+    const args = JSON.parse(json) as Record<string, unknown>;
+    for (const key of TOOL_ARG_KEYS) {
+      const value = args[key];
+      if (typeof value === "string" && value.trim() !== "") return `${name} ${foldWhitespace(value)}`;
+    }
+    return `${name} ${JSON.stringify(args)}`;
+  } catch {
+    return folded;
+  }
+}
+
 function outcomeIcon(outcome: string | undefined): string {
   if (outcome === undefined) return "\u23F3"; // still running (no turn/end)
   if (outcome.startsWith("error")) return "\u274C";
@@ -42,8 +73,14 @@ function turnHeaderLine(turn: TrajectoryTurn): string {
 }
 
 function stepLine(step: TrajectoryStep): string {
-  return `  ${STEP_ICONS[step.kind]} ${escapeHtml(truncate(step.text, 120))}`;
+  // Single-line ledger entries: newlines in assistant messages and tool
+  // results used to blow up the turn list (#history rendering feedback).
+  const text = step.kind === "tool-call" ? formatToolCallText(step.text) : foldWhitespace(step.text);
+  return `  ${STEP_ICONS[step.kind]} ${escapeHtml(truncate(text, 120))}`;
 }
+
+/** Thin divider between turns for visual hierarchy. */
+const TURN_DIVIDER = "\u2500".repeat(24);
 
 /** Render the paged trajectory as HTML lines (header line first). */
 export function renderTrajectoryLines(sessionId: string, result: TrajectoryResult): string[] {
@@ -56,17 +93,20 @@ export function renderTrajectoryLines(sessionId: string, result: TrajectoryResul
     lines.push("(no events)");
     return lines;
   }
+  let renderedTurns = 0;
   for (const turn of result.turns) {
+    // Empty turns are noise: a Prelude with no steps rendered a pointless
+    // `(no steps)` placeholder — skip them entirely (#history rendering).
+    if (turn.steps.length === 0) continue;
+    if (renderedTurns > 0) lines.push(TURN_DIVIDER);
+    renderedTurns += 1;
     lines.push(turnHeaderLine(turn));
     const visible = turn.steps.slice(0, TRAJECTORY_MAX_STEPS_PER_TURN);
     for (const step of visible) lines.push(stepLine(step));
     if (turn.steps.length > visible.length) {
       lines.push(`  \u2026 ${turn.steps.length - visible.length} more step(s)`);
     }
-    if (turn.steps.length === 0) lines.push("  (no steps)");
-    lines.push("");
   }
-  // Drop the trailing blank line after the last turn.
-  if (lines[lines.length - 1] === "") lines.pop();
+  if (renderedTurns === 0) lines.push("(no steps)");
   return lines;
 }
