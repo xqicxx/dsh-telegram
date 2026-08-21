@@ -87,8 +87,9 @@ interface TokenUsageLike {
 
 const EDIT_THROTTLE_MS = 250;
 /** Long tools can be silent for a while: heartbeat every 30s so the elapsed
- * timer keeps moving and the user sees the task is alive (issue #18). */
-const LIVENESS_HEARTBEAT_MS = 30_000;
+ * timer keeps moving and the user sees the task is alive (issue #18). Shared
+ * with the openclaw extension's draft heartbeat. */
+export const LIVENESS_HEARTBEAT_MS = 30_000;
 
 function bar(done: number, total: number): string {
   const width = 10;

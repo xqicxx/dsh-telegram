@@ -23,6 +23,8 @@ import { markdownTablePreBlock, markdownToHtml } from "../telegram/markdown.js";
 import { type StatusStats } from "../harness/adapters/status.js";
 import { safeWrap } from "../telegram/safe.js";
 import { renderTurnReceipt } from "../telegram/turn-receipt.js";
+// Shared heartbeat constant (telegram/goal-progress is the lower layer).
+import { LIVENESS_HEARTBEAT_MS } from "../telegram/goal-progress.js";
 import type { ExtensionHost } from "./types.js";
 
 const MAX_LINES = 8;
@@ -37,8 +39,6 @@ const TOOL_DETAIL_CHARS = 90;
  * made reasoning visibly lag behind the model stream (issue #24).
  */
 const EDIT_THROTTLE_MS = 200;
-/** Long tools emit no chunks; heartbeat keeps the draft visibly ticking. */
-const LIVENESS_HEARTBEAT_MS = 30_000;
 /** After a failed edit, retry the SAME message with exponential backoff
  * instead of clearing `messageId` and spawning another "…" placeholder. */
 const EDIT_RETRY_BASE_MS = 1500;

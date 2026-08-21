@@ -35,5 +35,5 @@ export function reasoningDirective(effort: ReasoningEffort): string {
 }
 
 export function reasoningLabel(effort: ReasoningEffort): string {
-  return LABEL[effort] ?? effort;
+  return LABEL[effort];
 }

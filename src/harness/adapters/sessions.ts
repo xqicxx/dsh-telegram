@@ -16,11 +16,6 @@ import { SessionId, type Session as DshSession } from "@deepseek-ai/dsh-session"
 import { ensureOpencodeGoResponsesRoute, normalizeOpencodeGoModel, opencodeGoModelUsesResponses } from "./opencodeGo.js";
 import { fail, ok, type AdapterResult } from "./types.js";
 
-export interface SessionEntry {
-  id: string;
-  cwd?: string;
-}
-
 /** One event as read from a live or persisted session log (structural). */
 export interface SessionEventLike {
   seq: number;
@@ -130,12 +125,6 @@ function sessionsOf(ctx: Context) {
         fork(id: SessionId, boundary: number | undefined, childId: SessionId): SessionLike;
       }
     | undefined;
-}
-
-export function listSessions(ctx: Context): SessionEntry[] {
-  const store = sessionsOf(ctx);
-  if (!store) return [];
-  return store.list().map((s) => ({ id: s.id, cwd: s.header?.cwd }));
 }
 
 export interface SessionDetail {
@@ -933,23 +922,6 @@ export function releaseSavedAttachments(): void {
   savedAttachments.clear();
 }
 
-/** Deliver a promoted image into the session, as one followup turn. */
-export function imagePrompt(ctx: Context, sessionId: string, attachment: AttachmentRefLike, caption?: string): AdapterResult {
-  const agents = agentsOf(ctx);
-  const agent = agents?.get(SessionId(sessionId));
-  if (!agent) return fail(`session ${sessionId} has no live agent`);
-  const content: unknown[] = [];
-  if (caption) content.push({ type: "text", text: caption });
-  content.push({ type: "image", attachment });
-  const message = createUserMessage({ content: content as never, source: { kind: "user" } });
-  try {
-    (agent as unknown as { followup(message: unknown): void }).followup(message);
-    return ok("Image delivered.");
-  } catch (err) {
-    return fail(err instanceof Error ? err.message : String(err));
-  }
-}
-
 export function releaseModelSelection(sessionId: string): void {
   const entry = selections.get(sessionId);
   if (!entry) return;
@@ -1062,7 +1034,6 @@ function disposeWithin(dispose: Promise<unknown>, label: string): Promise<void> 
 }
 
 export class SessionLifecycle {
-  private handle: AgentHandle | undefined;
   private readonly handles = new Map<string, AgentHandle>();
 
   /**
@@ -1120,7 +1091,6 @@ export class SessionLifecycle {
       console.error(
         `[dsh-telegram] session create model=${handle.agent.options.model} provider=${handle.agent.options.provider} preset=${resolvedPreset ?? "-"} (telegram config: ${model?.provider ?? "-"}/${model?.model ?? "-"})`,
       );
-      this.handle = handle;
       this.handles.set(handle.agent.id, handle);
       const replaced = options?.replaceSessionId;
       if (replaced !== undefined && replaced !== handle.agent.id) {
@@ -1159,7 +1129,6 @@ export class SessionLifecycle {
     const handle = this.handles.get(agentId);
     if (handle !== undefined) {
       this.handles.delete(agentId);
-      if (this.handle === handle) this.handle = undefined;
       await disposeWithin(handle.dispose().catch((err) => console.error("[dsh-telegram] failed to dispose agent", err)), agentId);
       return ok(`\u23F9 Closed ${agentId}`);
     }
@@ -1188,7 +1157,6 @@ export class SessionLifecycle {
 
   /** Plugin teardown: dispose every agent this plugin created or adopted. */
   async dispose(): Promise<void> {
-    this.handle = undefined;
     const pending = [...this.handles.values()];
     this.handles.clear();
     await Promise.all(pending.map((handle) => handle.dispose().catch(() => {})));

@@ -8,7 +8,6 @@ import { pathToFileURL } from "node:url";
 import { readdirSync } from "node:fs";
 import { join } from "node:path";
 import type { Context } from "@deepseek-ai/cordis";
-import { SessionId } from "@deepseek-ai/dsh-session";
 import { fail, ok, type AdapterResult } from "./types.js";
 
 export const TELEGRAM_DOCUMENT_LIMIT_BYTES = 50 * 1024 * 1024;
@@ -123,5 +122,3 @@ export async function exportSessionLog(ctx: Context, sessionId: string, includeD
     return { result: fail(err instanceof Error ? err.message : String(err)) };
   }
 }
-
-export { SessionId };

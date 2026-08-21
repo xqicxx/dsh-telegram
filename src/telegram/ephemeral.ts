@@ -16,8 +16,6 @@ export interface ChatOps {
 export class Ephemeral {
   private readonly ids = new Map<number, Set<number>>();
   private readonly last = new Map<number, number>();
-  private readonly lastText = new Map<number, string>();
-  private readonly lastMarkup = new Map<number, string>();
   private readonly locks = new Map<number, Promise<unknown>>();
 
   remember(chatId: number, messageId: number | undefined): void {
@@ -53,8 +51,6 @@ export class Ephemeral {
       const lastId = this.last.get(chatId);
       if (lastId !== undefined && !keep.has(lastId)) {
         this.last.delete(chatId);
-        this.lastText.delete(chatId);
-        this.lastMarkup.delete(chatId);
       }
       if (keep.size > 0) this.ids.set(chatId, keep);
       else this.ids.delete(chatId);
@@ -90,22 +86,15 @@ export class Ephemeral {
   replace(chatId: number, ops: ChatOps, text: string, options?: Record<string, unknown>): Promise<number | undefined> {
     return this.serialize(chatId, async () => {
       const current = this.last.get(chatId);
-      const markup = JSON.stringify(options?.reply_markup ?? null);
       if (current !== undefined) {
         const edited = await ops.editText(chatId, current, text, options).catch(() => false);
         if (edited) {
-          this.lastText.set(chatId, text);
-          this.lastMarkup.set(chatId, markup);
           return current;
         }
         this.last.delete(chatId);
-        this.lastText.delete(chatId);
-        this.lastMarkup.delete(chatId);
       }
       const id = await ops.sendText(chatId, text, options);
       this.remember(chatId, id);
-      this.lastText.set(chatId, text);
-      this.lastMarkup.set(chatId, markup);
       return id;
     });
   }
@@ -122,8 +111,6 @@ export class Ephemeral {
       if (set) {
         if (this.last.get(chatId) === messageId) {
           this.last.delete(chatId);
-          this.lastText.delete(chatId);
-          this.lastMarkup.delete(chatId);
         }
         set.delete(messageId);
         if (set.size === 0) this.ids.delete(chatId);
@@ -135,8 +122,6 @@ export class Ephemeral {
   reset(): void {
     this.ids.clear();
     this.last.clear();
-    this.lastText.clear();
-    this.lastMarkup.clear();
     this.locks.clear();
   }
 }

@@ -7,7 +7,6 @@
  *   - questions: `ctx.userQuestions.registerProvider` owns the ask() promise
  *     and settles it with the submitted answers.
  */
-import { randomUUID } from "node:crypto";
 import type { Context } from "@deepseek-ai/cordis";
 import type { QuestionOwnership } from "../../config.js";
 
@@ -658,5 +657,3 @@ export function attachInteractive(ctx: Context, delivery: InteractiveDelivery, o
     },
   };
 }
-
-export { randomUUID };

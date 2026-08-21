@@ -70,7 +70,7 @@ import { probeCapabilities, missingServices } from "./harness/adapters/capabilit
 import { attachInteractive, type Interactive, questionIdAt } from "./harness/adapters/interactive.js";
 import { ensureOpencodeGoResponsesRoute, normalizeOpencodeGoModel, opencodeGoModelUsesResponses } from "./harness/adapters/opencodeGo.js";
 import { saveDocumentAttachment, transcribeVoice } from "./harness/adapters/media.js";
-import { forgetStatusSession, resetStatusStats, statusSnapshot } from "./harness/adapters/status.js";
+import { forgetStatusSession, renderStatsStrip, resetStatusStats, statusSnapshot } from "./harness/adapters/status.js";
 import { CompactionWatcher, contextUsageOf } from "./harness/adapters/compaction-watch.js";
 import { diffTodos, listTodos, normalizeTodos, pendingTodoCount, type TodoView } from "./harness/adapters/todos.js";
 import { GoalProgressFeed, type ProgressSnapshot } from "./telegram/goal-progress.js";
@@ -243,7 +243,6 @@ function teardownMount(): void {
   state.chats.clear();
   state.context = null;
   pendingRename = undefined;
-  pendingWorkspaceCreate = undefined;
   pendingSubagentPrompt = undefined;
   pendingSteer = undefined;
   pendingSearch = undefined;
@@ -650,7 +649,6 @@ function stopTyping(chatId: number): void {
   }
 }
 
-import { renderStatsStrip } from "./harness/adapters/status.js";
 export { renderStatsStrip };
 
 /** Live subagent counts per agent id. `subagents.listChildren` is async, so
@@ -2812,7 +2810,6 @@ async function dispatchCallback(chatId: number, data: string): Promise<void> {
 }
 
 let pendingRename: { chatId: number; sessionId: string } | undefined;
-let pendingWorkspaceCreate: { chatId: number } | undefined;
 /** Chats whose first touch was `/start` while unauthorized: once they tap
  * Allow, replay the welcome instead of making them resend the command. */
 const pendingStartAfterAllow = new Set<number>();
@@ -3006,9 +3003,6 @@ async function dispatchCommand(chatId: number, command: string, args: string, me
       if (pendingPresetCopy && pendingPresetCopy.chatId === chatId) {
         pendingPresetCopy = undefined;
         await send("Preset copy cancelled.");
-      } else if (pendingWorkspaceCreate && pendingWorkspaceCreate.chatId === chatId) {
-        pendingWorkspaceCreate = undefined;
-        await send("Workspace create cancelled.");
       } else if (pendingMkdir && pendingMkdir.chatId === chatId) {
         pendingMkdir = undefined;
         await send("New-folder cancelled.");
@@ -4175,23 +4169,6 @@ export function apply(ctx: Context, loaderConfig?: unknown): void {
           pendingSteer = undefined;
           const res = promptSession(requireCtx(), sessionId, text, "steer");
           void uiSend(chatId, res.ok ? plain(res.text) : `\u274C ${plain(res.text)}`, { parse_mode: "HTML" });
-          return;
-        }
-        if (pendingWorkspaceCreate && pendingWorkspaceCreate.chatId === chatId) {
-          pendingWorkspaceCreate = undefined;
-          const trimmed = text.trim();
-          if (!trimmed) {
-            void uiSend(chatId, "\u274C Workspace path must not be blank.", { parse_mode: "HTML" });
-            return openWorkspacesCard(chatId);
-          }
-          const space = trimmed.indexOf(" ");
-          const path = space === -1 ? trimmed : trimmed.slice(0, space);
-          const title = space === -1 ? undefined : trimmed.slice(space + 1).trim();
-          void (async () => {
-            const res = await createWorkspace(requireCtx(), path, title === "" ? undefined : title);
-            void uiSend(chatId, res.ok ? plain(res.text) : `\u274C ${plain(res.text)}`, { parse_mode: "HTML" });
-            return openWorkspacesCard(chatId);
-          })().catch((err) => log("workspace create failed", err));
           return;
         }
         if (pendingRename && pendingRename.chatId === chatId) {

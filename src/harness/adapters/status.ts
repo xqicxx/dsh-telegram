@@ -242,7 +242,9 @@ function eventStatsFor(agent: unknown): StatusStats | undefined {
   // Official resolveSessionPreset order: latest agent-preset/selected event
   // wins, otherwise the preset the session was created with (issue #22).
   // The header preset only changes when the event log itself is rebuilt.
-  const headerPreset = fullRescan ? sessionHeaderPreset(source) : (cached !== undefined ? cached.headerPreset : sessionHeaderPreset(source));
+  // fullRescan is false only when a cache entry exists (line above), so the
+  // incremental path can always reuse its cached header preset.
+  const headerPreset = fullRescan ? sessionHeaderPreset(source) : cached!.headerPreset;
   const preset = latestPreset(source, cached?.preset, cached?.scannedEnd) ?? headerPreset;
   eventScanCache.set(key, { scannedEnd: end, stats: result, preset, headerPreset });
   return result;

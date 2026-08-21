@@ -222,7 +222,8 @@ export async function togglePlugin(ctx: Context, entryId: string, disabled: bool
     return fail(err instanceof Error ? err.message : String(err));
   }
   const persisted = persistPatch(entryId, disabled);
-  if (!persisted.ok) return { ok: true, text: `${persisted.text}${liveText}` };
+  // Persistence failures surface in the message text only — the live toggle
+  // already succeeded, so the result stays ok either way.
   return { ok: true, text: `${persisted.text}${liveText}` };
 }
 

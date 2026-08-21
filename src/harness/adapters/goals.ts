@@ -83,10 +83,6 @@ export function resumeGoal(ctx: Context, agentId: string, id: string, revision: 
   return Promise.resolve(run(ctx, agentId, (goals, agent) => goals.resume(agent, { id, revision })));
 }
 
-export function completeGoal(ctx: Context, agentId: string, id: string, revision: number) {
-  return Promise.resolve(run(ctx, agentId, (goals, agent) => goals.complete(agent, { id, revision })));
-}
-
 export function clearGoal(ctx: Context, agentId: string, id: string, revision: number) {
   return Promise.resolve(run(ctx, agentId, (goals, agent) => goals.clear(agent, { id, revision })));
 }

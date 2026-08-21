@@ -107,6 +107,9 @@ export async function promptSubagent(
   }
   try {
     const clientTimeZone = options?.clientTimeZone ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
+    // Always present (a live never-aborted signal when the caller supplies
+    // none) — the web contract hands followup a signal unconditionally, and
+    // test/subagents.test.mjs pins that shape.
     const signal = options?.signal ?? new AbortController().signal;
     const messageId = await subagents.followup(parent as unknown as AgentLike, SessionId(childSessionId), [{ type: "text", text }], {
       source: { kind: "user", ...(clientTimeZone === undefined ? {} : { clientTimeZone }) },

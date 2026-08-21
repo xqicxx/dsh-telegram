@@ -142,37 +142,6 @@ export function normalizeBarLabel(text: string): string | undefined {
   return undefined;
 }
 
-export interface CoreMenuState {
-  model: string;
-  /** Omitted for models without reasoning controls (hidden row, pi-style). */
-  thinking?: string;
-  queueCount: number;
-  /** Active project folder name (Codex-style). */
-  project?: string;
-}
-
-/** `☐ Menu` core card: pi-telegram status-menu style — full-width
- * status rows up top, then segmented domain rows, then full-width closers. */
-export function buildCoreMenu(state: CoreMenuState): InlineKeyboard {
-  const kb = new InlineKeyboard().text(`${MODELS_BTN} \u00B7 ${state.model}`, "m:models");
-  if (state.thinking !== undefined) kb.row().text(`\u{1F9E0} Thinking \u00B7 ${state.thinking}`, "m:thinking");
-  kb.row().text(`\u231B Queue \u00B7 ${state.queueCount}`, "m:queue");
-  kb.row().text(`\u{1F4C1} Project \u00B7 ${state.project ?? "..."}`, "m:project");
-  kb.row().text(NEW_BTN, "m:new").text(COMPACT_BTN, "m:compact");
-  kb.row().text(SESSIONS_BTN, "m:sessions");
-  kb.row().text(STATUS_BTN, "m:status").text(PLUGINS_BTN, "m:plugins");
-  kb.row().text(MODE_BTN, "m:mode");
-  kb.row().text("\u{1F5C2} Workspaces", "m:workspaces").text("\u{1F3AF} Goals", "m:goals");
-  kb.row().text("\u{1F9EC} Skills", "m:skills").text("\u{1F916} Subagents", "m:subagents");
-  kb.row().text("\u{1F3AD} Presets", "m:presets").text("\u{1F6E0}\uFE0F Host settings", "m:hostsettings");
-  kb.row().text("\u{1F511} Credentials", "m:credentials").text("\u{1F4BB} Host", "m:host");
-  kb.row().text("\u{1F4CB} Jobs", "m:jobs").text("\u269B\uFE0F Dynamic", "m:dynamic");
-  kb.row().text("\u{1F9EC} Capabilities", "m:capabilities");
-  kb.row().text("\u2699\uFE0F Settings", "m:settings");
-  kb.row().text("\u2716 Close", "m:close");
-  return kb;
-}
-
 export interface MenuItem {
   label: string;
   cb: string;
@@ -640,10 +609,6 @@ export function buildHostKeyboard(): InlineKeyboard {
   return kb.row().text("\u2190 Back", "m:back");
 }
 
-export function buildJobsKeyboard(): InlineKeyboard {
-  return new InlineKeyboard().row().text("\u2190 Back", "m:back");
-}
-
 export function buildDynamicCordisKeyboard(): InlineKeyboard {
   return new InlineKeyboard().row().text("\u2190 Back", "m:back");
 }
@@ -668,8 +633,4 @@ export function buildPluginLifecycleKeyboard(rows: readonly PluginRow[]): Inline
 
 export function buildCapabilitiesKeyboard(): InlineKeyboard {
   return new InlineKeyboard().row().text("\u2190 Back", "m:back");
-}
-
-export function buildFeedbackKeyboard(callbacks: { positive: string; negative: string; list: string }): InlineKeyboard {
-  return new InlineKeyboard().row().text("\u{1F44D}", callbacks.positive).text("\u{1F44E}", callbacks.negative).text("\u{1F4CB} Feedback list", callbacks.list);
 }

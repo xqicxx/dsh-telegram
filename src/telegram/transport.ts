@@ -318,44 +318,40 @@ export class TelegramTransport {
     return new Uint8Array(await response.arrayBuffer());
   }
 
-  /** Send a document (session-log ZIPs and other host artifacts). */
-  sendDocument(chatId: number, buffer: Uint8Array, filename: string, caption?: string): Promise<number | undefined> {
+  /** Shared body for the four binary-media senders below: identical queueing,
+   * timeout and HTML-caption handling — only the Bot API method differs.
+   * Called through the computed member access so grammY's Api keeps its
+   * receiver (the methods read `this.raw`). */
+  private sendMedia(chatId: number, buffer: Uint8Array, filename: string, caption: string | undefined, method: "sendDocument" | "sendPhoto" | "sendVoice" | "sendAudio"): Promise<number | undefined> {
     return this.queue.push(chatId, async () => {
-      const msg = await withTimeout(this.api.sendDocument(chatId, new InputFile(buffer, filename), {
-        ...(caption === undefined ? {} : { caption, parse_mode: "HTML" as const }),
-      }), 60_000);
+      const msg = await withTimeout(
+        (this.api[method] as (chatId: number, media: InputFile, options: { caption?: string; parse_mode?: "HTML" }) => Promise<{ message_id: number }>)(chatId, new InputFile(buffer, filename), {
+          ...(caption === undefined ? {} : { caption, parse_mode: "HTML" as const }),
+        }),
+        60_000,
+      );
       return msg.message_id;
     });
+  }
+
+  /** Send a document (session-log ZIPs and other host artifacts). */
+  sendDocument(chatId: number, buffer: Uint8Array, filename: string, caption?: string): Promise<number | undefined> {
+    return this.sendMedia(chatId, buffer, filename, caption, "sendDocument");
   }
 
   /** Send saved image bytes back to the chat (session.attachment read-back). */
   sendPhoto(chatId: number, buffer: Uint8Array, filename: string, caption?: string): Promise<number | undefined> {
-    return this.queue.push(chatId, async () => {
-      const msg = await withTimeout(this.api.sendPhoto(chatId, new InputFile(buffer, filename), {
-        ...(caption === undefined ? {} : { caption, parse_mode: "HTML" as const }),
-      }), 60_000);
-      return msg.message_id;
-    });
+    return this.sendMedia(chatId, buffer, filename, caption, "sendPhoto");
   }
 
   /** Send an OGG/OPUS voice note (agent outbound attachments, issue #25). */
   sendVoice(chatId: number, buffer: Uint8Array, filename: string, caption?: string): Promise<number | undefined> {
-    return this.queue.push(chatId, async () => {
-      const msg = await withTimeout(this.api.sendVoice(chatId, new InputFile(buffer, filename), {
-        ...(caption === undefined ? {} : { caption, parse_mode: "HTML" as const }),
-      }), 60_000);
-      return msg.message_id;
-    });
+    return this.sendMedia(chatId, buffer, filename, caption, "sendVoice");
   }
 
   /** Send an audio track (mp3/m4a/... — agent outbound attachments, #25). */
   sendAudio(chatId: number, buffer: Uint8Array, filename: string, caption?: string): Promise<number | undefined> {
-    return this.queue.push(chatId, async () => {
-      const msg = await withTimeout(this.api.sendAudio(chatId, new InputFile(buffer, filename), {
-        ...(caption === undefined ? {} : { caption, parse_mode: "HTML" as const }),
-      }), 60_000);
-      return msg.message_id;
-    });
+    return this.sendMedia(chatId, buffer, filename, caption, "sendAudio");
   }
 
   /** Remove/replace an inline keyboard in place (approval/question settles). */

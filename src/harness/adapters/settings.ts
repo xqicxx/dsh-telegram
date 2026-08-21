@@ -110,28 +110,26 @@ export function describeSettings(ctx: Context): SettingsDescription {
   }
 }
 
-export async function updateSettings(ctx: Context, ns: string, patch: object, expectedRevision?: number): Promise<AdapterResult & { view?: SettingsNamespaceView }> {
+/** Shared body of the three settings writes: resolve the provider, run one
+ * write call, then echo the fresh namespace view with a per-verb message. */
+async function withSettingsWrite(ctx: Context, ns: string, label: string, write: (settings: SettingsProviderLike) => Promise<void>): Promise<AdapterResult & { view?: SettingsNamespaceView }> {
   const settings = settingsOf(ctx);
   if (!settings) return fail("settings service is unavailable in this profile");
   try {
-    await settings.update(ns, patch, expectedRevision);
+    await write(settings);
     const view = describeSettings(ctx).namespaces.find((n) => n.ns === ns);
-    return { ok: true, text: `\u2699\uFE0F ${ns} updated`, ...(view === undefined ? {} : { view }) };
+    return { ok: true, text: `\u2699\uFE0F ${ns} ${label}`, ...(view === undefined ? {} : { view }) };
   } catch (err) {
     return fail(err instanceof Error ? err.message : String(err));
   }
 }
 
+export async function updateSettings(ctx: Context, ns: string, patch: object, expectedRevision?: number): Promise<AdapterResult & { view?: SettingsNamespaceView }> {
+  return withSettingsWrite(ctx, ns, "updated", (settings) => settings.update(ns, patch, expectedRevision));
+}
+
 export async function replaceSettings(ctx: Context, ns: string, section: object, expectedRevision?: number): Promise<AdapterResult & { view?: SettingsNamespaceView }> {
-  const settings = settingsOf(ctx);
-  if (!settings) return fail("settings service is unavailable in this profile");
-  try {
-    await settings.replace(ns, section, expectedRevision);
-    const view = describeSettings(ctx).namespaces.find((n) => n.ns === ns);
-    return { ok: true, text: `\u2699\uFE0F ${ns} replaced`, ...(view === undefined ? {} : { view }) };
-  } catch (err) {
-    return fail(err instanceof Error ? err.message : String(err));
-  }
+  return withSettingsWrite(ctx, ns, "replaced", (settings) => settings.replace(ns, section, expectedRevision));
 }
 
 export async function mutateSettings(
@@ -140,13 +138,5 @@ export async function mutateSettings(
   ops: { op: "set" | "unset"; path: string[]; value?: unknown }[],
   expectedRevision?: number,
 ): Promise<AdapterResult & { view?: SettingsNamespaceView }> {
-  const settings = settingsOf(ctx);
-  if (!settings) return fail("settings service is unavailable in this profile");
-  try {
-    await settings.mutate(ns, ops, expectedRevision);
-    const view = describeSettings(ctx).namespaces.find((n) => n.ns === ns);
-    return { ok: true, text: `\u2699\uFE0F ${ns} mutated`, ...(view === undefined ? {} : { view }) };
-  } catch (err) {
-    return fail(err instanceof Error ? err.message : String(err));
-  }
+  return withSettingsWrite(ctx, ns, "mutated", (settings) => settings.mutate(ns, ops, expectedRevision));
 }
