@@ -122,3 +122,28 @@ test('SessionLifecycle.close releases the per-session model selection', async ()
     'close() releases the selection — the live agent default shows through again',
   );
 });
+
+// ---------------------------------------------------------------------------
+// 🟠-17: stop without an explicit id must never cancel agents[0] of several
+// ---------------------------------------------------------------------------
+
+test('SessionLifecycle.stop refuses to guess among several live sessions (🟠-17)', () => {
+  const lifecycle = new SessionLifecycle();
+  const cancels = [];
+  const make = (id) => ({ id, cancel: (...args) => cancels.push([id, ...args]) });
+  const ctx = { agents: { list: () => [make('a'), make('b')] } };
+  const res = lifecycle.stop(ctx);
+  assert.equal(res.ok, false, 'ambiguous stop must fail, not pick agents[0]');
+  assert.match(res.text, /explicit session id/);
+  assert.deepEqual(cancels, [], 'no turn may be cancelled on an ambiguous stop');
+});
+
+test('SessionLifecycle.stop keeps the single-agent default working (🟠-17)', () => {
+  const lifecycle = new SessionLifecycle();
+  const cancels = [];
+  const agent = { id: 'solo', cancel: (...args) => cancels.push([agent.id, ...args]) };
+  const ctx = { agents: { list: () => [agent] } };
+  const res = lifecycle.stop(ctx);
+  assert.equal(res.ok, true);
+  assert.deepEqual(cancels, [['solo', { kind: 'user' }, { keepInbox: true }]]);
+});

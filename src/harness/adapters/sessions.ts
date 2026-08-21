@@ -711,12 +711,29 @@ export function forkSession(ctx: Context, sessionId: string, atSeq?: number): Ad
   }
 }
 
-/** Resume a persisted session as a live agent (session.open equivalent). */
-export async function resumeSession(ctx: Context, sessionId: string): Promise<AdapterResult & { agentId?: string; handle?: AgentHandle }> {
+/** Resume a persisted session as a live agent (session.open equivalent).
+ * `inheritFrom` names the live agent whose provider/model the resumed agent
+ * inherits. Without it the source is only resolvable when exactly ONE live
+ * agent exists: among several, defaulting to list()[0] could inherit another
+ * chat's model, so the request fails instead of guessing (🟠-17). */
+export async function resumeSession(
+  ctx: Context,
+  sessionId: string,
+  inheritFrom?: string,
+): Promise<AdapterResult & { agentId?: string; handle?: AgentHandle }> {
   const agents = agentsOf(ctx);
   if (!agents) return fail("agents service is unavailable in this profile");
   try {
-    const previous = agents.list()[0];
+    const live = agents.list();
+    const previous = inheritFrom !== undefined
+      ? live.find((agent) => String(agent.id) === String(inheritFrom)) ?? agents.get?.(SessionId(inheritFrom))
+      : live.length === 1 ? live[0] : undefined;
+    if (inheritFrom !== undefined && previous === undefined) {
+      return fail(`cannot inherit provider/model: ${inheritFrom} has no live agent`);
+    }
+    if (previous === undefined && live.length > 1) {
+      return fail(`${live.length} live sessions are running \u2014 cannot tell whose provider/model to inherit`);
+    }
     const handle = await agents.resume({
       resumeSessionId: SessionId(sessionId),
       agentOptions: { provider: previous?.options?.provider, model: previous?.options?.model },
@@ -941,6 +958,10 @@ export interface CreatedSession {
   agentId?: string;
   /** Preset the new session was composed from (web session.create echo). */
   agentPreset?: string;
+  /** True when no session was created because the chat already had a live
+   * one (onlyIfUnbound short-circuit): the requested model was NOT applied
+   * to any session, so callers must not treat this as "model set". */
+  reusedLive?: boolean;
 }
 
 export interface SessionCreateOptions {
@@ -1144,13 +1165,21 @@ export class SessionLifecycle {
     return ok(`\u23F9 Closed ${agentId}`);
   }
 
-  /** Cancel the current turn of one agent (defaults to the first live agent).
+  /** Cancel the current turn of one agent (defaults to the only live agent).
    * `keepInbox: true` preserves queued messages: only the in-flight turn is
-   * aborted, the session and its pending work stay alive. */
+   * aborted, the session and its pending work stay alive. With several live
+   * agents the default is refused — cancelling list()[0] could kill another
+   * chat's turn (🟠-17). */
   stop(ctx: Context, agentId?: string): AdapterResult {
     const agents = ctx.agents?.list() ?? [];
-    const agent = agentId !== undefined ? agents.find((a) => String(a.id) === String(agentId)) : agents[0];
-    if (!agent) return agentId === undefined ? ok("Nothing is running.") : fail("no live agent in this session");
+    const agent = agentId !== undefined
+      ? agents.find((a) => String(a.id) === String(agentId))
+      : agents.length === 1 ? agents[0] : undefined;
+    if (!agent) {
+      if (agentId !== undefined) return fail("no live agent in this session");
+      if (agents.length > 1) return fail(`${agents.length} live sessions are running \u2014 stop needs an explicit session id`);
+      return ok("Nothing is running.");
+    }
     agent.cancel({ kind: "user" }, { keepInbox: true });
     return ok("\u23F9 Stopping the current turn \u2014 queued messages are kept.");
   }

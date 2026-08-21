@@ -81,9 +81,10 @@ function midSessionCtx({ sourceEvents }) {
   const ctx = {
     agents: {
       get: (id) => (key(id) === 'source-session' ? sourceAgent : key(id) === 'child-session' ? childAgent : undefined),
-      list: () => [{ options: { provider: 'opencode-go', model: 'deepseek-v4-pro' } }],
+      // 🟠-17: the inherit source is resolved by id — the roster entry carries it.
+      list: () => [{ id: 'source-session', options: { provider: 'opencode-go', model: 'deepseek-v4-pro' } }],
       resume: async (options) => {
-        calls.resume.push({ resumeSessionId: key(options.resumeSessionId) });
+        calls.resume.push({ resumeSessionId: key(options.resumeSessionId), agentOptions: options.agentOptions });
         return { agent: childAgent, dispose: async () => {} };
       },
     },
@@ -119,7 +120,11 @@ test('mid-session switch forks through the last turn end, resumes, recomposes, a
   assert.equal(calls.fork[0].boundary, 3);
   assert.equal(typeof calls.fork[0].child, 'string');
   assert.ok(calls.fork[0].child.startsWith('telegram-'), 'fork child id is generated');
-  assert.deepEqual(calls.resume, [{ resumeSessionId: calls.fork[0].child }]);
+  assert.deepEqual(calls.resume, [{
+    resumeSessionId: calls.fork[0].child,
+    // 🟠-17: the fork inherits the SOURCE session's provider/model explicitly.
+    agentOptions: { provider: 'opencode-go', model: 'deepseek-v4-pro' },
+  }]);
   assert.deepEqual(calls.recompose, [{ scope: 'child', id: 'preset-b' }]);
   assert.deepEqual(childAppends, [{ type: 'agent-preset/selected', data: { agentPreset: 'preset-b' } }]);
 });

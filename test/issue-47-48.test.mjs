@@ -39,8 +39,17 @@ test('typingKeepaliveActive trusts the live agent status over the sticky flag (#
   assert.equal(typingKeepaliveActive(undefined, false, 0), false);
 });
 
-test('typingKeepaliveActive enforces the rearm budget (#48)', () => {
+test('typingKeepaliveActive enforces the rearm budget only on the stale path (#48)', () => {
   assert.equal(typingKeepaliveActive(true, true, 3), true, 'within budget keeps typing');
-  assert.equal(typingKeepaliveActive(true, true, 4), false, 'over the rearm limit the loop dies even mid-turn');
+  // A genuinely running turn is never budget-killed: single turns can
+  // legitimately outlast ~30-40 minutes (the budget check used to fire
+  // before the live-agent check and killed typing mid-turn).
+  assert.equal(typingKeepaliveActive(true, true, 4), true, 'a running agent keeps typing even over the limit');
+  assert.equal(typingKeepaliveActive(true, false, 99), true, 'live agent status wins at any budget');
   assert.equal(typingKeepaliveActive(true, true, 99, 100), true, 'the limit is configurable');
+  // The budget still caps the stale fallback where no live agent can answer.
+  assert.equal(typingKeepaliveActive(undefined, true, 3), true, 'stale sticky flag keeps typing within budget');
+  assert.equal(typingKeepaliveActive(undefined, true, 4), false, 'over the rearm limit the stale loop dies');
+  assert.equal(typingKeepaliveActive(undefined, true, 99, 100), true, 'configurable limit still bounds the stale path');
+  assert.equal(typingKeepaliveActive(undefined, true, 101, 100), false);
 });

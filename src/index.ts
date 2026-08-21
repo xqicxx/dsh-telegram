@@ -232,7 +232,10 @@ function teardownMount(): void {
   state.bridge?.detach();
   state.bridge = undefined;
   const teardownTransport = state.transport;
-  if (teardownTransport) void safeWrap("transport-stop", () => teardownTransport.stop(), log);
+  // The transport itself is stopped by apply() (which awaits the stop before
+  // building its replacement); teardown only reuses it for control-path
+  // cleanup below. Two concurrent stops would be harmless, but one owner
+  // keeps the 409 window closed deterministically.
   state.transport = undefined;
   // Remove dedicated bar-carrier messages so a hot reload never leaves a
   // stale reply keyboard button behind.
@@ -380,9 +383,19 @@ function buildExtensionHost(): ExtensionHost {
     applyConfig: (patch) => {
       const { config, changed } = overlayConfig(state.config, patch);
       if (changed.length === 0) return changed;
+      // Persist BEFORE committing to memory: a failed write (read-only disk)
+      // used to leave the runtime running on config the disk never saw
+      // (silently rolled back on restart) and threw raw into the extension
+      // callback. An empty result is the existing "nothing applied" signal
+      // callers already handle.
+      try {
+        writeConfig(state.configRoot, config);
+      } catch (err) {
+        log("applyConfig: persist failed \u2014 keeping the previous config", err);
+        return [];
+      }
       state.config = config;
       applyConfigLive(changed);
-      writeConfig(state.configRoot, state.config);
       return changed;
     },
     liveFeedEnabled: () => state.config.outbound.liveFeed !== false,
@@ -593,10 +606,14 @@ const typingRearms = new Map<number, number>();
 /** Keepalive decision (#48): a live agent's own status is authoritative —
  * the sticky `runningTurns` flag goes stale when a turn/end event is lost,
  * which used to re-arm the typing loop forever. The flag is only trusted
- * when no live agent can answer, and the rearm budget caps everything. */
+ * when no live agent can answer, and the rearm budget caps that stale path.
+ * A genuinely running agent is never budget-killed: turns legitimately
+ * outlast a few windows, so the budget must not fire before the agent check. */
 export function typingKeepaliveActive(agentRunning: boolean | undefined, stickyRunning: boolean, rearmCount: number, rearmLimit = TYPING_REARM_LIMIT): boolean {
+  if (agentRunning === true) return true;
+  if (agentRunning === false) return false;
   if (rearmCount > rearmLimit) return false;
-  return agentRunning === undefined ? stickyRunning : agentRunning;
+  return stickyRunning;
 }
 
 function turnStillRunning(chatId: number): boolean {
@@ -622,6 +639,11 @@ function startTyping(chatId: number): void {
   typingRearms.set(chatId, (typingRearms.get(chatId) ?? 0) + 1);
   setTimeout(() => {
     if (typingLoops.get(chatId) !== timer) return;
+    // A genuinely running turn RENEWS its budget instead of spending it (#48):
+    // the cap exists for the stale no-live-agent path, not to kill typing on
+    // a single turn that legitimately outlasts ~30-40 minutes.
+    const agent = currentAgent(chatId);
+    if (agent?.status === "running") typingRearms.delete(chatId);
     if (turnStillRunning(chatId)) startTyping(chatId);
     else stopTyping(chatId);
   }, TYPING_KEEPALIVE_MAX_MS);
@@ -814,7 +836,7 @@ async function createSessionForChat(
         const boundId = state.bridge?.agentIdForChat(chatId);
         if (boundId !== undefined) {
           const live = requireCtx().agents?.get(boundId as never);
-          if (live) return { result: { ok: true, text: "Session is already live." }, agentId: boundId };
+          if (live) return { result: { ok: true, text: "Session is already live." }, agentId: boundId, reusedLive: true };
         }
       }
       const requested = model ?? state.config.model ?? {};
@@ -2089,9 +2111,19 @@ async function dispatchToken(chatId: number, payload: Record<string, string>): P
         // Auto-create one with the chosen model (same path as `✨ New`)
         // instead of failing the tap, and persist the choice as the
         // bridge's default so future sessions inherit it.
-        const { result: res, agentId } = await createSessionForChat(chatId, { provider, model }, undefined, true);
+        const { result: res, agentId, reusedLive } = await createSessionForChat(chatId, { provider, model }, undefined, true);
         bindCreatedSession(chatId, agentId);
         const selected = normalizeOpencodeGoModel(provider, model);
+        if (res.ok && reusedLive) {
+          // The onlyIfUnbound gate reused this chat's already-live session
+          // (e.g. a first message raced the tap, or the binding outlived its
+          // released agent and another path re-bound it): the chosen model
+          // was never applied to any live session, so persisting it as the
+          // default would silently lie. Report the miss instead (#47 follow-up).
+          log(`model-select (no agent) provider=${provider} model=${model} -> not applied: ${res.text}`);
+          await uiSend(chatId, `\u274C ${plain(res.text)} The selected model was not applied \u2014 use \u2728 New for a session with ${plain(selected.provider)}/${plain(selected.model)}.`, { parse_mode: "HTML" });
+          return openModelsCard(chatId);
+        }
         if (res.ok) {
           state.config.model = { provider: selected.provider, model: selected.model };
           writeConfig(state.configRoot, state.config);
@@ -2553,7 +2585,9 @@ async function dispatchCallback(chatId: number, data: string): Promise<void> {
     if (sub === "use") {
       let targetId: string | undefined;
       if (!sessionLifecycle.find(requireCtx(), id)) {
-        const res = await resumeSession(requireCtx(), id).catch(() => undefined);
+        // Inherit this chat's own live agent's provider/model explicitly —
+        // never another chat's (🟠-17).
+        const res = await resumeSession(requireCtx(), id, boundAgentId(chatId)).catch(() => undefined);
         if (res?.ok && res.agentId !== undefined) {
           if (res.handle !== undefined) sessionLifecycle.adopt(res.handle);
           targetId = res.agentId;
@@ -3312,7 +3346,8 @@ async function dispatchCommand(chatId: number, command: string, args: string, me
         state.bridge?.bindAgent(chatId, id);
         await send(`\u{1F3AF} Switched to ${plain(truncate(id, 24))}.`);
       } else {
-        const res = await resumeSession(ctx, id);
+        // Same explicit inheritance as the Sessions-card `Use` tap (🟠-17).
+        const res = await resumeSession(ctx, id, boundAgentId(chatId));
         if (res.ok && res.agentId !== undefined) {
           if (res.handle !== undefined) sessionLifecycle.adopt(res.handle);
           state.bridge?.bindAgent(chatId, res.agentId);
@@ -3885,7 +3920,373 @@ async function syncBar(chatId: number): Promise<void> {
   await replaceBarCarrier(chatId, t, count);
 }
 
-export function apply(ctx: Context, loaderConfig?: unknown): void {
+/** Construct the transport and every chat-facing consumer (bridge, cards,
+ * router, tools' UI seams). Contains no await, so a FIRST mount executes
+ * synchronously inside apply(); on re-apply it runs only after the old
+ * transport's stop has been awaited, keeping two pollers from racing
+ * Telegram's 409 Conflict window. */
+async function mountTransport(ctx: Context): Promise<void> {
+  const botToken = resolveToken();
+  if (botToken === undefined) return;
+  state.transport = new TelegramTransport({
+    token: botToken,
+    log,
+    queue: new SendQueue({
+      maxPerWindow: state.config.outbound.sendRatePerSecond,
+      retry: { attempts: state.config.outbound.maxRetries, baseDelayMs: 500 },
+    }),
+    maxMessageLength: state.config.outbound.maxMessageLength,
+  });
+  state.bridge = new Bridge({
+    ctx,
+    transport: state.transport,
+    getConfig: () => state.config,
+    onStateChange: refreshAllPanels,
+    onTurnRunning: (chatId, running) => {
+      if (running) {
+        runningTurns.add(chatId);
+        // A genuine new turn gets a fresh keepalive budget (#48).
+        typingRearms.delete(chatId);
+        startTyping(chatId);
+      } else {
+        runningTurns.delete(chatId);
+        typingRearms.delete(chatId);
+        stopTyping(chatId);
+      }
+    },
+    log,
+  });
+  state.bridge.attach();
+
+  // Goal progress cards (issue #7): only when no streaming renderer owns
+  // presentation. Completion collapses the card into the openclaw receipt,
+  // hit-rate included.
+  goalProgress = new GoalProgressFeed({
+    ops: {
+      send: uiOps(state.transport).sendText,
+      edit: uiOps(state.transport).editText,
+    },
+    log,
+    chatIdForAgent: (agentId) => state.bridge?.chatIdForAgent(agentId),
+    goalFor: (chatId) => goalForChat(chatId),
+    todosFor: (chatId) => currentTodos(chatId),
+    statusStats: (chatId) => statusSnapshot(requireCtx(), boundAgentId(chatId), false).stats,
+    liveRendererActive: () => state.bridge?.hasAssistantConsumer() ?? false,
+    pendingInbound: (chatId) => state.bridge?.hasPendingInbound(chatId) ?? false,
+    notifyOnComplete: () => state.config.notify?.onComplete !== false,
+    notifyOnLongTask: () => state.config.notify?.onLongTask !== false,
+  });
+  goalProgress.attach(ctx);
+
+  // Context-pressure watcher (issue #8). Approval cards are minted through
+  // the single-use token registry and answered in dispatchToken.
+  compactionWatcher = new CompactionWatcher({
+    ctx,
+    log,
+    chatIdForAgent: (agentId) => state.bridge?.chatIdForAgent(agentId),
+    threshold: () => state.config.compact.threshold,
+    policy: () => state.config.compact.policy,
+    cooldownMs: () => state.config.compact.cooldownMs,
+    askApproval: (chatId, sessionId, usage) => {
+      const pct = Math.round((usage.ratio ?? 0) * 100);
+      void uiSend(chatId, `\u{1F4C8} Context ${pct}% of ${usage.window ?? "?"} tokens \u2014 compact before it overflows?`, {
+        parse_mode: "HTML",
+        reply_markup: {
+          inline_keyboard: [[
+            { text: "\u2705 \u81EA\u52A8\u538B\u7F29", callback_data: token({ action: "compact-auto", sessionId }) },
+            { text: "\u{1F4DD} \u6211\u6765\u624B\u52A8", callback_data: token({ action: "compact-manual", sessionId }) },
+            { text: "\u{1F7E2} \u538B\u7F29\u5E76\u7EE7\u7EED", callback_data: token({ action: "compact-auto", sessionId }) },
+          ]],
+        },
+      });
+    },
+    notify: (chatId, text) => {
+      void uiSend(chatId, text, { parse_mode: "HTML" });
+    },
+  });
+  compactionWatcher.attach();
+
+  // Incremental todo cards + live bar count (issue #10). The first durable
+  // snapshot only primes the baseline. turn/end also refreshes the open
+  // Todo card immediately instead of waiting for the next 5s tick (#14).
+  refreshEventDisposers.push(
+    (ctx.on.bind(ctx) as (name: string, listener: (...args: unknown[]) => void) => () => void)("session/event", (...args: unknown[]) => {
+      const session = args[0] as { id: unknown };
+      const event = args[1] as { type?: string; data?: { todos?: readonly TodoView[] } };
+      const chatId = state.bridge?.chatIdForAgent(String(session.id));
+      if (chatId === undefined) return;
+      if (event.type === "turn/end") {
+        refreshActiveCards();
+        scheduleBarSync(chatId, 0);
+        return;
+      }
+      if (event.type !== "todo/write" || !Array.isArray(event.data?.todos)) return;
+      const next = normalizeTodos(event.data.todos);
+      const hadBaseline = todoSnapshots.has(chatId);
+      const previous = todoSnapshots.get(chatId) ?? [];
+      todoSnapshots.set(chatId, next);
+      if (hadBaseline) notifyTodoChange(chatId, previous, next);
+      refreshActiveCards();
+      scheduleBarSync(chatId, 0);
+    }),
+  );
+
+  // Refresh-only subscribers for the events the web forwards over
+  // events.mux/events.host: open panels re-read their data source, closed
+  // chats get no message. Waterfall events keep flowing (we return void).
+  const onRefreshEvent = ctx.on.bind(ctx) as (name: string, listener: (...args: unknown[]) => void) => () => void;
+  for (const name of FORWARDED_EVENT_NAMES) {
+    refreshEventDisposers.push(
+      onRefreshEvent(name, () => {
+        refreshAllPanels();
+        refreshActiveCards();
+      }),
+    );
+  }
+  for (const name of HOST_EVENT_NAMES) {
+    refreshEventDisposers.push(
+      onRefreshEvent(name, () => {
+        refreshAllPanels();
+        refreshActiveCards();
+      }),
+    );
+  }
+  // Bounded per-session bookkeeping (LOOP_AUDIT #8): drop live counters as
+  // soon as the harness reports the session disposed.
+  refreshEventDisposers.push(
+    onRefreshEvent("session/disposed", (...args: unknown[]) => {
+      const session = args[0] as { id?: unknown } | undefined;
+      if (session?.id === undefined) return;
+      const id = String(session.id);
+      forgetStatusSession(id);
+      statusSubagentCounts.delete(id);
+      const chatId = state.bridge?.chatIdForAgent(id);
+      if (chatId !== undefined) todoSnapshots.delete(chatId);
+    }),
+  );
+
+  state.interactive = attachInteractive(
+    ctx,
+    {
+      broadcast: async (text, keyboard, chatId) => {
+        const delivered: { chatId: number; messageId: number }[] = [];
+        const targets = chatId === undefined ? [...state.chats] : state.chats.has(chatId) ? [chatId] : [];
+        for (const target of targets) {
+          const id = await uiSend(target, plain(text), {
+            parse_mode: "HTML",
+            ...(keyboard === undefined ? {} : { reply_markup: keyboard as never }),
+          });
+          if (id !== undefined) delivered.push({ chatId: target, messageId: id });
+        }
+        return delivered;
+      },
+      chatForSession: (sessionId) => state.bridge?.chatIdForAgent(sessionId),
+      edit: async (chatId, messageId, text, keyboard) => {
+        const t = state.transport;
+        if (!t) return false;
+        const edited = await t.editTextControl(chatId, messageId, plain(text), {
+          parse_mode: "HTML",
+          // `undefined` means "settle this card": edit the text and remove
+          // its inline keyboard in place instead of leaving dead buttons.
+          reply_markup: keyboard === undefined ? { inline_keyboard: [] } : (keyboard as never),
+        });
+        return edited;
+      },
+    },
+    {
+      userQuestions: state.config.interactive?.userQuestions ?? "telegram",
+      log,
+      allowedTools: state.config.interactive?.allowByTool,
+      persistToolAllow: (toolName) => {
+        const next = [...new Set([...(state.config.interactive?.allowByTool ?? []), toolName])];
+        const { config, changed } = overlayConfig(state.config, { interactive: { allowByTool: next } });
+        state.config = config;
+        writeConfig(state.configRoot, state.config);
+        applyConfigLive(changed);
+        return true;
+      },
+      goalIdForSession: (sessionId) => {
+        const agent = requireCtx().agents?.get(sessionId as never);
+        if (!agent) return undefined;
+        return getGoal(requireCtx(), String(agent.id))?.id;
+      },
+    },
+  );
+
+  // Every restart the client keeps the previous reply keyboard, which can
+  // be a stale static `⌛ Queue` label from an older build. Re-assert the
+  // live bar (count embedded) for every whitelisted chat on mount.
+  for (const chatId of state.config.security.allowedChatIds) {
+    state.chats.add(chatId);
+    state.barCounts.set(chatId, -1);
+    scheduleBarSync(chatId, 1500);
+  }
+
+  attachRouter({
+    transport: state.transport,
+    isAllowed: (chatId) => {
+      const allowed = isChatAllowed(state.config, chatId);
+      // Track only whitelisted chats: broadcasts/panels must never reach a
+      // chat that merely probed the bot while unauthorized.
+      if (allowed) state.chats.add(chatId);
+      return allowed;
+    },
+    onCommand: (chatId, command, args, messageId) => dispatchCommand(chatId, command, args, messageId).catch((err) => notifyDispatchFailure(chatId, `command /${command}`, err)),
+    onBarButton: (chatId, label) => dispatchBarButton(chatId, label).catch((err) => notifyDispatchFailure(chatId, "Bar action", err)),
+    onCallback: (chatId, data) => dispatchCallback(chatId, data).catch((err) => notifyDispatchFailure(chatId, "Button action", err)),
+    onPhoto: (chatId, fileId, caption, messageId) => dispatchPhoto(chatId, fileId, caption, messageId).catch((err) => notifyDispatchFailure(chatId, "Photo upload", err)),
+    onPhotos: (chatId, photos) => dispatchPhotos(chatId, photos).catch((err) => notifyDispatchFailure(chatId, "Photo batch upload", err)),
+    onDocument: (chatId, kind, fileId, name, mimeType, messageId) =>
+      dispatchDocument(chatId, kind, fileId, name, mimeType, messageId).catch((err) => notifyDispatchFailure(chatId, "Attachment upload", err)),
+    onUnauthorized: (chatId, reason) => {
+      if (reason === "command:start") pendingStartAfterAllow.add(chatId);
+      log(`unauthorized prompt -> chatId ${chatId}${reason === undefined ? "" : ` (${reason})`}`);
+      void uiSend(chatId, "\u{1F6AB} This chat is not allowed yet. Tap below to grant access:", {
+        parse_mode: "HTML",
+        reply_markup: { inline_keyboard: [[{ text: "\u2795 Allow this chat", callback_data: "m:allowthis" }]] },
+      });
+    },
+    onUserText: async (chatId, text, messageId) => {
+      if (state.transport) void safeWrap(`typing(${chatId})`, () => state.transport!.sendChatActionControl(chatId, "typing"), log);
+      if (pendingSearch && pendingSearch.chatId === chatId) {
+        pendingSearch = undefined;
+        void openSearchCard(chatId, text);
+        return;
+      }
+      if (pendingMkdir && pendingMkdir.chatId === chatId) {
+        const { path } = pendingMkdir;
+        pendingMkdir = undefined;
+        const name = text.trim();
+        if (!name || name.includes("/") || name.includes("\\")) {
+          void uiSend(chatId, "\u274C Folder name must be a single path segment (no / or \\).", { parse_mode: "HTML" });
+          return openHostDirectoryCard(chatId, path);
+        }
+        void (async () => {
+          const res = await createDirectory(join(path, name));
+          void uiSend(chatId, res.ok ? plain(res.text) : `\u274C ${plain(res.text)}`, { parse_mode: "HTML" });
+          return openHostDirectoryCard(chatId, path);
+        })().catch((err) => log("new folder failed", err));
+        return;
+      }
+      if (pendingSteer && pendingSteer.chatId === chatId) {
+        const { sessionId } = pendingSteer;
+        pendingSteer = undefined;
+        const res = promptSession(requireCtx(), sessionId, text, "steer");
+        void uiSend(chatId, res.ok ? plain(res.text) : `\u274C ${plain(res.text)}`, { parse_mode: "HTML" });
+        return;
+      }
+      if (pendingRename && pendingRename.chatId === chatId) {
+        const sessionId = pendingRename.sessionId;
+        pendingRename = undefined;
+        const res = renameSession(requireCtx(), sessionId, text);
+        void uiSend(chatId, res.ok ? plain(res.text) : `\u274C ${plain(res.text)}`, { parse_mode: "HTML" });
+        return;
+      }
+      if (pendingSubagentPrompt && pendingSubagentPrompt.chatId === chatId) {
+        const { parentId, childId } = pendingSubagentPrompt;
+        pendingSubagentPrompt = undefined;
+        void safeWrap("subagent-prompt", () =>
+          promptSubagent(requireCtx(), parentId, childId, text).then((res) =>
+            uiSend(chatId, res.ok ? plain(res.text) : `\u274C ${plain(res.text)}`, { parse_mode: "HTML" }),
+          ),
+        log).then((sent) => {
+          if (sent === undefined) void uiSend(chatId, "\u274C Subagent prompt failed.", { parse_mode: "HTML" });
+        });
+        return;
+      }
+      if (pendingPresetCopy && pendingPresetCopy.chatId === chatId) {
+        const { sourceId } = pendingPresetCopy;
+        pendingPresetCopy = undefined;
+        const newId = text.trim();
+        if (!newId) {
+          void uiSend(chatId, "\u274C Preset id must not be blank.", { parse_mode: "HTML" });
+          return;
+        }
+        void safeWrap("preset-copy", () =>
+          copyAgentPreset(requireCtx(), sourceId, newId).then((res) => {
+            void uiSend(chatId, res.ok ? plain(res.text) : `\u274C ${plain(res.text)}`, { parse_mode: "HTML" });
+            if (res.ok) void openPresetsCard(chatId);
+          }),
+        log).then((done) => {
+          if (done === undefined) void uiSend(chatId, "\u274C Preset copy failed.", { parse_mode: "HTML" });
+        });
+        return;
+      }
+      if (pendingPluginAdd && pendingPluginAdd.chatId === chatId) {
+        pendingPluginAdd = undefined;
+        const agentId = boundAgentId(chatId);
+        if (agentId === undefined) {
+          void uiSend(chatId, "\u274C No live session in this chat \u2014 send a message first to create one, then /pluginadd.", { parse_mode: "HTML" });
+          return;
+        }
+        // Tolerate ```json fences and leading labels around the payload.
+        const raw = text.trim().replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "");
+        let parsed: Record<string, unknown>;
+        try {
+          const value: unknown = JSON.parse(raw);
+          if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("not an object");
+          parsed = value as Record<string, unknown>;
+        } catch {
+          void uiSend(chatId, '\u274C That is not a JSON object. Expected {"name", "purpose", "host"/"client"} — try again or /cancel.', { parse_mode: "HTML" });
+          pendingPluginAdd = { chatId };
+          return;
+        }
+        const str = (key: string): string | undefined => (typeof parsed[key] === "string" ? (parsed[key] as string) : undefined);
+        void safeWrap("plugin-add", () =>
+          defineDynamicCordis(requireCtx(), agentId, {
+            name: str("name") ?? "",
+            purpose: str("purpose") ?? "",
+            host: str("host"),
+            client: str("client"),
+          }, typeof parsed["pluginId"] === "string" ? (parsed["pluginId"] as string) : undefined).then((res) => {
+            void uiSend(chatId, res.ok ? `\u2705 ${plain(res.text)}\nTap \u25B6 Run on the Dynamic card to activate it.` : `\u274C ${plain(res.text)}`, { parse_mode: "HTML" });
+            if (res.ok) refreshAllPanels();
+          }),
+        log).then((done) => {
+          if (done === undefined) void uiSend(chatId, "\u274C Plugin definition failed.", { parse_mode: "HTML" });
+        });
+        return;
+      }
+      // Per-chat binding: this chat's first message creates its own
+      // session. Other chats keep their own agent and never share it.
+      const boundId = state.bridge?.agentIdForChat(chatId);
+      const chatAgent = boundId === undefined ? undefined : requireCtx().agents?.get(boundId as never);
+      if (chatAgent === undefined) {
+        // AWAITED, not fire-and-forget: the router's per-chat user FIFO can
+        // only protect "two rapid first messages → two sessions" if the handler
+        // promise spans the whole create+bind+deliver path. The shared
+        // per-chat session gate additionally serializes a fast UI tap
+        // (✨ New / model select) that races the first message.
+        const created = await createSessionForChat(chatId, state.config.model, undefined, true);
+        bindCreatedSession(chatId, created.agentId);
+        if (!created.result.ok) {
+          await uiSend(chatId, `\u274C ${plain(created.result.text)}`, { parse_mode: "HTML" });
+          return;
+        }
+        const res = state.bridge!.deliver(chatId, text, messageId);
+        if (!res.ok) await uiSend(chatId, `\u274C ${plain(res.text)}`, { parse_mode: "HTML" });
+        else scheduleBarSync(chatId, 0);
+        return;
+      }
+      const res = state.bridge!.deliver(chatId, text, messageId);
+      if (!res.ok) await uiSend(chatId, `\u274C ${plain(res.text)}`, { parse_mode: "HTML" });
+      else scheduleBarSync(chatId, 0);
+    },
+  });
+  ctx.on("agent/created", () => {
+    if (state.config.watch.autoStart && !state.watching) {
+      void startWatching().catch((err) => log("auto start failed", err));
+    }
+  });
+  if (state.config.watch.autoStart && !state.watching) {
+    void startWatching().catch((err) => log("auto start failed", err));
+  }
+}
+
+export function apply(ctx: Context, loaderConfig?: unknown): void | Promise<void> {
+  // Captured BEFORE teardownMount() clears state.transport: the re-apply
+  // dispatch below must await THIS transport's stop before rebuilding.
+  const previousTransport = state.transport;
   if (state.context) teardownMount();
   state.context = ctx;
 
@@ -3971,361 +4372,21 @@ export function apply(ctx: Context, loaderConfig?: unknown): void {
     }
   });
 
-  const botToken = resolveToken();
-  if (botToken) {
-    state.transport = new TelegramTransport({
-      token: botToken,
-      log,
-      queue: new SendQueue({
-        maxPerWindow: state.config.outbound.sendRatePerSecond,
-        retry: { attempts: state.config.outbound.maxRetries, baseDelayMs: 500 },
-      }),
-      maxMessageLength: state.config.outbound.maxMessageLength,
-    });
-    state.bridge = new Bridge({
-      ctx,
-      transport: state.transport,
-      getConfig: () => state.config,
-      onStateChange: refreshAllPanels,
-      onTurnRunning: (chatId, running) => {
-        if (running) {
-          runningTurns.add(chatId);
-          // A genuine new turn gets a fresh keepalive budget (#48).
-          typingRearms.delete(chatId);
-          startTyping(chatId);
-        } else {
-          runningTurns.delete(chatId);
-          typingRearms.delete(chatId);
-          stopTyping(chatId);
-        }
-      },
-      log,
-    });
-    state.bridge.attach();
-
-    // Goal progress cards (issue #7): only when no streaming renderer owns
-    // presentation. Completion collapses the card into the openclaw receipt,
-    // hit-rate included.
-    goalProgress = new GoalProgressFeed({
-      ops: {
-        send: uiOps(state.transport).sendText,
-        edit: uiOps(state.transport).editText,
-      },
-      log,
-      chatIdForAgent: (agentId) => state.bridge?.chatIdForAgent(agentId),
-      goalFor: (chatId) => goalForChat(chatId),
-      todosFor: (chatId) => currentTodos(chatId),
-      statusStats: (chatId) => statusSnapshot(requireCtx(), boundAgentId(chatId), false).stats,
-      liveRendererActive: () => state.bridge?.hasAssistantConsumer() ?? false,
-      pendingInbound: (chatId) => state.bridge?.hasPendingInbound(chatId) ?? false,
-      notifyOnComplete: () => state.config.notify?.onComplete !== false,
-      notifyOnLongTask: () => state.config.notify?.onLongTask !== false,
-    });
-    goalProgress.attach(ctx);
-
-    // Context-pressure watcher (issue #8). Approval cards are minted through
-    // the single-use token registry and answered in dispatchToken.
-    compactionWatcher = new CompactionWatcher({
-      ctx,
-      log,
-      chatIdForAgent: (agentId) => state.bridge?.chatIdForAgent(agentId),
-      threshold: () => state.config.compact.threshold,
-      policy: () => state.config.compact.policy,
-      cooldownMs: () => state.config.compact.cooldownMs,
-      askApproval: (chatId, sessionId, usage) => {
-        const pct = Math.round((usage.ratio ?? 0) * 100);
-        void uiSend(chatId, `\u{1F4C8} Context ${pct}% of ${usage.window ?? "?"} tokens \u2014 compact before it overflows?`, {
-          parse_mode: "HTML",
-          reply_markup: {
-            inline_keyboard: [[
-              { text: "\u2705 \u81EA\u52A8\u538B\u7F29", callback_data: token({ action: "compact-auto", sessionId }) },
-              { text: "\u{1F4DD} \u6211\u6765\u624B\u52A8", callback_data: token({ action: "compact-manual", sessionId }) },
-              { text: "\u{1F7E2} \u538B\u7F29\u5E76\u7EE7\u7EED", callback_data: token({ action: "compact-auto", sessionId }) },
-            ]],
-          },
-        });
-      },
-      notify: (chatId, text) => {
-        void uiSend(chatId, text, { parse_mode: "HTML" });
-      },
-    });
-    compactionWatcher.attach();
-
-    // Incremental todo cards + live bar count (issue #10). The first durable
-    // snapshot only primes the baseline. turn/end also refreshes the open
-    // Todo card immediately instead of waiting for the next 5s tick (#14).
-    refreshEventDisposers.push(
-      (ctx.on.bind(ctx) as (name: string, listener: (...args: unknown[]) => void) => () => void)("session/event", (...args: unknown[]) => {
-        const session = args[0] as { id: unknown };
-        const event = args[1] as { type?: string; data?: { todos?: readonly TodoView[] } };
-        const chatId = state.bridge?.chatIdForAgent(String(session.id));
-        if (chatId === undefined) return;
-        if (event.type === "turn/end") {
-          refreshActiveCards();
-          scheduleBarSync(chatId, 0);
-          return;
-        }
-        if (event.type !== "todo/write" || !Array.isArray(event.data?.todos)) return;
-        const next = normalizeTodos(event.data.todos);
-        const hadBaseline = todoSnapshots.has(chatId);
-        const previous = todoSnapshots.get(chatId) ?? [];
-        todoSnapshots.set(chatId, next);
-        if (hadBaseline) notifyTodoChange(chatId, previous, next);
-        refreshActiveCards();
-        scheduleBarSync(chatId, 0);
-      }),
-    );
-
-    // Refresh-only subscribers for the events the web forwards over
-    // events.mux/events.host: open panels re-read their data source, closed
-    // chats get no message. Waterfall events keep flowing (we return void).
-    const onRefreshEvent = ctx.on.bind(ctx) as (name: string, listener: (...args: unknown[]) => void) => () => void;
-    for (const name of FORWARDED_EVENT_NAMES) {
-      refreshEventDisposers.push(
-        onRefreshEvent(name, () => {
-          refreshAllPanels();
-          refreshActiveCards();
-        }),
-      );
-    }
-    for (const name of HOST_EVENT_NAMES) {
-      refreshEventDisposers.push(
-        onRefreshEvent(name, () => {
-          refreshAllPanels();
-          refreshActiveCards();
-        }),
-      );
-    }
-    // Bounded per-session bookkeeping (LOOP_AUDIT #8): drop live counters as
-    // soon as the harness reports the session disposed.
-    refreshEventDisposers.push(
-      onRefreshEvent("session/disposed", (...args: unknown[]) => {
-        const session = args[0] as { id?: unknown } | undefined;
-        if (session?.id === undefined) return;
-        const id = String(session.id);
-        forgetStatusSession(id);
-        statusSubagentCounts.delete(id);
-        const chatId = state.bridge?.chatIdForAgent(id);
-        if (chatId !== undefined) todoSnapshots.delete(chatId);
-      }),
-    );
-
-    state.interactive = attachInteractive(
-      ctx,
-      {
-        broadcast: async (text, keyboard, chatId) => {
-          const delivered: { chatId: number; messageId: number }[] = [];
-          const targets = chatId === undefined ? [...state.chats] : state.chats.has(chatId) ? [chatId] : [];
-          for (const target of targets) {
-            const id = await uiSend(target, plain(text), {
-              parse_mode: "HTML",
-              ...(keyboard === undefined ? {} : { reply_markup: keyboard as never }),
-            });
-            if (id !== undefined) delivered.push({ chatId: target, messageId: id });
-          }
-          return delivered;
-        },
-        chatForSession: (sessionId) => state.bridge?.chatIdForAgent(sessionId),
-        edit: async (chatId, messageId, text, keyboard) => {
-          const t = state.transport;
-          if (!t) return false;
-          const edited = await t.editTextControl(chatId, messageId, plain(text), {
-            parse_mode: "HTML",
-            // `undefined` means "settle this card": edit the text and remove
-            // its inline keyboard in place instead of leaving dead buttons.
-            reply_markup: keyboard === undefined ? { inline_keyboard: [] } : (keyboard as never),
-          });
-          return edited;
-        },
-      },
-      {
-        userQuestions: state.config.interactive?.userQuestions ?? "telegram",
-        log,
-        allowedTools: state.config.interactive?.allowByTool,
-        persistToolAllow: (toolName) => {
-          const next = [...new Set([...(state.config.interactive?.allowByTool ?? []), toolName])];
-          const { config, changed } = overlayConfig(state.config, { interactive: { allowByTool: next } });
-          state.config = config;
-          writeConfig(state.configRoot, state.config);
-          applyConfigLive(changed);
-          return true;
-        },
-        goalIdForSession: (sessionId) => {
-          const agent = requireCtx().agents?.get(sessionId as never);
-          if (!agent) return undefined;
-          return getGoal(requireCtx(), String(agent.id))?.id;
-        },
-      },
-    );
-
-    // Every restart the client keeps the previous reply keyboard, which can
-    // be a stale static `⌛ Queue` label from an older build. Re-assert the
-    // live bar (count embedded) for every whitelisted chat on mount.
-    for (const chatId of state.config.security.allowedChatIds) {
-      state.chats.add(chatId);
-      state.barCounts.set(chatId, -1);
-      scheduleBarSync(chatId, 1500);
-    }
-
-    attachRouter({
-      transport: state.transport,
-      isAllowed: (chatId) => {
-        const allowed = isChatAllowed(state.config, chatId);
-        // Track only whitelisted chats: broadcasts/panels must never reach a
-        // chat that merely probed the bot while unauthorized.
-        if (allowed) state.chats.add(chatId);
-        return allowed;
-      },
-      onCommand: (chatId, command, args, messageId) => dispatchCommand(chatId, command, args, messageId).catch((err) => notifyDispatchFailure(chatId, `command /${command}`, err)),
-      onBarButton: (chatId, label) => dispatchBarButton(chatId, label).catch((err) => notifyDispatchFailure(chatId, "Bar action", err)),
-      onCallback: (chatId, data) => dispatchCallback(chatId, data).catch((err) => notifyDispatchFailure(chatId, "Button action", err)),
-      onPhoto: (chatId, fileId, caption, messageId) => dispatchPhoto(chatId, fileId, caption, messageId).catch((err) => notifyDispatchFailure(chatId, "Photo upload", err)),
-      onPhotos: (chatId, photos) => dispatchPhotos(chatId, photos).catch((err) => notifyDispatchFailure(chatId, "Photo batch upload", err)),
-      onDocument: (chatId, kind, fileId, name, mimeType, messageId) =>
-        dispatchDocument(chatId, kind, fileId, name, mimeType, messageId).catch((err) => notifyDispatchFailure(chatId, "Attachment upload", err)),
-      onUnauthorized: (chatId, reason) => {
-        if (reason === "command:start") pendingStartAfterAllow.add(chatId);
-        log(`unauthorized prompt -> chatId ${chatId}${reason === undefined ? "" : ` (${reason})`}`);
-        void uiSend(chatId, "\u{1F6AB} This chat is not allowed yet. Tap below to grant access:", {
-          parse_mode: "HTML",
-          reply_markup: { inline_keyboard: [[{ text: "\u2795 Allow this chat", callback_data: "m:allowthis" }]] },
-        });
-      },
-      onUserText: async (chatId, text, messageId) => {
-        if (state.transport) void safeWrap(`typing(${chatId})`, () => state.transport!.sendChatActionControl(chatId, "typing"), log);
-        if (pendingSearch && pendingSearch.chatId === chatId) {
-          pendingSearch = undefined;
-          void openSearchCard(chatId, text);
-          return;
-        }
-        if (pendingMkdir && pendingMkdir.chatId === chatId) {
-          const { path } = pendingMkdir;
-          pendingMkdir = undefined;
-          const name = text.trim();
-          if (!name || name.includes("/") || name.includes("\\")) {
-            void uiSend(chatId, "\u274C Folder name must be a single path segment (no / or \\).", { parse_mode: "HTML" });
-            return openHostDirectoryCard(chatId, path);
-          }
-          void (async () => {
-            const res = await createDirectory(join(path, name));
-            void uiSend(chatId, res.ok ? plain(res.text) : `\u274C ${plain(res.text)}`, { parse_mode: "HTML" });
-            return openHostDirectoryCard(chatId, path);
-          })().catch((err) => log("new folder failed", err));
-          return;
-        }
-        if (pendingSteer && pendingSteer.chatId === chatId) {
-          const { sessionId } = pendingSteer;
-          pendingSteer = undefined;
-          const res = promptSession(requireCtx(), sessionId, text, "steer");
-          void uiSend(chatId, res.ok ? plain(res.text) : `\u274C ${plain(res.text)}`, { parse_mode: "HTML" });
-          return;
-        }
-        if (pendingRename && pendingRename.chatId === chatId) {
-          const sessionId = pendingRename.sessionId;
-          pendingRename = undefined;
-          const res = renameSession(requireCtx(), sessionId, text);
-          void uiSend(chatId, res.ok ? plain(res.text) : `\u274C ${plain(res.text)}`, { parse_mode: "HTML" });
-          return;
-        }
-        if (pendingSubagentPrompt && pendingSubagentPrompt.chatId === chatId) {
-          const { parentId, childId } = pendingSubagentPrompt;
-          pendingSubagentPrompt = undefined;
-          void safeWrap("subagent-prompt", () =>
-            promptSubagent(requireCtx(), parentId, childId, text).then((res) =>
-              uiSend(chatId, res.ok ? plain(res.text) : `\u274C ${plain(res.text)}`, { parse_mode: "HTML" }),
-            ),
-          log).then((sent) => {
-            if (sent === undefined) void uiSend(chatId, "\u274C Subagent prompt failed.", { parse_mode: "HTML" });
-          });
-          return;
-        }
-        if (pendingPresetCopy && pendingPresetCopy.chatId === chatId) {
-          const { sourceId } = pendingPresetCopy;
-          pendingPresetCopy = undefined;
-          const newId = text.trim();
-          if (!newId) {
-            void uiSend(chatId, "\u274C Preset id must not be blank.", { parse_mode: "HTML" });
-            return;
-          }
-          void safeWrap("preset-copy", () =>
-            copyAgentPreset(requireCtx(), sourceId, newId).then((res) => {
-              void uiSend(chatId, res.ok ? plain(res.text) : `\u274C ${plain(res.text)}`, { parse_mode: "HTML" });
-              if (res.ok) void openPresetsCard(chatId);
-            }),
-          log).then((done) => {
-            if (done === undefined) void uiSend(chatId, "\u274C Preset copy failed.", { parse_mode: "HTML" });
-          });
-          return;
-        }
-        if (pendingPluginAdd && pendingPluginAdd.chatId === chatId) {
-          pendingPluginAdd = undefined;
-          const agentId = boundAgentId(chatId);
-          if (agentId === undefined) {
-            void uiSend(chatId, "\u274C No live session in this chat \u2014 send a message first to create one, then /pluginadd.", { parse_mode: "HTML" });
-            return;
-          }
-          // Tolerate ```json fences and leading labels around the payload.
-          const raw = text.trim().replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "");
-          let parsed: Record<string, unknown>;
-          try {
-            const value: unknown = JSON.parse(raw);
-            if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("not an object");
-            parsed = value as Record<string, unknown>;
-          } catch {
-            void uiSend(chatId, '\u274C That is not a JSON object. Expected {"name", "purpose", "host"/"client"} — try again or /cancel.', { parse_mode: "HTML" });
-            pendingPluginAdd = { chatId };
-            return;
-          }
-          const str = (key: string): string | undefined => (typeof parsed[key] === "string" ? (parsed[key] as string) : undefined);
-          void safeWrap("plugin-add", () =>
-            defineDynamicCordis(requireCtx(), agentId, {
-              name: str("name") ?? "",
-              purpose: str("purpose") ?? "",
-              host: str("host"),
-              client: str("client"),
-            }, typeof parsed["pluginId"] === "string" ? (parsed["pluginId"] as string) : undefined).then((res) => {
-              void uiSend(chatId, res.ok ? `\u2705 ${plain(res.text)}\nTap \u25B6 Run on the Dynamic card to activate it.` : `\u274C ${plain(res.text)}`, { parse_mode: "HTML" });
-              if (res.ok) refreshAllPanels();
-            }),
-          log).then((done) => {
-            if (done === undefined) void uiSend(chatId, "\u274C Plugin definition failed.", { parse_mode: "HTML" });
-          });
-          return;
-        }
-        // Per-chat binding: this chat's first message creates its own
-        // session. Other chats keep their own agent and never share it.
-        const boundId = state.bridge?.agentIdForChat(chatId);
-        const chatAgent = boundId === undefined ? undefined : requireCtx().agents?.get(boundId as never);
-        if (chatAgent === undefined) {
-          // AWAITED, not fire-and-forget: the router's per-chat user FIFO can
-          // only protect "two rapid first messages → two sessions" if the handler
-          // promise spans the whole create+bind+deliver path. The shared
-          // per-chat session gate additionally serializes a fast UI tap
-          // (✨ New / model select) that races the first message.
-          const created = await createSessionForChat(chatId, state.config.model, undefined, true);
-          bindCreatedSession(chatId, created.agentId);
-          if (!created.result.ok) {
-            await uiSend(chatId, `\u274C ${plain(created.result.text)}`, { parse_mode: "HTML" });
-            return;
-          }
-          const res = state.bridge!.deliver(chatId, text, messageId);
-          if (!res.ok) await uiSend(chatId, `\u274C ${plain(res.text)}`, { parse_mode: "HTML" });
-          else scheduleBarSync(chatId, 0);
-          return;
-        }
-        const res = state.bridge!.deliver(chatId, text, messageId);
-        if (!res.ok) await uiSend(chatId, `\u274C ${plain(res.text)}`, { parse_mode: "HTML" });
-        else scheduleBarSync(chatId, 0);
-      },
-    });
-    ctx.on("agent/created", () => {
-      if (state.config.watch.autoStart && !state.watching) {
-        void startWatching().catch((err) => log("auto start failed", err));
-      }
-    });
-    if (state.config.watch.autoStart && !state.watching) {
-      void startWatching().catch((err) => log("auto start failed", err));
-    }
+  // Re-apply (hot reload / config restart) must fully stop the previous
+  // polling loop BEFORE constructing its replacement: two live getUpdates
+  // pollers race Telegram's 409 Conflict window. The remount promise is
+  // RETURNED at the end of apply() so awaited callers (cordis awaits thenable
+  // plugin results; the loader awaits fiber.await()) block until the
+  // replacement is live. First mounts stay fully synchronous
+  // (mountTransport has no await before its effects), so apply() still
+  // registers the router and tools before it returns.
+  let remount: Promise<void>;
+  if (previousTransport !== undefined) {
+    remount = previousTransport.stop()
+      .catch((err) => log("old transport stop failed during re-apply", err))
+      .then(() => mountTransport(ctx));
+  } else {
+    remount = mountTransport(ctx);
   }
 
   ctx.commands.register({
@@ -4533,4 +4594,6 @@ export function apply(ctx: Context, loaderConfig?: unknown): void {
   }));
 
   ctx.effect(() => teardownMount);
+
+  return remount;
 }

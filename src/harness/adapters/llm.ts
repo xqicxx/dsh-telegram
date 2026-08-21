@@ -64,6 +64,13 @@ function llmOf(ctx: Context): LlmLike | undefined {
   return ctx.get("llm") as LlmLike | undefined;
 }
 
+/** Model discovery dials a draft baseURL; a hung endpoint must not suspend
+ * Telegram command processing forever (the request used to carry no signal).
+ * Same race shape as host.ts's withFsTimeout; the signal is also passed so
+ * fetch-based adapters abort their connection immediately. Matches media.ts's
+ * transcription budget. */
+const DISCOVER_TIMEOUT_MS = 60_000;
+
 /** Build the web's exact model catalog shape (groups + failures + routable). */
 export async function modelCatalog(ctx: Context, current?: { provider?: string; model?: string; reasoningEffort?: string }): Promise<ModelCatalog> {
   const llm = llmOf(ctx);
@@ -140,11 +147,19 @@ export async function discoverModels(
 ): Promise<AdapterResult & { models?: DiscoveredModel[] }> {
   const llm = llmOf(ctx);
   if (!llm) return fail("llm service is unavailable in this profile");
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    const models = await llm.discoverModels(settingsNs, request);
+    const models = await Promise.race([
+      llm.discoverModels(settingsNs, { ...request, signal: AbortSignal.timeout(DISCOVER_TIMEOUT_MS) }),
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(`model discovery timed out after ${DISCOVER_TIMEOUT_MS}ms`)), DISCOVER_TIMEOUT_MS);
+      }),
+    ]);
     const lines = models.map((model) => `${model.id}${model.name === undefined ? "" : ` \u00B7 ${model.name}`}${model.contextWindow === undefined ? "" : ` \u00B7 ctx ${model.contextWindow}`}`);
     return { ok: true, text: `\u{1F50D} ${models.length} model(s) discovered:\n${lines.join("\n").slice(0, 3500)}`, models };
   } catch (err) {
     return fail(err instanceof Error ? err.message : String(err));
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
   }
 }

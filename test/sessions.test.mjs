@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { listQueue, updateQueueItem, searchSessions, readHistory, promptSession, listSessionDetails, saveImageAttachment, readImageAttachment, releaseSavedAttachments, displayTitleFor, groupSessionsByProject, orderProjectGroups, sortProjectSessions, selectSessionModel, UNGROUPED_KEY } from '../dist/harness/adapters/sessions.js';
+import { listQueue, updateQueueItem, searchSessions, readHistory, promptSession, listSessionDetails, saveImageAttachment, readImageAttachment, releaseSavedAttachments, displayTitleFor, groupSessionsByProject, orderProjectGroups, sortProjectSessions, selectSessionModel, resumeSession, UNGROUPED_KEY } from '../dist/harness/adapters/sessions.js';
 
 function queueAgent(id, nextTurn, nextStep, status = 'idle') {
   const make = (items) => items.map((item) => ({ id: item.id, content: [{ type: 'text', text: item.text }] }));
@@ -404,4 +404,60 @@ test('deleteSession removes both raw and wrapped session directories', async () 
     else process.env.DSH_HOME = oldHome;
     rmSync(home, { recursive: true, force: true });
   }
+});
+
+// ---------------------------------------------------------------------------
+// 🟠-17: resumeSession must never guess provider/model from agents[0]
+// ---------------------------------------------------------------------------
+
+function resumeCtx(liveAgents) {
+  const resumeCalls = [];
+  return {
+    resumeCalls,
+    agents: {
+      list: () => liveAgents,
+      get: (id) => liveAgents.find((a) => String(a.id) === String(id)),
+      resume: async (options) => {
+        resumeCalls.push(options);
+        return { agent: { id: String(options.resumeSessionId), options: options.agentOptions ?? {} }, dispose: async () => {} };
+      },
+    },
+    get: () => undefined,
+  };
+}
+
+test('resumeSession refuses to guess whose model to inherit among several live agents (🟠-17)', async () => {
+  const ctx = resumeCtx([
+    { id: 'a-chat', options: { provider: 'chat-a', model: 'model-a' } },
+    { id: 'b-chat', options: { provider: 'chat-b', model: 'model-b' } },
+  ]);
+  const res = await resumeSession(ctx, 'persisted-1');
+  assert.equal(res.ok, false);
+  assert.match(res.text, /live sessions are running/);
+  assert.deepEqual(ctx.resumeCalls, [], 'no resume may run on an ambiguous inheritance');
+});
+
+test('resumeSession inherits provider/model only from the explicitly named live agent (🟠-17)', async () => {
+  const ctx = resumeCtx([
+    { id: 'a-chat', options: { provider: 'chat-a', model: 'model-a' } },
+    { id: 'b-chat', options: { provider: 'chat-b', model: 'model-b' } },
+  ]);
+  const res = await resumeSession(ctx, 'persisted-1', 'b-chat');
+  assert.equal(res.ok, true, res.text);
+  assert.deepEqual(ctx.resumeCalls[0]?.agentOptions, { provider: 'chat-b', model: 'model-b' });
+});
+
+test('resumeSession keeps single-agent behavior: the only live agent is the inherit source', async () => {
+  const ctx = resumeCtx([{ id: 'only', options: { provider: 'solo', model: 'solo-model' } }]);
+  const res = await resumeSession(ctx, 'persisted-1');
+  assert.equal(res.ok, true, res.text);
+  assert.deepEqual(ctx.resumeCalls[0]?.agentOptions, { provider: 'solo', model: 'solo-model' });
+});
+
+test('resumeSession fails cleanly when the named inherit source is not live', async () => {
+  const ctx = resumeCtx([{ id: 'a-chat', options: { provider: 'chat-a', model: 'model-a' } }]);
+  const res = await resumeSession(ctx, 'persisted-1', 'gone-agent');
+  assert.equal(res.ok, false);
+  assert.match(res.text, /no live agent/);
+  assert.deepEqual(ctx.resumeCalls, []);
 });

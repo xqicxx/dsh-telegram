@@ -126,7 +126,10 @@ export async function switchAgentPresetMidSession(
   if (boundary === undefined) return fail("the current turn has not finished — wait for it to end, then switch again");
   const fork = forkSession(ctx, sourceSessionId, boundary);
   if (!fork.ok || fork.childId === undefined) return fail(fork.text);
-  const resumed = await resumeSession(ctx, fork.childId);
+  // Inherit the SOURCE session's provider/model explicitly: letting the
+  // resume fall back to "the only/first live agent" could pick another
+  // chat's model in multi-chat rosters (🟠-17).
+  const resumed = await resumeSession(ctx, fork.childId, sourceSessionId);
   if (!resumed.ok || resumed.agentId === undefined) {
     return fail(`forked to ${fork.childId}, but resuming it failed: ${resumed.text}`);
   }

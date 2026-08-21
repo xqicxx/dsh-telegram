@@ -65,7 +65,10 @@ async function bootGoalHarness() {
     writeFileSync(join(base, '.pi', 'telegram.json'), JSON.stringify({ security: { allowedChatIds: [7] } }));
     process.chdir(base);
     process.env.TELEGRAM_BOT_TOKEN = '123456:goal-command-test';
-    applyPlugin(ctx, {});
+    // Awaited: a boot that re-applies over an earlier mount now stops the old
+    // transport before rebuilding (🟠-11), so the router attaches when the
+    // returned promise settles.
+    await applyPlugin(ctx, {});
     return { ctx, liveAgents, sends, handlers, base };
   } catch (err) {
     process.chdir(oldCwd);
