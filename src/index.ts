@@ -15,7 +15,6 @@ import type {} from "@deepseek-ai/dsh-agent";
 import type { CommandInvocation, CommandResult } from "@deepseek-ai/dsh-commands";
 import type {} from "@deepseek-ai/dsh-session";
 import { existsSync } from "node:fs";
-import { homedir } from "node:os";
 import { basename, join, parse, resolve } from "node:path";
 import { isChatAllowed, readConfig, resolveToken, writeConfig, overlayConfig, getConfigPath, patchFromPath, type ConfigSection, type TelegramConfig } from "./config.js";
 import { Bridge } from "./harness/bridge.js";
@@ -23,13 +22,7 @@ import { compactCurrent } from "./harness/adapters/compact.js";
 import { modeSummary } from "./harness/adapters/mode.js";
 import { listPlugins, togglePlugin, entryIdFor } from "./harness/adapters/plugins.js";
 import {
-  displayTitleFor,
-  groupSessionsByProject,
   listSessionDetails,
-  orderProjectGroups,
-  type ProjectGroup,
-  type SessionDetail,
-  searchSessions,
   readHistory,
   readTrajectory,
   renameSession,
@@ -48,69 +41,39 @@ import {
 } from "./harness/adapters/sessions.js";
 import { listWorkspaces, createWorkspace, renameWorkspace, deleteWorkspace, insertWorkspaceBefore, insertSessionBefore, archiveSession } from "./harness/adapters/workspace.js";
 import { getGoal, createGoal, editGoal, pauseGoal, resumeGoal, clearGoal } from "./harness/adapters/goals.js";
-import { listFeedback, putFeedback, deleteFeedback } from "./harness/adapters/feedback.js";
+import { putFeedback, deleteFeedback } from "./harness/adapters/feedback.js";
 import { listSkills } from "./harness/adapters/skills.js";
 import { listSubagents, promptSubagent, interruptSubagent, subagentHistory } from "./harness/adapters/subagents.js";
 import { listAgentPresets, selectAgentPreset, setDefaultAgentPreset, readAgentPreset, copyAgentPreset, removeAgentPreset, openAgentPresetDocument, switchAgentPresetMidSession, sessionHasStarted } from "./harness/adapters/presets.js";
 import { describeSettings, updateSettings, replaceSettings, mutateSettings, parseJsonWithRevision } from "./harness/adapters/settings.js";
-import { describeCredential, describeCredentials, setCredential, unsetCredential, listCredentialRefs } from "./harness/adapters/credentials.js";
-import { modelCatalog, providerCatalog, discoverModels } from "./harness/adapters/llm.js";
-import { REASONING_DEFAULT, REASONING_EFFORTS, isReasoningEffort, reasoningLabel } from "./reasoning.js";
+import { describeCredential, describeCredentials, setCredential, unsetCredential } from "./harness/adapters/credentials.js";
+import { modelCatalog, discoverModels } from "./harness/adapters/llm.js";
+import { isReasoningEffort, reasoningLabel } from "./reasoning.js";
 import { reasoningExtension } from "./extensions/reasoning.js";
 import type { TelegramExtension, ExtensionHost } from "./extensions/types.js";
-import { describeHost, hostVersionOf, breadcrumbSegments, listDirectory, createDirectory, isDirectory, parentOf, openPath, pickDirectoryHint } from "./harness/adapters/host.js";
+import { describeHost, listDirectory, createDirectory, parentOf, openPath, pickDirectoryHint } from "./harness/adapters/host.js";
 import { listCommands, executeCommand } from "./harness/adapters/commands.js";
 import { listJobs } from "./harness/adapters/jobs.js";
 import { exportSessionLog } from "./harness/adapters/downloads.js";
 import { listDynamicCordis, defineDynamicCordis, runDynamicPlugin, stopDynamicPlugin, undefineDynamicPlugin } from "./harness/adapters/dynamicCordis.js";
-import { probeCapabilities, missingServices } from "./harness/adapters/capabilities.js";
+import { probeCapabilities } from "./harness/adapters/capabilities.js";
 import { attachInteractive, type Interactive, questionIdAt } from "./harness/adapters/interactive.js";
 import { ensureOpencodeGoResponsesRoute, normalizeOpencodeGoModel, opencodeGoModelUsesResponses } from "./harness/adapters/opencodeGo.js";
 import { renderStatsStrip, resetStatusStats, statusSnapshot } from "./harness/adapters/status.js";
-import { CompactionWatcher, contextUsageOf } from "./harness/adapters/compaction-watch.js";
+import { CompactionWatcher } from "./harness/adapters/compaction-watch.js";
 import { diffTodos, listTodos, pendingTodoCount, type TodoView } from "./harness/adapters/todos.js";
 import { GoalProgressFeed, type ProgressSnapshot } from "./telegram/goal-progress.js";
-import { renderTodosCard } from "./telegram/todos-card.js";
 import { Ephemeral } from "./telegram/ephemeral.js";
 import { plain, truncate } from "./telegram/html.js";
 import {
   buildBackKeyboard,
   buildBarKeyboard,
   buildCollapsedBarKeyboard,
-  buildConfirmKeyboard,
-  buildHistoryKeyboard,
   buildMenuPage,
-  buildPagingKeyboard,
-  buildProjectKeyboard,
   queueBarLabel,
-  todoBarLabel,
   type MenuItem,
-  buildSessionsKeyboard,
-  buildSearchKeyboard,
-  buildSessionDetailKeyboard,
-  buildSessionProjectsKeyboard,
-  buildWorkspaceKeyboard,
-  buildWorkspaceDetailKeyboard,
   buildQueueKeyboard,
   inputPromptKeyboard,
-  buildModelsKeyboard,
-  buildProvidersKeyboard,
-  buildNewSessionKeyboard,
-  buildModelDetailKeyboard,
-  buildThinkingKeyboard,
-  buildGoalsKeyboard,
-  buildSkillsKeyboard,
-  buildSubagentsKeyboard,
-  buildSubagentDetailKeyboard,
-  buildPresetsKeyboard,
-  buildPresetDetailKeyboard,
-  buildSettingsKeyboard,
-  buildCredentialsKeyboard,
-  buildHostKeyboard,
-  buildDynamicCordisKeyboard,
-  buildPluginLifecycleKeyboard,
-  type PluginRow,
-  buildCapabilitiesKeyboard,
   CALLBACK_RE,
   COLLAPSE_BTN,
   COMPACT_BTN,
@@ -143,6 +106,15 @@ import { findWorkspaceRoot } from "./workspace.js";
 import { makeAttachmentHandlers } from "./media/attachments.js";
 import { attachSessionEvents } from "./core/events.js";
 import { registerTelegramTools } from "./core/tools.js";
+import { createCardRegistry, withTimeout, widenCard } from "./core/cards.js";
+import { createModelCards } from "./cards/models.js";
+import { createSessionCards } from "./cards/sessions.js";
+import { createPresetCards } from "./cards/presets.js";
+import { createWorkspaceCards } from "./cards/workspaces.js";
+import { createHostCards } from "./cards/host.js";
+import { createGoalCards } from "./cards/goals.js";
+import { createQueueCards } from "./cards/queue.js";
+import { createMiscCards, STATUS_SUBAGENTS_TIMEOUT_MS } from "./cards/misc.js";
 
 export const name = "dsh-telegram";
 export const version = "0.4.0";
@@ -176,9 +148,6 @@ interface State {
 
 /** Latest durable todo snapshot per chat (todo/write is whole-list). */
 const todoSnapshots = new Map<number, TodoView[]>();
-/** Per-chat 5-second refresh loops for the live Todos card (issue #14). */
-const TODO_CARD_REFRESH_MS = 5000;
-const todoCardTimers = new Map<number, ReturnType<typeof setInterval>>();
 /** Goal progress feed; constructed once the transport exists (control ops). */
 let goalProgress: GoalProgressFeed | undefined;
 /** Context-pressure compaction watcher (issue #8). */
@@ -568,38 +537,9 @@ export { renderStatsStrip };
  * before the next in-place edit. */
 const statusSubagentCounts = new Map<string, number>();
 let statusSubagentSync: Promise<void> | undefined;
-/** One slow subagent listing must never latch `statusSubagentSync` forever:
- * every later panel refresh would otherwise await the same stuck promise. */
-const STATUS_SUBAGENTS_TIMEOUT_MS = 5000;
 
 /** Bound one in-process service promise so `refreshStatusSubagents` always
  * settles and clears the shared latch, even when a service hangs. */
-/** Card data-loading deadline (issue #20/#2): a hung service must fail the
- * card with a visible message instead of wedging the chat's UI lane forever. */
-const CARD_LOAD_TIMEOUT_MS = 10_000;
-
-async function cardLoad<T>(chatId: number, label: string, load: () => Promise<T>): Promise<T | undefined> {
-  try {
-    return await withTimeout(Promise.resolve().then(load), CARD_LOAD_TIMEOUT_MS, label);
-  } catch (err) {
-    log(`${label} load failed`, err instanceof Error ? `${err.message}\n${err.stack ?? ""}` : String(err));
-    await uiSend(chatId, `\u274C ${label} \u52A0\u8F7D\u5931\u8D25\uFF1A${plain(truncate(err instanceof Error ? err.message : String(err), 120))}`, { parse_mode: "HTML" });
-    return undefined;
-  }
-}
-
-function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  return Promise.race([
-    promise,
-    new Promise<T>((_resolve, reject) => {
-      timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
-    }),
-  ]).finally(() => {
-    if (timer !== undefined) clearTimeout(timer);
-  });
-}
-
 async function refreshStatusSubagents(): Promise<void> {
   const ctx = requireCtx();
   const agents = ctx.agents?.list() ?? [];
@@ -770,45 +710,22 @@ function bindCreatedSession(chatId: number, agentId: string | undefined): boolea
   return live !== undefined;
 }
 
-/** Cards that should re-read their data source when web-side settings/plugin
- * events fire (presets, workspaces, sessions). Keyed by chat. */
-const activeCardRenderers = new Map<number, () => Promise<void>>();
-
-async function openCard(chatId: number, text: string, keyboard: unknown, refresh?: () => Promise<void>): Promise<void> {
-  const t = requireTransport();
-  if (refresh === undefined) activeCardRenderers.delete(chatId);
-  else activeCardRenderers.set(chatId, refresh);
-  await ephemeral.replace(chatId, uiOps(t), text, {
-    parse_mode: "HTML",
-    reply_markup: keyboard,
-  });
-}
-
-function refreshActiveCards(): void {
-  for (const render of activeCardRenderers.values()) {
-    void render().catch((err) => log("active card refresh failed", err));
-  }
-}
-
-/** Replace the current card with a destructive-action confirmation. */
-async function askConfirm(chatId: number, text: string, confirmPayload: Record<string, string>, cancelPayload: Record<string, string>): Promise<void> {
-  await openCard(chatId, text, buildConfirmKeyboard({
-    confirm: token(confirmPayload),
-    cancel: token(cancelPayload),
-  }));
-}
+/** Card registry plumbing lives in core/cards.ts (yellow-1 step 2): openCard
+ * replace/refresh, the per-chat renderer map, cardLoad's deadline and the
+ * destructive-action confirmation. This is their single wiring point. */
+const { activeCardRenderers, openCard, refreshActiveCards, askConfirm, cardLoad } = createCardRegistry({
+  requireTransport,
+  uiOps,
+  ephemeral,
+  token,
+  log,
+  uiSend,
+});
 
 const menuPageIndex = new Map<number, number>();
 /** Which entry point opened the current card: bar-opened cards close on Back,
  * menu-opened cards return to the last menu page (issue #16). */
 const cardOrigins = new Map<number, "menu" | "bar">();
-
-/** Telegram sizes the bubble (and its inline keyboard) to the widest text
- * line. A trailing line of non-breaking spaces forces the card to span the
- * maximum bubble width so keyboard rows never leave a right-hand gap. */
-function widenCard(text: string): string {
-  return `${text}\n${"\u00A0".repeat(80)}`;
-}
 
 /** Paginated core menu. Page 0 = non-bar frequent actions; bar-mirrored
  * functions live on page 1; display-only/rare cards on pages 2-3. */
@@ -863,975 +780,106 @@ async function openMenuAt(chatId: number, page: number): Promise<void> {
 // Domain cards
 // ---------------------------------------------------------------------------
 
-async function openModelsCard(chatId: number): Promise<void> {
-  const ctx = requireCtx();
-  const agent = currentAgent(chatId);
-  const current = agent ? currentSessionModel(ctx, agent.id) : {};
-  const catalog = await cardLoad(chatId, "model catalog", () => modelCatalog(ctx, current));
-  if (catalog === undefined) return;
-  const lines = [
-    `\u{1F9E9} Models \u00B7 current: ${current.provider ? `${plain(current.provider)}/` : ""}${plain(current.model ?? "default")}${current.reasoningEffort ? ` (${plain(current.reasoningEffort)})` : ""} \u00B7 routable: ${catalog.routable ? "yes" : "no"}`,
-    "",
-  ];
-  for (const group of catalog.groups) {
-    lines.push(`\u2022 ${plain(group.name)} (${plain(group.id)})`);
-    for (const model of group.models.slice(0, 12)) lines.push(`  \u2212 ${plain(truncate(model.id, 40))}`);
-    if (group.models.length > 12) lines.push(`  \u2026 +${group.models.length - 12}`);
-  }
-  for (const failure of catalog.failures) lines.push(`\u26A0\uFE0F ${plain(failure.provider)}: ${plain(failure.message)}`);
-  lines.push("", "Tap a provider to switch the current session's model.");
-  log(`models card: groups=${catalog.groups.map((g) => g.id).join(",")} failures=${catalog.failures.length}`);
-  await openCard(chatId, lines.join("\n"), buildModelsKeyboard(catalog.groups, "m:providers", current.provider));
-}
+/** Models/providers/reasoning cards live in cards/models.ts (yellow-1 step 2). */
+const { openModelsCard, openProvidersCard, openProviderModelsCard, openModelThinkingCard, currentReasoningEffort } = createModelCards({
+  state,
+  requireCtx,
+  currentAgent,
+  cardLoad,
+  openCard,
+  token,
+  log,
+});
 
-/** Standalone Providers view (llm.providers): deployment facts per provider
- * \u2014 where it is configured (settingsNs/settingsPath), whether an adapter is
- * mounted (active), and whether settings declared it (declared). */
-async function openProvidersCard(chatId: number): Promise<void> {
-  const catalog = await cardLoad(chatId, "llm providers", () => providerCatalog(requireCtx()));
-  if (catalog === undefined) return;
-  const lines = [`\u{1F6F0}\uFE0F Providers (${catalog.providers.length})`, ""];
-  for (const provider of catalog.providers.slice(0, 20)) {
-    lines.push(`\u2022 ${plain(provider.id)} \u00B7 ${plain(provider.name)}`);
-    lines.push(`  settings: ${plain(provider.settingsNs ?? "\u2014")}${provider.settingsPath ? ` (${plain(truncate(provider.settingsPath, 40))})` : ""} \u00B7 active: ${provider.active === undefined ? "\u2014" : provider.active ? "yes" : "no"} \u00B7 declared: ${provider.declared === undefined ? "\u2014" : provider.declared ? "yes" : "no"}`);
-  }
-  if (catalog.providers.length === 0) lines.push("No providers registered in the llm registry.");
-  for (const failure of catalog.failures) lines.push(`\u26A0\uFE0F ${plain(failure.provider)}: ${plain(failure.message)}`);
-  await openCard(chatId, lines.join("\n"), buildProvidersKeyboard(
-    catalog.providers.slice(0, 20).map((provider) => ({
-      label: `\u{1F4E1} ${provider.name}`,
-      cb: token({ action: "provider", provider: provider.id }),
-    })),
-  ));
-}
+/** Plugins/skills/subagents/jobs/dynamic/capabilities/feedback and the small
+ * display cards (mode/allowed/watch/settings/about) live in cards/misc.ts
+ * (yellow-1 step 2). */
+const {
+  openPluginsCard, openSkillsCard, openSubagentsCard, isContinuableSubagent, openSubagentDetailCard,
+  openJobsCard, openDynamicCordisCard, openCapabilitiesCard, openFeedbackListCard,
+  openModeCard, openAllowedCard, openWatchCard, openSettingsCard, openAboutCard,
+} = createMiscCards({
+  state,
+  requireCtx,
+  currentAgent,
+  boundSessionCwd,
+  cardLoad,
+  openCard,
+  token,
+  log,
+  version,
+});
 
-const MODELS_PAGE_SIZE = 12;
+/** Sessions/projects/detail/history/search cards live in cards/sessions.ts
+ * (yellow-1 step 2); lastProjectKey feeds the dispatchers' back-navigation. */
+const { lastProjectKey, openSessionsCard, openSessionProjectsCard, openSessionDetailCard, openHistoryCard, openSearchCard } = createSessionCards({
+  state,
+  requireCtx,
+  cardLoad,
+  openCard,
+  uiSend,
+  token,
+});
 
-async function openProviderModelsCard(chatId: number, providerId: string, page = 0): Promise<void> {
-  const ctx = requireCtx();
-  const agent = currentAgent(chatId);
-  const current = agent ? currentSessionModel(ctx, agent.id) : {};
-  const catalog = await cardLoad(chatId, "model catalog", () => modelCatalog(ctx, current));
-  if (catalog === undefined) return;
-  const group = catalog.groups.find((candidate) => candidate.id === providerId);
-  log(`provider card requested=${providerId} groups=${catalog.groups.map((g) => g.id).join(",")} found=${group !== undefined}`);
-  if (!group) return openModelsCard(chatId);
-  const totalPages = Math.max(1, Math.ceil(group.models.length / MODELS_PAGE_SIZE));
-  const safe = Math.max(0, Math.min(page, totalPages - 1));
-  const pageModels = group.models.slice(safe * MODELS_PAGE_SIZE, (safe + 1) * MODELS_PAGE_SIZE);
-  const lines = [
-    `\u{1F4E1} ${plain(group.name)} \u00B7 page ${safe + 1}/${totalPages}`,
-    "",
-    `current: ${current.provider === providerId ? plain(current.model ?? "default") : "other provider"}`,
-    "",
-  ];
-  const models = pageModels.map((model) => ({
-    id: model.id,
-    name: model.name,
-    cb: token({ action: "model-select", provider: providerId, model: model.id }),
-  }));
-  for (const model of models) {
-    lines.push(`${current.provider === providerId && current.model === model.id ? "\u2705" : "\u25CB"} ${plain(truncate(model.id, 40))}`);
-    if (model.name !== model.id) lines.push(`   ${plain(truncate(model.name, 40))}`);
-  }
-  const selectedModel = current.provider === providerId && current.model !== undefined ? current.model : undefined;
-  await openCard(chatId, lines.join("\n"), buildModelDetailKeyboard(
-    models,
-    selectedModel === undefined
-      ? undefined
-      : {
-          label: reasoningLabel(isReasoningEffort(current.reasoningEffort) ? current.reasoningEffort : currentReasoningEffort()),
-          cb: token({ action: "model-thinking", provider: providerId, model: selectedModel }),
-        },
-    {
-      ...(safe > 0 ? { previous: token({ action: "model-page", provider: providerId, page: String(safe - 1) }) } : {}),
-      ...(safe + 1 < totalPages ? { next: token({ action: "model-page", provider: providerId, page: String(safe + 1) }) } : {}),
-    },
-  ));
-}
+/** Queue card lives in cards/queue.ts (yellow-1 step 2). */
+const { openQueueCard } = createQueueCards({
+  state,
+  requireCtx,
+  currentAgent,
+  boundAgentId,
+  progressFor,
+  openCard,
+});
 
-/** Current reasoning effort from the live config (default medium). */
-function currentReasoningEffort(): "minimal" | "low" | "medium" | "high" | "max" {
-  const effort = state.config.reasoning?.effort;
-  return effort !== undefined && isReasoningEffort(effort) ? effort : REASONING_DEFAULT;
-}
+/** Workspaces / project picker / workspace-create picker cards live in
+ * cards/workspaces.ts (yellow-1 step 2); applyProjectPath is shared with the
+ * /project and /workspacecreate commands. */
+const { openWorkspacesCard, openWorkspaceDetailCard, openProjectCard, applyProjectPath, openWorkspaceCreatePicker } = createWorkspaceCards({
+  state,
+  requireCtx,
+  uiSend,
+  openCard,
+  token,
+  log,
+  openMenuAt,
+});
 
-/** Per-session reasoning picker for the selected model (web selectModel). */
-async function openModelThinkingCard(chatId: number, providerId: string, modelId: string): Promise<void> {
-  const agent = currentAgent(chatId);
-  const current = agent ? currentSessionModel(requireCtx(), agent.id) : {};
-  const active = isReasoningEffort(current.reasoningEffort) ? current.reasoningEffort : currentReasoningEffort();
-  const options = REASONING_EFFORTS.map((effort) => ({
-    id: effort,
-    name: reasoningLabel(effort),
-    cb: token({ action: "model-effort", provider: providerId, model: modelId, effort }),
-  }));
-  await openCard(chatId, `\u{1F9E0} Thinking effort \u00B7 ${plain(providerId)}/${plain(modelId)}`, buildThinkingKeyboard(options, active));
-}
+/** Todos auto-refresh loop + Todos/Goals cards live in cards/goals.ts
+ * (yellow-1 step 2); the timer map is shared with teardown/ejectChat and
+ * stopTodoCardRefresh with openStatusPanel. */
+const { todoCardTimers, stopTodoCardRefresh, openTodosCard, openGoalsCard } = createGoalCards({
+  requireTransport,
+  requireCtx,
+  currentAgent,
+  ephemeral,
+  uiOps,
+  activeCardRenderers,
+  openCard,
+  token,
+  log,
+  uiSend,
+});
 
-/** Reasoning-effort picker card: the fixed codex-telegram-bot levels. */
-const PLUGINS_PAGE_SIZE = 20;
 
-async function openPluginsCard(chatId: number, page = 0): Promise<void> {
-  const ctx = requireCtx();
-  const plugins = listPlugins(ctx);
-  const totalPages = Math.max(1, Math.ceil(plugins.length / PLUGINS_PAGE_SIZE));
-  const safe = Math.max(0, Math.min(page, totalPages - 1));
-  const pageItems = plugins.slice(safe * PLUGINS_PAGE_SIZE, (safe + 1) * PLUGINS_PAGE_SIZE);
-  const lines = [`\u{1F50C} Plugins (${plugins.length}) \u00B7 page ${safe + 1}/${totalPages}`, ""];
-  for (const plugin of pageItems) {
-    lines.push(`${plugin.enabled ? "\u2705" : "\u26AA"} ${plain(truncate(plugin.moduleName ?? plugin.entryId, 36))} \u00B7 ${plain(plugin.fiberPhase ?? "\u2014")}`);
-  }
-  const dynamic = listDynamicCordis(ctx);
-  if (dynamic.length > 0) {
-    lines.push("", `Dynamic plugin packages: ${dynamic.length}`);
-    for (const row of dynamic.slice(0, 10)) lines.push(`\u2022 ${plain(String(row.pluginId))}`);
-  }
-  lines.push("", "Toggle: /pluginenable &lt;name&gt; \u00B7 /plugindisable &lt;name&gt;");
-  await openCard(chatId, lines.join("\n"), buildPagingKeyboard({
-    ...(safe > 0 ? { previous: token({ action: "plugins-page", page: String(safe - 1) }) } : {}),
-    ...(safe + 1 < totalPages ? { next: token({ action: "plugins-page", page: String(safe + 1) }) } : {}),
-    back: "m:back",
-  }));
-}
+/** New-session / presets / preset-detail cards live in cards/presets.ts
+ * (yellow-1 step 2). */
+const { openNewSessionCard, openPresetsCard, openPresetDetailCard } = createPresetCards({
+  requireCtx,
+  currentAgent,
+  cardLoad,
+  openCard,
+  token,
+});
 
-const SESSIONS_PAGE_SIZE = 10;
-const SESSION_PROJECTS_PAGE_SIZE = 12;
-/** Synthetic project key for the legacy flat "all sessions" view. */
-const ALL_PROJECTS_KEY = "__all__";
+/** Host settings/credentials/host/host-directory cards live in cards/host.ts
+ * (yellow-1 step 2). */
+const { openHostSettingsCard, openSettingsNamespaceCard, openCredentialsCard, openHostCard, openHostDirectoryCard } = createHostCards({
+  state,
+  requireCtx,
+  openCard,
+  token,
+});
 
-/** Load the Sessions roster once and project it into web-style ordered project groups. */
-async function sessionProjectSnapshot(chatId: number): Promise<{ details: SessionDetail[]; groups: ProjectGroup[]; bound?: string }> {
-  const ctx = requireCtx();
-  const details = await cardLoad(chatId, "sessions roster", () => listSessionDetails(ctx));
-  const workspaces = details === undefined ? [] : listWorkspaces(ctx).items;
-  if (details === undefined) return { details: [], groups: [], bound: undefined };
-  const groups = groupSessionsByProject(details, workspaces);
-  const bound = state.bridge?.agentIdForChat(chatId) ?? state.bridge?.currentAgentIdValue();
-  return { details, groups: orderProjectGroups(groups, bound), bound };
-}
-
-/** Project key the user last viewed on this chat's Sessions card. */
-function lastProjectKey(chatId: number): string | undefined {
-  return state.lastSessionsProject.get(chatId);
-}
-
-async function openSessionsCard(chatId: number, projectKey?: string, page = 0): Promise<void> {
-  const { details, groups, bound } = await sessionProjectSnapshot(chatId);
-  const requestedKey = projectKey ?? groups[0]?.key ?? ALL_PROJECTS_KEY;
-  const group = requestedKey === ALL_PROJECTS_KEY ? undefined : groups.find((candidate) => candidate.key === requestedKey) ?? groups[0];
-  const key = group?.key ?? ALL_PROJECTS_KEY;
-  const sessions = (group?.sessions ?? details).filter((session) => !session.archived);
-  const archivedCount = (group?.sessions ?? details).length - sessions.length;
-  const totalPages = Math.max(1, Math.ceil(sessions.length / SESSIONS_PAGE_SIZE));
-  const safe = Math.max(0, Math.min(page, totalPages - 1));
-  const pageItems = sessions.slice(safe * SESSIONS_PAGE_SIZE, (safe + 1) * SESSIONS_PAGE_SIZE);
-  const runningCount = sessions.filter((session) => session.running).length;
-  const label = group?.label ?? "\u5168\u90E8\u4F1A\u8BDD";
-  state.lastSessionsProject.set(chatId, key);
-  const lines = [
-    `\u{1F9ED} Sessions \u00B7 ${plain(truncate(label, 26))} \u00B7 \u25B6${runningCount}/${sessions.length}${archivedCount > 0 ? ` \u00B7 \u{1F5C4}${archivedCount}` : ""} \u00B7 page ${safe + 1}/${totalPages}`,
-    "",
-  ];
-  if (sessions.length === 0) lines.push("(\u8BE5\u9879\u76EE\u6682\u65E0\u4F1A\u8BDD)", "");
-  for (const session of pageItems) {
-    const flags = [session.live ? "live" : "cold", session.running ? "running" : "idle"];
-    const title = displayTitleFor(session.title, session.cwd, session.id);
-    const hasTitle = session.title !== undefined && session.title.trim() !== "";
-    lines.push(
-      `${session.id === bound ? "\u25B8" : "\u2022"} ${session.running ? "\u25B6 " : ""}${plain(truncate(title, 32))} \u00B7 ${flags.join("/")}${hasTitle ? ` \u00B7 ${plain(truncate(session.id, 14))}` : ""}`,
-    );
-    if (session.lastPromptAt !== undefined) lines.push(`   last prompt: ${plain(new Date(session.lastPromptAt).toLocaleString())}`);
-  }
-  lines.push("", "\u4F1A\u8BDD\u6309\u94AE\u6253\u5F00\u8BE6\u60C5 \u00B7 \u5F52\u6863 / \u5220\u9664 \u76F4\u63A5\u64CD\u4F5C\u3002");
-  await openCard(chatId, lines.join("\n"), buildSessionsKeyboard(pageItems.map((session) => ({
-    id: session.id,
-    title: displayTitleFor(session.title, session.cwd, session.id),
-    running: session.running,
-    archiveCb: token({ action: "session-archive", sessionId: session.id }),
-    deleteCb: token({ action: "session-delete", sessionId: session.id }),
-  })), {
-    projectCount: groups.length,
-    projectsCb: token({ action: "sessions-projects" }),
-    paging: {
-      ...(safe > 0 ? { previous: token({ action: "sessions-page", projectKey: key, page: String(safe - 1) }) } : {}),
-      ...(safe + 1 < totalPages ? { next: token({ action: "sessions-page", projectKey: key, page: String(safe + 1) }) } : {}),
-    },
-  }), () => openSessionsCard(chatId, key, safe));
-}
-
-/** Project switcher page: running projects first, then current, then recency. */
-async function openSessionProjectsCard(chatId: number, page = 0): Promise<void> {
-  const { groups, bound } = await sessionProjectSnapshot(chatId);
-  const totalPages = Math.max(1, Math.ceil(groups.length / SESSION_PROJECTS_PAGE_SIZE));
-  const safe = Math.max(0, Math.min(page, totalPages - 1));
-  const pageGroups = groups.slice(safe * SESSION_PROJECTS_PAGE_SIZE, (safe + 1) * SESSION_PROJECTS_PAGE_SIZE);
-  const lines = [`\u{1F504} \u9879\u76EE (${groups.length}) \u00B7 page ${safe + 1}/${totalPages}`, ""];
-  for (const group of pageGroups) {
-    const current = bound !== undefined && group.sessions.some((session) => session.id === bound);
-    lines.push(
-      `${current ? "\u25B8" : "\u2022"} ${plain(truncate(group.label, 30))} \u00B7 \u25B6${group.runningCount} \u00B7 \u5171${group.sessions.length}`,
-    );
-  }
-  lines.push("", "Tap a project to switch its Sessions page.");
-  await openCard(chatId, lines.join("\n"), buildSessionProjectsKeyboard(pageGroups.map((group) => ({
-    label: group.label,
-    running: group.runningCount,
-    total: group.sessions.length,
-    cb: token({ action: "sessions-project", projectKey: group.key }),
-  })), {
-    all: token({ action: "sessions-project", projectKey: ALL_PROJECTS_KEY }),
-    paging: {
-      ...(safe > 0 ? { previous: token({ action: "sessions-projects-page", page: String(safe - 1) }) } : {}),
-      ...(safe + 1 < totalPages ? { next: token({ action: "sessions-projects-page", page: String(safe + 1) }) } : {}),
-    },
-    back: token({ action: "sessions-open" }),
-  }), () => openSessionProjectsCard(chatId, safe));
-}
-
-async function openSessionDetailCard(chatId: number, sessionId: string): Promise<void> {
-  const ctx = requireCtx();
-  const details = await cardLoad(chatId, "session details", () => listSessionDetails(ctx));
-  if (details === undefined) return;
-  const session = details.find((candidate) => candidate.id === sessionId);
-  if (!session) {
-    await uiSend(chatId, `\u274C Session ${plain(truncate(sessionId, 32))} not found.`, { parse_mode: "HTML" });
-    return openSessionsCard(chatId, lastProjectKey(chatId));
-  }
-  const title = displayTitleFor(session.title, session.cwd, session.id);
-  const hasTitle = session.title !== undefined && session.title.trim() !== "";
-  const lines = [
-    `\u{1F9ED} ${plain(truncate(title, 40))}${hasTitle ? ` \u00B7 ${plain(truncate(session.id, 16))}` : ""}`,
-    "",
-    `live: ${session.live} \u00B7 running: ${session.running} \u00B7 blank: ${session.blank} \u00B7 archived: ${session.archived}`,
-    `events: ${session.eventCount}${session.cwd ? ` \u00B7 cwd: ${plain(truncate(session.cwd, 28))}` : ""}`,
-    hasTitle ? `id: ${plain(session.id)}` : "",
-    session.lastPromptAt !== undefined ? `last prompt: ${plain(new Date(session.lastPromptAt).toLocaleString())}` : "",
-  ].filter((line) => line !== "");
-  await openCard(chatId, lines.join("\n"), buildSessionDetailKeyboard(session.id, session.archived, token({ action: "sessions-open" })));
-}
-
-async function openHistoryCard(chatId: number, sessionId: string, beforeSeq?: number): Promise<void> {
-  // Turn-grouped trajectory view (issue #32), matching the web's 轨迹 ledger:
-  // per-turn model/outcome/duration header plus user/thinking/tool/answer steps.
-  const result = await cardLoad(chatId, "session history", () => readTrajectory(requireCtx(), sessionId, 6, beforeSeq));
-  if (result === undefined) return;
-  await openCard(chatId, renderTrajectoryLines(sessionId, result).join("\n"), buildHistoryKeyboard(
-    sessionId,
-    result.hasMore && result.nextBefore !== undefined
-      ? token({ action: "history-older", sessionId, beforeSeq: String(result.nextBefore) })
-      : undefined,
-  ));
-}
-
-const SEARCH_PAGE_SIZE = 10;
-
-async function openSearchCard(chatId: number, query: string, page = 0): Promise<void> {
-  const hits = await cardLoad(chatId, "search results", () => searchSessions(requireCtx(), query, 100));
-  if (hits === undefined) return;
-  const totalPages = Math.max(1, Math.ceil(hits.length / SEARCH_PAGE_SIZE));
-  const safe = Math.max(0, Math.min(page, totalPages - 1));
-  const pageHits = hits.slice(safe * SEARCH_PAGE_SIZE, (safe + 1) * SEARCH_PAGE_SIZE);
-  const lines = [`\u{1F50D} Search "${plain(truncate(query, 40))}" \u2014 ${hits.length} hit(s) \u00B7 page ${safe + 1}/${totalPages}`, ""];
-  for (const hit of pageHits) {
-    lines.push(`\u2022 ${plain(truncate(hit.sessionId, 24))} [${hit.seq}] ${hit.type}${hit.live ? "" : " (cold)"}`);
-    lines.push(`  ${plain(truncate(hit.snippet, 80))}`);
-  }
-  if (hits.length === 0) lines.push("(no hits)");
-  await openCard(chatId, lines.join("\n"), buildSearchKeyboard(pageHits.map((hit) => hit.sessionId), {
-    ...(safe > 0 ? { previous: token({ action: "search-page", query, page: String(safe - 1) }) } : {}),
-    ...(safe + 1 < totalPages ? { next: token({ action: "search-page", query, page: String(safe + 1) }) } : {}),
-  }));
-}
-
-async function openQueueCard(chatId: number): Promise<void> {
-  const ctx = requireCtx();
-  const agent = currentAgent(chatId);
-  const snapshot = statusSnapshot(ctx, boundAgentId(chatId), false);
-  const items = agent ? listQueue(ctx, agent.id) : [];
-  const progress = progressFor(chatId);
-  const lines = [`\u231B Queue`, "", `Agent inbox: ${snapshot.queue} \u00B7 Outbound sends pending: ${state.transport?.pending() ?? 0}`];
-  if (progress !== undefined) {
-    const seconds = Math.max(1, Math.round(progress.elapsedMs / 1000));
-    const eta = progress.todosDone > 0 && progress.todosTotal > progress.todosDone
-      ? ` \u00B7 ETA ~${Math.max(1, Math.round((progress.elapsedMs / progress.todosDone) * (progress.todosTotal - progress.todosDone) / 1000))}s`
-      : "";
-    lines.push(`\u{1F3AF} ${plain(truncate(progress.objective, 40))} \u00B7 step ${progress.step} \u00B7 tools ${progress.tools}${progress.currentTool ? ` \u00B7 now: ${plain(truncate(progress.currentTool, 24))}` : ""} \u00B7 \u23F1\uFE0F ${seconds}s${eta}`);
-  }
-  lines.push("");
-  items.slice(0, 12).forEach((item, index) => {
-    const kind = item.target === "next-turn" ? "turn" : "step";
-    const preview = item.text.trim().replace(/\s+/g, " ") || "(no text)";
-    lines.push(`#${index + 1} \u00B7 ${kind} \u00B7 ${plain(truncate(preview, 60))}`);
-  });
-  if (items.length === 0) {
-    lines.push("(nothing pending)", "", "\u{1F4A1} \u8FDE\u7EED\u53D1\u4E24\u6761\u6D88\u606F\uFF0C\u7B2C\u4E8C\u6761\u4F1A\u6392\u961F\uFF0C\u6BCF\u6761\u90FD\u6709 \u270F/\u{1F5D1}/\u26A1 \u6309\u94AE\u3002");
-  } else {
-    lines.push("", "\u270F \u7F16\u8F91 \u00B7 \u{1F5D1} \u5220\u9664 \u00B7 \u26A1 \u7ACB\u5373\u6267\u884C(\u4EC5 next-turn) \u2014 \u6309\u4E0B\u65B9\u6309\u94AE\u64CD\u4F5C");
-  }
-  await openCard(
-    chatId,
-    lines.join("\n"),
-    buildQueueKeyboard(items.map((item, index) => ({ itemId: item.itemId, kind: item.target, index }))),
-  );
-}
-
-async function openWorkspacesCard(chatId: number): Promise<void> {
-  log(`workspaces card open requested chatId=${chatId}`);
-  try {
-    const listed = listWorkspaces(requireCtx());
-    const items = listed.items;
-    const archivedSessionIds = listed.archivedSessionIds;
-    log(`workspaces listed items=${items.length} archived=${archivedSessionIds.length}`);
-    const lines = [`\u{1F5C2} Workspaces (${items.length})`, ""];
-    for (const workspace of items.slice(0, 15)) {
-      const title = typeof workspace.title === "string" && workspace.title !== "" ? workspace.title : basename(workspace.path || "workspace");
-      lines.push(`\u2022 ${plain(truncate(title, 28))} \u00B7 ${plain(truncate(workspace.path, 24))}`);
-      lines.push(`  sessions: ${workspace.sessionIds.length} \u00B7 id: ${plain(truncate(workspace.workspaceId, 20))}`);
-    }
-    if (items.length === 0) {
-      lines.push(`\u2022 Current project: ${plain(truncate(state.workspaceRoot, 48))}`);
-      lines.push("No registered workspaces yet \u2014 /workspacecreate &lt;path&gt; [title], or use Project to register this one.");
-    }
-    if (archivedSessionIds.length > 0) lines.push("", `Archived sessions: ${archivedSessionIds.length}`);
-    log(`workspaces card rendering lines=${lines.length}`);
-    await openCard(
-      chatId,
-      lines.join("\n"),
-      buildWorkspaceKeyboard(items.map((workspace) => ({ id: workspace.workspaceId, title: typeof workspace.title === "string" ? workspace.title : basename(workspace.path || "workspace") }))),
-      () => openWorkspacesCard(chatId),
-    );
-  } catch (err) {
-    const message = err instanceof Error ? err.message : String(err);
-    log(`workspaces card ERROR chatId=${chatId}: ${message}`);
-    await openCard(
-      chatId,
-      `\u{1F5C2} Workspaces\n\n\u26A0\uFE0F ${plain(truncate(message, 120))}`,
-      buildWorkspaceKeyboard([]),
-      () => openWorkspacesCard(chatId),
-    );
-  }
-}
-
-async function openWorkspaceDetailCard(chatId: number, workspaceId: string): Promise<void> {
-  const { items } = listWorkspaces(requireCtx());
-  const workspace = items.find((candidate) => candidate.workspaceId === workspaceId);
-  if (!workspace) return openWorkspacesCard(chatId);
-  const lines = [
-    `\u{1F5C2} ${plain(truncate(workspace.title, 40))}`,
-    "",
-    `path: ${plain(truncate(workspace.path, 60))}`,
-    `id: ${plain(truncate(workspace.workspaceId, 32))}`,
-    `sessions (${workspace.sessionIds.length}): ${workspace.sessionIds.slice(0, 6).map((id) => plain(truncate(id, 16))).join(", ")}${workspace.sessionIds.length > 6 ? "\u2026" : ""}`,
-    workspace.createdAt !== undefined ? `created: ${plain(new Date(workspace.createdAt).toLocaleString())}` : "",
-    workspace.updatedAt !== undefined ? `updated: ${plain(new Date(workspace.updatedAt).toLocaleString())}` : "",
-  ].filter((line) => line !== "");
-  await openCard(chatId, lines.join("\n"), buildWorkspaceDetailKeyboard(workspaceId, {
-    use: token({ action: "workspace-use", workspaceId }),
-    sessions: token({ action: "sessions-project", projectKey: workspaceId }),
-  }));
-}
-
-/** Codex-style project picker: browse folders inline, then use one as the
- * active project for all new sessions. */
-const PROJECT_PAGE_SIZE = 24;
-
-async function openProjectCard(chatId: number, target?: string, offset = 0): Promise<void> {
-  const path = target ?? state.workspaceRoot;
-
-  const workspacePaths = listWorkspaces(requireCtx()).items.map((workspace) => workspace.path);
-  const quick = [...new Set(workspacePaths.filter((candidate) => candidate !== path))].slice(0, 3).map((candidate) => ({
-    label: `\u{1F5C2} ${basename(candidate)}`,
-    cb: token({ action: "project-open", path: candidate }),
-  }));
-
-  const baseActions = {
-      up: path === "/" ? undefined : token({ action: "project-up", path }),
-      home: path === homedir() ? undefined : token({ action: "project-open", path: homedir() }),
-      root: path === "/" ? undefined : token({ action: "project-open", path: "/" }),
-      menu: "m:back",
-      close: "m:close",
-      quick,
-  };
-
-  if (!(await isDirectory(path))) {
-    const lines = [`\u{1F4C1} ${plain(truncate(path, 60))}`, "", "\u274C Not a directory (or not readable).", "", "Go up a level, or pick a quick root below."];
-    await openCard(chatId, lines.join("\n"), buildProjectKeyboard([], baseActions));
-    return;
-  }
-
-  const listing = await listDirectory(path);
-  if (!listing.ok) {
-    const lines = [`\u{1F4C1} ${plain(truncate(path, 60))}`, "", `\u274C ${plain(listing.text)}`, "", "The folder itself is valid \u2014 use it as the project, or go up."];
-    await openCard(chatId, lines.join("\n"), buildProjectKeyboard([], { ...baseActions, use: token({ action: "project-select", path }) }));
-    return;
-  }
-
-  const entries = listing.entries ?? [];
-  const dirs = entries.filter((entry) => entry.kind === "directory");
-  const files = entries.length - dirs.length;
-  const active = path === state.workspaceRoot ? " \u00B7 \u2705 current project" : "";
-  const lines = [
-    `\u{1F4C1} ${plain(truncate(path, 60))}${active}`,
-    "",
-    `folders: ${dirs.length} \u00B7 files: ${files}`,
-    "",
-    "Pick a folder to open it, or use this one as the project.",
-  ];
-  const page = dirs.slice(offset, offset + PROJECT_PAGE_SIZE).map((entry) => ({ label: entry.name, cb: token({ action: "project-open", path: joinPath(path, entry.name) }) }));
-  const paging: { text: string; cb: string }[] = [];
-  if (offset > 0) paging.push({ text: "\u2B05\uFE0F Prev", cb: token({ action: "project-open", path, offset: String(Math.max(0, offset - PROJECT_PAGE_SIZE)) }) });
-  if (offset + PROJECT_PAGE_SIZE < dirs.length) paging.push({ text: "Next \u27A1\uFE0F", cb: token({ action: "project-open", path, offset: String(offset + PROJECT_PAGE_SIZE) }) });
-  await openCard(
-    chatId,
-    lines.join("\n"),
-    buildProjectKeyboard(page, {
-      ...baseActions,
-      paging,
-      use: token({ action: "project-select", path }),
-    }),
-  );
-}
-
-function joinPath(parent: string, name: string): string {
-  return parent.endsWith("/") ? `${parent}${name}` : `${parent}/${name}`;
-}
-
-/** Validate, switch, persist, and register the picked project folder. */
-async function applyProjectPath(chatId: number, raw: string): Promise<void> {
-  const tilde = raw.startsWith("~") ? raw.replace(/^~/, homedir()) : raw;
-  const target = tilde === "" ? state.workspaceRoot : resolve(tilde.startsWith("/") ? tilde : joinPath(state.workspaceRoot, tilde));
-  const path = target;
-  if (!(await isDirectory(path))) {
-    await uiSend(chatId, `\u274C Not a directory: ${plain(truncate(path, 60))}`, { parse_mode: "HTML" });
-    return openProjectCard(chatId, path);
-  }
-  state.workspaceRoot = path;
-  state.config.workspace.activePath = path;
-  writeConfig(state.configRoot, state.config);
-  const registry = requireCtx().get("workspaceRegistry");
-  if (registry) {
-    const anyRegistry = registry as { list(): { path: string }[]; create(path: string, title?: string): Promise<unknown> };
-    const existing = anyRegistry.list().find((workspace) => workspace.path === path);
-    if (!existing) {
-      await anyRegistry.create(path, basename(path) || path).catch((err) => log("project register failed", err));
-    }
-  }
-  await uiSend(chatId, `\u{1F4C1} Project set: ${plain(path)}\n\u2728 New sessions will be created here.`, { parse_mode: "HTML" });
-  return openMenuAt(chatId, 0);
-}
-
-/** Workspace-create directory picker: instead of typing an abstract path,
- * browse to a folder and tap "Create here". Mirrors the Project browser. */
-const WORKSPACE_PICK_PAGE_SIZE = 12;
-
-async function openWorkspaceCreatePicker(chatId: number, path: string, offset = 0): Promise<void> {
-  const target = path || state.workspaceRoot;
-  if (!(await isDirectory(target))) {
-    await uiSend(chatId, `\u274C Not a directory: ${plain(truncate(target, 60))}`, { parse_mode: "HTML" });
-    return openWorkspaceCreatePicker(chatId, parentOf(target));
-  }
-  const listing = await listDirectory(target);
-  const dirs = (listing.ok ? listing.entries ?? [] : []).filter((entry) => entry.kind === "directory");
-  const safe = Math.max(0, Math.min(offset, Math.max(0, Math.ceil(dirs.length / WORKSPACE_PICK_PAGE_SIZE) - 1)));
-  const pageDirs = dirs.slice(safe * WORKSPACE_PICK_PAGE_SIZE, (safe + 1) * WORKSPACE_PICK_PAGE_SIZE);
-  const paging: { text: string; cb: string }[] = [];
-  if (safe > 0) paging.push({ text: "\u2B05\uFE0F Prev", cb: token({ action: "ws-pick-page", path: target, page: String(safe - 1) }) });
-  if ((safe + 1) * WORKSPACE_PICK_PAGE_SIZE < dirs.length) paging.push({ text: "Next \u27A1\uFE0F", cb: token({ action: "ws-pick-page", path: target, page: String(safe + 1) }) });
-  const lines = [`\u{1F5C2} Create workspace at:\n${plain(truncate(target, 60))}`, "", `folders: ${dirs.length}`, "", "Browse to a folder, then tap \u2705 Create here."];
-  await openCard(chatId, lines.join("\n"), buildProjectKeyboard(
-    pageDirs.map((entry) => ({ label: entry.name, cb: token({ action: "ws-pick-open", path: joinPath(target, entry.name) }) })),
-    {
-      up: target === "/" ? undefined : token({ action: "ws-pick-open", path: parentOf(target) }),
-      home: target === homedir() ? undefined : token({ action: "ws-pick-open", path: homedir() }),
-      root: target === "/" ? undefined : token({ action: "ws-pick-open", path: "/" }),
-      paging,
-      use: token({ action: "ws-create-here", path: target }),
-      close: "m:workspaces",
-    },
-  ));
-}
-
-/** Refresh the open Todos card in place through the UI control lane. */
-async function refreshTodosCard(chatId: number): Promise<void> {
-  const t = requireTransport();
-  const agent = currentAgent(chatId);
-  const todos = agent === undefined ? [] : listTodos(requireCtx(), agent.id);
-  await ephemeral.replace(chatId, uiOps(t), renderTodosCard(todos, agent !== undefined), {
-    parse_mode: "HTML",
-    reply_markup: buildBackKeyboard(),
-  });
-}
-
-/** Stop the per-chat Todos auto-refresh loop (reopen, card switch, teardown). */
-function stopTodoCardRefresh(chatId: number): void {
-  const timer = todoCardTimers.get(chatId);
-  if (timer === undefined) return;
-  clearInterval(timer);
-  todoCardTimers.delete(chatId);
-}
-
-/** Start the 5s auto-refresh. The loop checks that the SAME renderer is still
- * the active card; Back/Close/any other card replaces it and stops the loop
- * on the next tick, so a stale timer can never write over another card. */
-function startTodoCardRefresh(chatId: number, refresh: () => Promise<void>): void {
-  stopTodoCardRefresh(chatId);
-  const timer = setInterval(() => {
-    if (activeCardRenderers.get(chatId) !== refresh) {
-      stopTodoCardRefresh(chatId);
-      return;
-    }
-    void safeWrap(`todos-refresh(${chatId})`, () => refresh(), log);
-  }, TODO_CARD_REFRESH_MS);
-  todoCardTimers.set(chatId, timer);
-}
-
-async function openTodosCard(chatId: number): Promise<void> {
-  const t0 = Date.now();
-  log(`openTodosCard start chatId=${chatId}`);
-  stopTodoCardRefresh(chatId);
-  try {
-    const agent = currentAgent(chatId);
-    const todos = agent === undefined ? [] : listTodos(requireCtx(), agent.id);
-    log(`openTodosCard agent=${agent?.id ?? "none"} todos=${todos.length} took=${Date.now() - t0}ms`);
-    const refresh = () => refreshTodosCard(chatId);
-    await openCard(chatId, renderTodosCard(todos, agent !== undefined), buildBackKeyboard(), refresh);
-    // Start only after the card actually opened; `openCard` has already
-    // registered `refresh` as the active renderer for this chat.
-    startTodoCardRefresh(chatId, refresh);
-  } catch (err) {
-    log("openTodosCard FAILED", err instanceof Error ? `${err.message}\n${err.stack ?? ""}` : String(err));
-    await uiSend(chatId, `\u274C Todo list \u8F7D\u5165\u5931\u8D25\uff1A${plain(truncate(err instanceof Error ? err.message : String(err), 120))}`, { parse_mode: "HTML" });
-  }
-}
-
-async function openGoalsCard(chatId: number): Promise<void> {
-  const agent = currentAgent(chatId);
-  const lines = ["\u{1F3AF} Goal", ""];
-  let hasGoal = false;
-  let paused = false;
-  if (agent) {
-    const goal = getGoal(requireCtx(), agent.id);
-    if (goal) {
-      hasGoal = true;
-      paused = goal.phase === "paused";
-      lines.push(`phase: ${goal.phase} \u00B7 activation: ${goal.activation} \u00B7 rounds: ${goal.roundsStarted}${goal.maxGoalRounds !== undefined ? `/${goal.maxGoalRounds}` : ""}`);
-      lines.push(`objective: ${plain(truncate(goal.objective, 120))}`);
-      lines.push(`revision: ${goal.revision} \u00B7 created: ${plain(new Date(goal.createdAt).toLocaleString())}`);
-    } else {
-      lines.push("(no current goal)");
-    }
-  } else {
-    lines.push("No live agent \u2014 goals are per-agent.");
-  }
-  const goalPayload = agent ? { action: "goal", agentId: agent.id } : { action: "goal", agentId: "" };
-  const callbacks = {
-    ...(hasGoal ? {
-      edit: token({ ...goalPayload, op: "edit" }),
-      toggle: token({ ...goalPayload, op: paused ? "resume" : "pause" }),
-      clear: token({ ...goalPayload, op: "clear" }),
-    } : {}),
-  };
-  lines.push("", "Start: /goal &lt;objective&gt; [maxRounds]");
-  if (hasGoal) lines.push("Edit: /goaledit &lt;objective&gt; [maxRounds] \u00B7 Clear: /goalclear");
-  await openCard(chatId, lines.join("\n"), buildGoalsKeyboard(hasGoal, callbacks, paused));
-}
-
-async function openSkillsCard(chatId: number): Promise<void> {
-  const ctx = requireCtx();
-  const agent = currentAgent(chatId);
-  // Web skill.list is addressed by session + cwd + scope: pass the live
-  // session's project root (header cwd, else the workspace root) and ask for
-  // the user-invocable scope, then filter client-side for registries that
-  // ignore the scope option.
-  const cwd = boundSessionCwd(ctx, agent?.id) ?? state.workspaceRoot;
-  const skills = await cardLoad(chatId, "skills list", () => listSkills(ctx, { ...(agent?.id === undefined ? {} : { sessionId: agent.id }), cwd, scope: "user" }));
-  if (skills === undefined) return;
-  const userSkills = skills.filter((skill) => skill.userInvocable);
-  const lines = [`\u{1F9D1}\u200D\u{1F3EB} Skills (${userSkills.length} user-invocable)`, ""];
-  for (const skill of userSkills.slice(0, 30)) {
-    lines.push(`\u2022 ${plain(skill.name)} \u00B7 ${plain(skill.source)}`);
-    lines.push(`  ${plain(truncate(skill.description, 80))}`);
-    lines.push(`  model:${skill.modelInvocable ? "yes" : "no"} provider: ${plain(skill.provider)}`);
-  }
-  if (skills.length === 0) lines.push("No skills registered in this profile.");
-  else if (userSkills.length === 0) lines.push("No user-invocable skills for this session's project.");
-  else if (userSkills.length < skills.length) lines.push("", `Model-only skills hidden: ${skills.length - userSkills.length}`);
-  await openCard(chatId, lines.join("\n"), buildSkillsKeyboard());
-}
-
-async function openSubagentsCard(chatId: number): Promise<void> {
-  const agent = currentAgent(chatId);
-  if (!agent) {
-    await openCard(chatId, "No live agent \u2014 subagents hang off a parent session.", buildBackKeyboard());
-    return;
-  }
-  const entries = await cardLoad(chatId, "subagents list", () => listSubagents(requireCtx(), agent.id));
-  if (entries === undefined) return;
-  const lines = [`\u{1F916} Subagents of ${plain(truncate(agent.id, 24))} (${entries.length})`, ""];
-  for (const entry of entries.slice(0, 15)) {
-    const flags: string[] = [entry.kind, entry.activity];
-    if (entry.mode !== undefined) flags.push(entry.mode);
-    if (entry.hasChildren === true) flags.push("children");
-    flags.push(entry.parentAvailable === false ? "parent:unavailable" : "parent:available");
-    lines.push(`\u2022 ${plain(truncate(entry.id, 28))} \u00B7 ${flags.join("/")}${entry.label ? ` \u00B7 ${plain(truncate(entry.label, 20))}` : ""}`);
-    if (entry.kind === "diagnostic") lines.push(`  reason: ${plain(entry.reason ?? "unavailable")}`);
-  }
-  if (entries.length === 0) lines.push("(none)");
-  const rows = entries.slice(0, 12).map((entry) => ({ id: entry.id, cb: token({ action: "subagent", parentId: agent.id, childId: entry.id }) }));
-  await openCard(chatId, lines.join("\n"), buildSubagentsKeyboard(rows));
-}
-
-async function isContinuableSubagent(parentId: string, childId: string): Promise<boolean> {
-  try {
-    const entries = await withTimeout(listSubagents(requireCtx(), parentId), STATUS_SUBAGENTS_TIMEOUT_MS, "subagents.listChildren");
-    return entries.some((entry) => entry.id === childId && entry.kind === "child" && entry.mode === "continuable");
-  } catch {
-    return false;
-  }
-}
-
-async function openSubagentDetailCard(chatId: number, parentId: string, childId: string): Promise<void> {
-  const entries = await cardLoad(chatId, "subagents list", () => listSubagents(requireCtx(), parentId));
-  if (entries === undefined) return;
-  const entry = entries.find((candidate) => candidate.id === childId);
-  const lines = [
-    `\u{1F916} ${plain(truncate(childId, 32))}`,
-    "",
-    `parent: ${plain(truncate(parentId, 24))}`,
-    entry === undefined
-      ? "catalog entry: not listed"
-      : `kind: ${entry.kind} \u00B7 activity: ${entry.activity}${entry.mode ? ` \u00B7 mode: ${entry.mode}` : ""}${entry.hasChildren === true ? " \u00B7 has children" : ""}${entry.parentAvailable === false ? " \u00B7 parent unavailable" : ""}`,
-    entry?.label ? `label: ${plain(truncate(entry.label, 40))}` : "",
-    entry?.kind === "diagnostic" ? `reason: ${plain(entry.reason ?? "unavailable")}` : "",
-  ].filter((line) => line !== "");
-  const continuable = entry?.kind === "child" && entry.mode === "continuable";
-  const callbacks = {
-    ...(continuable
-      ? {
-          prompt: token({ action: "subagent-prompt", parentId, childId }),
-          interrupt: token({ action: "subagent-interrupt", parentId, childId }),
-        }
-      : {}),
-    history: token({ action: "subagent-history", parentId, childId }),
-  };
-  if (!continuable) lines.push("", "This subagent is not continuable \u2014 history is read-only.");
-  await openCard(chatId, lines.join("\n"), buildSubagentDetailKeyboard(callbacks));
-}
-
-/** New-session preset picker (web session.create's agentPreset): use the
- * roster's default preset with one tap, or pick a specific preset. Profiles
- * without presets fall straight through to creation. */
-async function openNewSessionCard(chatId: number): Promise<void> {
-  const presetsView = await cardLoad(chatId, "agent presets", () => listAgentPresets(requireCtx()));
-  if (presetsView === undefined) return;
-  const { presets } = presetsView;
-  const lines = [
-    "\u2728 New session",
-    "",
-    presets.length > 0
-      ? "Compose the session from a preset, or use the roster default:"
-      : "This profile composes no agent presets \u2014 the new session uses the profile default.",
-    "",
-    ...presets.slice(0, 12).map((preset) => `${preset.isDefault ? "\u2B50" : "\u2022"} ${plain(preset.id)}${preset.isDefault ? " (default)" : ""}`),
-  ];
-  await openCard(chatId, lines.join("\n"), buildNewSessionKeyboard(
-    token({ action: "new-default" }),
-    presets.slice(0, 12).map((preset) => ({ id: preset.id, isDefault: preset.isDefault, cb: token({ action: "preset-new", presetId: preset.id }) })),
-  ));
-}
-
-async function openPresetsCard(chatId: number): Promise<void> {
-  const presetsView = await cardLoad(chatId, "agent presets", () => listAgentPresets(requireCtx()));
-  if (presetsView === undefined) return;
-  const { presets, authorable, hasDocument } = presetsView;
-  const lines = [`\u{1F3AD} Agent presets (${presets.length}) \u00B7 authorable: ${authorable} \u00B7 document: ${hasDocument ? "yes" : "no"}`, ""];
-  for (const preset of presets.slice(0, 20)) {
-    lines.push(`${preset.isDefault ? "\u2B50" : "\u2022"} ${plain(preset.id)} \u00B7 ${preset.trust}${preset.broken ? " \u00B7 broken" : ""}`);
-    if (preset.description) lines.push(`  ${plain(truncate(preset.description, 60))}`);
-  }
-  if (presets.length === 0) lines.push("This profile composes no agent presets.");
-  const rows = presets.slice(0, 12).map((preset) => ({ id: preset.id, cb: token({ action: "preset", presetId: preset.id }) }));
-  await openCard(chatId, lines.join("\n"), buildPresetsKeyboard(rows), () => openPresetsCard(chatId));
-}
-
-async function openPresetDetailCard(chatId: number, presetId: string): Promise<void> {
-  const agent = currentAgent(chatId);
-  const lines = [
-    `\u{1F3AD} ${plain(truncate(presetId, 40))}`,
-    "",
-    "Blank session: applies in place. Started session: forks it, applies the preset to the fork, and closes the original.",
-  ];
-  const callbacks = {
-    select: token({ action: "preset-select", presetId, sessionId: agent?.id ?? "" }),
-    read: token({ action: "preset-read", presetId }),
-    create: token({ action: "preset-new", presetId }),
-    copy: token({ action: "preset-copy", presetId }),
-    remove: token({ action: "preset-remove", presetId }),
-    open: token({ action: "preset-open", presetId }),
-    default: token({ action: "preset-default", presetId }),
-  };
-  await openCard(chatId, lines.join("\n"), buildPresetDetailKeyboard(callbacks));
-}
-
-async function openHostSettingsCard(chatId: number): Promise<void> {
-  const { writable, hasDocument, documentPath, namespaces, internalNamespaces } = describeSettings(requireCtx());
-  const lines = [`\u2699\uFE0F Host settings \u00B7 writable: ${writable} \u00B7 document: ${hasDocument ? plain(truncate(documentPath ?? "yes", 48)) : "none"}`, ""];
-  for (const ns of namespaces.slice(0, 15)) {
-    const secrets = ns.secrets.filter((secret) => secret.set).length;
-    lines.push(`\u2022 ${plain(truncate(ns.ns, 36))} \u00B7 applies: ${ns.applies} \u00B7 rev ${ns.revision} \u00B7 secrets set: ${secrets}`);
-  }
-  if (namespaces.length === 0) lines.push("No settings namespaces registered.");
-  if (internalNamespaces.length > 0) {
-    lines.push("", `Outside the web boundary (not listed): ${internalNamespaces.slice(0, 8).map(plain).join(", ")}${internalNamespaces.length > 8 ? "\u2026" : ""}`);
-  }
-  lines.push("", "Describe: /settingsdescribe [ns] \u00B7 Update: /settingsupdate &lt;ns&gt; &lt;json patch&gt;");
-  await openCard(chatId, lines.join("\n"), buildSettingsKeyboard(namespaces.map((ns) => ns.ns)));
-}
-
-async function openSettingsNamespaceCard(chatId: number, ns: string): Promise<void> {
-  const { namespaces } = describeSettings(requireCtx());
-  const view = namespaces.find((candidate) => candidate.ns === ns);
-  if (!view) return openHostSettingsCard(chatId);
-  const lines = [
-    `\u2699\uFE0F ${plain(truncate(ns, 40))}`,
-    "",
-    `applies: ${view.applies} \u00B7 revision: ${view.revision}`,
-    view.schema !== undefined ? `schema: ${plain(truncate(JSON.stringify(view.schema), 300))}` : "schema: (not declared)",
-    `value: ${plain(truncate(JSON.stringify(view.value), 300))}`,
-    view.user !== undefined ? `user: ${plain(truncate(JSON.stringify(view.user), 200))}` : "",
-    `secrets: ${view.secrets.map((secret) => `${secret.path.join(".")}=${secret.set ? "set" : "unset"}`).join(", ") || "none"}`,
-  ].filter((line) => line !== "");
-  await openCard(chatId, lines.join("\n"), buildSettingsKeyboard([ns]));
-}
-
-async function openCredentialsCard(chatId: number): Promise<void> {
-  const refs = await listCredentialRefs(requireCtx());
-  const lines = [
-    "\u{1F511} Credentials",
-    "",
-    "Describe: /credential &lt;REF&gt; [REF...] (configured/source/writable, value never shown)",
-    "Set: /credentialset &lt;REF&gt; &lt;value&gt; \u00B7 Unset: /credentialunset &lt;REF&gt;",
-    "",
-    refs.length > 0 ? `Available refs (${refs.length}) \u2014 tap to describe:` : "This host exposes no ref roster (credentials are non-enumerable here).",
-    ...refs.slice(0, 12).map((ref) => `\u2022 ${plain(ref)}`),
-    refs.length > 12 ? `\u2026 +${refs.length - 12}` : "",
-    "",
-    "The secret value never rides back \u2014 same as the web form.",
-  ].filter((line) => line !== "");
-  await openCard(chatId, lines.join("\n"), buildCredentialsKeyboard(refs.slice(0, 12).map((ref) => ({ ref, cb: token({ action: "credential-show", ref }) }))));
-}
-
-async function openHostCard(chatId: number): Promise<void> {
-  // No hardcoded version: the host version comes from the hostInfo seam or
-  // DSH_VERSION; when the profile exposes neither, say so instead of showing
-  // a bridge-owned number (the bridge version lives in About).
-  const host = describeHost(requireCtx(), state.workspaceRoot);
-  const lines = [
-    "\u{1F5A5} Host",
-    "",
-    `version: ${host.version ? plain(host.version) : "unknown (not exposed to plugins)"} \u00B7 cwd: ${plain(truncate(host.cwd, 40))}`,
-    `model default: ${host.provider ? `${plain(host.provider)}/` : ""}${host.model ? plain(host.model) : "default"}`,
-    `attached sessions: ${host.attachedSessions} \u00B7 canOpenPath: ${host.canOpenPath}`,
-    "",
-    "Browse: pick a folder below \u00B7 Text: /ls [path] \u00B7 Mkdir: /mkdir &lt;path&gt;",
-  ];
-  await openCard(chatId, lines.join("\n"), buildHostKeyboard());
-}
-
-const HOST_BROWSE_PAGE_SIZE = 20;
-
-/** Telegram-native host.listDirectory: clickable breadcrumb browsing instead
- * of a raw `/ls` dump. Directories are buttons; files are only counted so a
- * large folder never overflows the callback keyboard. */
-async function openHostDirectoryCard(chatId: number, path: string, page = 0): Promise<void> {
-  const target = resolve(path);
-  const res = await listDirectory(target);
-  const dirs = (res.entries ?? []).filter((entry) => entry.kind === "directory");
-  const files = (res.entries ?? []).length - dirs.length;
-  const totalPages = Math.max(1, Math.ceil(dirs.length / HOST_BROWSE_PAGE_SIZE));
-  const safe = Math.max(0, Math.min(page, totalPages - 1));
-  const pageDirs = dirs.slice(safe * HOST_BROWSE_PAGE_SIZE, (safe + 1) * HOST_BROWSE_PAGE_SIZE);
-  const lines = [
-    res.ok ? `\u{1F4C2} ${plain(truncate(target, 80))}` : `\u274C ${plain(truncate(target, 80))}`,
-    "",
-    res.ok
-      ? `${dirs.length} dirs \u00B7 ${files} files \u00B7 page ${safe + 1}/${totalPages}`
-      : `Cannot list this path: ${plain(res.text)}`,
-    "",
-  ];
-  if (res.ok && pageDirs.length === 0) lines.push("(this directory contains files only)");
-  // Breadcrumb: every ancestor up to the current directory is one tap.
-  const crumbs = breadcrumbSegments(target);
-  if (res.ok && crumbs.length > 1) {
-    const shown = crumbs.length > 3 ? [{ label: "\u2026", path: crumbs[crumbs.length - 3]!.path }, ...crumbs.slice(-2)] : crumbs.slice(0, -1);
-    lines.splice(2, 0, shown.map((crumb) => plain(crumb.label)).join(" \u203A "));
-  }
-  await openCard(chatId, lines.join("\n"), buildProjectKeyboard(
-    pageDirs.map((entry) => ({ label: entry.name, cb: token({ action: "host-open", path: join(target, entry.name) }) })),
-    {
-      up: token({ action: "host-open", path: parentOf(target) }),
-      home: token({ action: "host-open", path: homedir() }),
-      root: token({ action: "host-open", path: parse(target).root }),
-      breadcrumb: (res.ok && crumbs.length > 1 ? (crumbs.length > 3 ? [{ label: "\u2026", path: crumbs[crumbs.length - 3]!.path }, ...crumbs.slice(-2)] : crumbs.slice(0, -1)) : []).map(
-        (crumb) => ({ label: crumb.label, cb: token({ action: "host-open", path: crumb.path }) }),
-      ),
-      paging: [
-        ...(safe > 0 ? [{ text: "\u2039 Prev", cb: token({ action: "host-page", path: target, page: String(safe - 1) }) }] : []),
-        ...(safe + 1 < totalPages ? [{ text: "More \u203A", cb: token({ action: "host-page", path: target, page: String(safe + 1) }) }] : []),
-      ],
-      newFolder: token({ action: "host-mkdir-prompt", path: target }),
-      close: "m:host",
-    },
-  ));
-}
-
-const JOBS_PAGE_SIZE = 20;
-
-async function openJobsCard(chatId: number, page = 0): Promise<void> {
-  const agent = currentAgent(chatId);
-  const jobs = listJobs(requireCtx(), agent?.id);
-  const totalPages = Math.max(1, Math.ceil(jobs.length / JOBS_PAGE_SIZE));
-  const safe = Math.max(0, Math.min(page, totalPages - 1));
-  const pageItems = jobs.slice(safe * JOBS_PAGE_SIZE, (safe + 1) * JOBS_PAGE_SIZE);
-  const lines = [`\u{1F527} Jobs (${jobs.length}) \u00B7 page ${safe + 1}/${totalPages}`, ""];
-  for (const job of pageItems) {
-    lines.push(`\u2022 ${plain(job.kind)} [${plain(job.id)}] \u00B7 ${job.status}${job.detail ? ` \u00B7 ${plain(truncate(job.detail, 30))}` : ""}`);
-    lines.push(`  ${plain(truncate(job.label, 60))} \u00B7 started ${plain(new Date(job.startedAt).toLocaleString())}`);
-  }
-  if (jobs.length === 0) lines.push("(none)");
-  await openCard(chatId, lines.join("\n"), buildPagingKeyboard({
-    ...(safe > 0 ? { previous: token({ action: "jobs-page", page: String(safe - 1) }) } : {}),
-    ...(safe + 1 < totalPages ? { next: token({ action: "jobs-page", page: String(safe + 1) }) } : {}),
-    back: "m:back",
-  }));
-}
-
-async function openDynamicCordisCard(chatId: number): Promise<void> {
-  const rows = listDynamicCordis(requireCtx());
-  const lines = [`\u{1F9F0} Dynamic plugins (${rows.length})`, ""];
-  const pluginRows: PluginRow[] = [];
-  for (const row of rows.slice(0, 15)) {
-    const pluginId = String(row.pluginId);
-    const running = row.activeRun !== undefined && row.activeRun !== null;
-    const current = row.currentPackageId === undefined || row.currentPackageId === null ? undefined : String(row.currentPackageId);
-    const versions = Array.isArray(row.packages) ? row.packages.length : 0;
-    lines.push(`\u2022 ${plain(pluginId)} \u00B7 ${versions} pkg${current === undefined ? "" : ` \u00B7 @ ${plain(truncate(current, 18))}`}${running ? " \u00B7 \u25B6 running" : ""}`);
-    pluginRows.push({
-      pluginId,
-      running,
-      callbacks: {
-        run: token({ action: "plugin-run", pluginId }),
-        stop: token({ action: "plugin-stop", pluginId }),
-        remove: token({ action: "plugin-remove", pluginId }),
-      },
-    });
-  }
-  if (rows.length === 0) {
-    lines.push("(none)", "", "Install your own plugin from the phone:", "tap \u2795 Add plugin, then reply with a JSON:", '{"name": "my-decoder", "purpose": "...", "host": "<js source>"}', "The host half can call your own model to decode.");
-  }
-  await openCard(chatId, lines.join("\n"), buildPluginLifecycleKeyboard(pluginRows));
-}
-
-async function openCapabilitiesCard(chatId: number): Promise<void> {
-  const caps = probeCapabilities(requireCtx());
-  const lines = ["\u{1F9E9} Host capabilities", ""];
-  for (const [key, available] of Object.entries(caps) as [string, boolean][]) {
-    lines.push(`${available ? "\u2705" : "\u274C"} ${plain(key)}`);
-  }
-  const missing = missingServices(requireCtx());
-  if (missing.length > 0) lines.push("", `Missing (cards degrade with hints): ${missing.map(plain).join(", ")}`);
-  await openCard(chatId, lines.join("\n"), buildCapabilitiesKeyboard());
-}
-
-async function openFeedbackListCard(chatId: number, sessionId: string): Promise<void> {
-  const items = await cardLoad(chatId, "feedback list", () => listFeedback(requireCtx(), sessionId));
-  if (items === undefined) return;
-  const lines = [`\u{1F4CB} Feedback \u00B7 ${plain(truncate(sessionId, 24))} (${items.length})`, ""];
-  const rows: { text: string; callback_data: string }[][] = [];
-  for (const item of items.slice(0, 20)) {
-    lines.push(`\u2022 ${item.rating === "positive" ? "\u{1F44D}" : "\u{1F44E}"} [${item.messageId.slice(0, 8)}]${item.note ? ` ${plain(truncate(item.note, 40))}` : ""}`);
-    rows.push([
-      {
-        text: `\u{1F5D1} Delete [${item.messageId.slice(0, 8)}]`,
-        callback_data: token({ action: "feedback-delete", sessionId, messageId: item.messageId, ifVersion: item.version }),
-      },
-    ]);
-  }
-  if (items.length === 0) lines.push("(no feedback yet \u2014 tap \u{1F44D}/\u{1F44E} under an assistant reply)");
-  rows.push([{ text: "\u2190 Back", callback_data: "m:back" }]);
-  await openCard(chatId, lines.join("\n"), { inline_keyboard: rows });
-}
-
-async function openModeCard(chatId: number): Promise<void> {
-  const mode = modeSummary();
-  const displayName = state.config.mode?.name;
-  const lines = [
-    `\u{1F3AD} Mode${displayName ? ` \u00B7 ${plain(displayName)}` : ""}`,
-    "",
-    plain(mode.note),
-    `Profiles: ${mode.profiles.length > 0 ? mode.profiles.map(plain).join(", ") : "none found"}`,
-  ];
-  lines.push("", "Switch profile by restarting dsh with `dsh --profile &lt;name&gt;`.");
-  await openCard(chatId, lines.join("\n"), buildBackKeyboard());
-}
-
-async function openAllowedCard(chatId: number): Promise<void> {
-  const allowed = state.config.security.allowedChatIds;
-  const lines = [`\u{1F510} Allowed chats (${allowed.length})`, ""];
-  for (const id of allowed) lines.push(`\u2022 ${plain(String(id))}`);
-  if (allowed.length === 0) lines.push("Nobody is allowed yet \u2014 inbound messages are ignored.");
-  await openCard(chatId, lines.join("\n"), {
-    inline_keyboard: [
-      [{ text: "\u2795 Allow this chat", callback_data: "m:allowthis" }],
-      [{ text: "\u2190 Back", callback_data: "m:back" }],
-    ],
-  });
-}
-
-async function openWatchCard(chatId: number): Promise<void> {
-  const lines = [`\u{1F4E1} Watch`, "", state.watching ? "Telegram polling is ON." : "Telegram polling is OFF.", `autoStart: ${state.config.watch.autoStart}`];
-  await openCard(chatId, lines.join("\n"), {
-    inline_keyboard: [
-      [{ text: state.watching ? "\u23F8 Pause polling" : "\u25B6 Start polling", callback_data: "m:watchtoggle" }],
-      [{ text: "\u2190 Back", callback_data: "m:back" }],
-    ],
-  });
-}
-
-async function openSettingsCard(chatId: number): Promise<void> {
-  const c = state.config.outbound;
-  const lines = [
-    "\u2699\uFE0F Telegram settings",
-    "",
-    `parseMode: ${c.parseMode}`,
-    `disableNotification: ${c.disableNotification}`,
-    `maxRetries: ${c.maxRetries} \u00B7 sendRatePerSecond: ${c.sendRatePerSecond}`,
-    `maxMessageLength: ${c.maxMessageLength}`,
-    "",
-    "Edit .pi/telegram.json in the workspace to change these values.",
-    "",
-    "Host settings live under /hostsettings; credentials under /credentials.",
-  ];
-  await openCard(chatId, lines.join("\n"), {
-    inline_keyboard: [[{ text: "\u2190 Back", callback_data: "m:back" }]],
-  });
-}
-
-async function openAboutCard(chatId: number): Promise<void> {
-  const bot = state.transport ? await state.transport.botInfo().catch(() => undefined) : undefined;
-  const lines = [
-    "\u2139\uFE0F dsh-telegram",
-    "",
-    `version: ${version}`,
-    `bot: ${bot ? `@${plain(bot.username)} (${bot.id})` : "not connected"}`,
-    `token: ${resolveToken() ? "set" : "missing"}`,
-    `workspace: ${plain(state.workspaceRoot)}`,
-  ];
-  await openCard(chatId, lines.join("\n"), {
-    inline_keyboard: [[{ text: "\u2190 Back", callback_data: "m:back" }]],
-  });
-}
 
 // ---------------------------------------------------------------------------
 // Action registry (structural yellow-2)
