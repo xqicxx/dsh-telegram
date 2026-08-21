@@ -5,9 +5,10 @@
  * Each Telegram chat owns one dsh agent binding. Inbound text from chat N
  * goes to chat N's agent, and session events are routed back to chat N by
  * looking up the agent id — chats never share turns or steal each other's
- * final replies. The legacy single-chat fields (`currentAgentId`,
- * `activeChat`, `inbound`) are maintained as the "most recently touched"
- * view for plugins and callers that only need one active conversation.
+ * final replies. `chatStates` plus the `chatByAgent` reverse index are the
+ * single source of truth; a `lastTouch` pointer derives the "most recently
+ * touched" compatibility view for plugins and callers that only need one
+ * active conversation.
  */
 import type { Context } from "@deepseek-ai/cordis";
 import { createUserMessage } from "@deepseek-ai/dsh-llm";
@@ -100,21 +101,24 @@ export class Bridge {
   private readonly log: (message: string, error?: unknown) => void;
   private readonly disposers: (() => void)[] = [];
   private readonly chatStates = new Map<number, ChatState>();
+  /** Reverse index: agent id -> owning chat. Maintained in lockstep with
+   * `chatStates` by every mutation point (touch/bindAgent/detach); one agent
+   * maps to at most one chat, so `chatIdForAgent` stays O(1) on the hot
+   * session/event path. */
+  private readonly chatByAgent = new Map<string, number>();
   /** Dropped-event diagnostics: one line per unbound agent, plus every
    * turn/end so a missing final delivery is visible in the log. */
   private readonly droppedEvents = new Map<string, { count: number; lastType?: string }>();
 
   /** Most recently touched chat/agent — compatibility view, not the routing
-   * source of truth. Session events are routed through `chatStates`. */
-  private currentAgentId: ReturnType<typeof SessionId> | undefined;
-  private activeChat: number | undefined;
-  private inbound: Inbound | undefined;
+   * source of truth. Session events are routed through `chatStates`.
+   * `setCurrentAgent` without an active chat keeps just the agent half. */
+  private lastTouch: { chatId?: number; agentId: ReturnType<typeof SessionId> } | undefined;
   private assistantConsumer: ((chatId: number, text: string, assistantMessageId?: string) => void) | undefined;
-  private reminded = false;
 
   /** Active chat id for stream plugins (official session/event consumers). */
   activeChatValue(): number | undefined {
-    return this.activeChat;
+    return this.lastTouch?.chatId;
   }
 
   constructor(options: BridgeOptions) {
@@ -139,19 +143,27 @@ export class Bridge {
         return bound;
       }
     }
-    if (this.currentAgentId !== undefined) {
-      const bound = this.ctx.agents?.get(this.currentAgentId);
+    const touched = this.lastTouch?.agentId;
+    if (touched !== undefined) {
+      const bound = this.ctx.agents?.get(touched);
       if (bound) return bound;
     }
     return this.ctx.agents?.list()[0];
   }
 
   private touch(chatId: number, agentId: ReturnType<typeof SessionId>): ChatState {
+    // One agent belongs to one chat: if another chat already owns this
+    // agent, drop that stale binding so the reverse index stays exclusive
+    // and event routing can never become ambiguous.
+    const owner = this.chatByAgent.get(String(agentId));
+    if (owner !== undefined && owner !== chatId) this.chatStates.delete(owner);
     const existing = this.chatStates.get(chatId) ?? { agentId, reminded: false };
+    const previousId = String(existing.agentId);
+    if (previousId !== String(agentId)) this.chatByAgent.delete(previousId);
     existing.agentId = agentId;
     this.chatStates.set(chatId, existing);
-    this.currentAgentId = agentId;
-    this.activeChat = chatId;
+    this.chatByAgent.set(String(agentId), chatId);
+    this.lastTouch = { chatId, agentId };
     return existing;
   }
 
@@ -170,13 +182,12 @@ export class Bridge {
   /** Bind (or clear) the agent owned by one Telegram chat. */
   bindAgent(chatId: number, agentId: string | undefined): void {
     if (agentId === undefined) {
+      const previous = this.chatStates.get(chatId);
       this.chatStates.delete(chatId);
-      if (this.activeChat === chatId) {
-        this.currentAgentId = undefined;
-        this.activeChat = undefined;
-        this.inbound = undefined;
-        this.reminded = false;
+      if (previous !== undefined && this.chatByAgent.get(String(previous.agentId)) === chatId) {
+        this.chatByAgent.delete(String(previous.agentId));
       }
+      if (this.lastTouch?.chatId === chatId) this.lastTouch = undefined;
     } else {
       const id = SessionId(agentId);
       const previous = this.chatStates.get(chatId);
@@ -185,20 +196,9 @@ export class Bridge {
         // session's unanswered inbound (its reply-quote and turn/end state).
         previous.inbound = undefined;
         previous.reminded = false;
-        if (this.activeChat === chatId) this.inbound = undefined;
       }
-      // One agent belongs to one chat: if another chat already owns it, clear
-      // that old binding so event routing can never become ambiguous.
-      for (const [existingChat, state] of [...this.chatStates]) {
-        if (existingChat !== chatId && String(state.agentId) === String(id)) {
-          this.chatStates.delete(existingChat);
-          if (this.activeChat === existingChat) {
-            this.activeChat = undefined;
-            this.inbound = undefined;
-            this.reminded = false;
-          }
-        }
-      }
+      // touch() evicts any other chat that still owns this agent, so the
+      // one-agent-one-chat rule holds in both `chatStates` and the index.
       this.touch(chatId, id);
     }
     this.notifyStateChange();
@@ -207,16 +207,17 @@ export class Bridge {
   /** Legacy single-binding setter; when a chat is active it updates that
    * chat's binding as well. */
   setCurrentAgent(agentId: string | undefined): void {
-    if (this.activeChat !== undefined) {
-      this.bindAgent(this.activeChat, agentId);
+    const active = this.activeChatValue();
+    if (active !== undefined) {
+      this.bindAgent(active, agentId);
       return;
     }
-    this.currentAgentId = agentId === undefined ? undefined : SessionId(agentId);
+    this.lastTouch = agentId === undefined ? undefined : { agentId: SessionId(agentId) };
     this.notifyStateChange();
   }
 
   currentAgentIdValue(): string | undefined {
-    return this.currentAgentId;
+    return this.lastTouch?.agentId;
   }
 
   agentIdForChat(chatId: number): string | undefined {
@@ -225,17 +226,11 @@ export class Bridge {
   }
 
   chatIdForAgent(agentId: string): number | undefined {
-    for (const [chatId, state] of this.chatStates) {
-      if (String(state.agentId) === agentId) return chatId;
-    }
-    if (this.activeChat !== undefined && this.currentAgentId !== undefined && String(this.currentAgentId) === agentId) {
-      return this.activeChat;
-    }
-    return undefined;
+    return this.chatByAgent.get(agentId);
   }
 
   private inboundFor(chatId: number): Inbound | undefined {
-    return this.chatStates.get(chatId)?.inbound ?? (this.activeChat === chatId ? this.inbound : undefined);
+    return this.chatStates.get(chatId)?.inbound;
   }
 
   /** Pending inbound owned by the agent that is about to call `telegram_reply`.
@@ -243,77 +238,72 @@ export class Bridge {
    * reply out of chat B even when B was the most recently touched chat. */
   inboundForAgent(agentId: string): Inbound | undefined {
     const chatId = this.chatIdForAgent(agentId);
-    if (chatId !== undefined) return this.inboundFor(chatId);
-    return this.inbound;
-  }
-
-  private syncLegacy(chatId: number, state: ChatState, inbound?: Inbound): void {
-    this.currentAgentId = state.agentId;
-    this.activeChat = chatId;
-    this.inbound = inbound ?? state.inbound;
-    this.reminded = state.reminded;
+    return chatId === undefined ? undefined : this.inboundFor(chatId);
   }
 
   /** Route one inbound user text into that chat's agent inbox. */
   deliver(chatId: number, text: string, messageId?: number): { ok: boolean; text: string } {
-    const agent = this.resolveAgent(chatId);
-    if (!agent) return { ok: false, text: "No live agent in this session." };
-    const config = this.getConfig();
-    const mode = resolveInboundMode(config, chatId, text);
-    if (mode === "muted") return { ok: true, text: "Muted \u2014 message ignored." };
-
-    const message = createUserMessage({
+    return this.deliverContent(chatId, messageId, { queued: "Queued.", delivered: "Delivered." }, (config) => ({
+      probe: text,
       content: [{ type: "text", text: withReasoningDirective(config, text) }],
-      source: { kind: "user" },
-    });
-    // Bind the chat to this agent and install the inbound BEFORE the agent
-    // can emit anything: a synchronous turn/start or assistant/message must
-    // already know its chat and quote target, never be dropped as "no chat".
-    const state = this.touch(chatId, agent.id);
-    const inbound = { chatId, text, messageId, replied: false, noReply: false };
-    state.inbound = inbound;
-    state.reminded = false;
-    this.syncLegacy(chatId, state, inbound);
-    if (mode === "queue-only") {
-      agent.send(message, "next-turn", false);
-    } else {
-      agent.followup(message);
-    }
-    return { ok: true, text: mode === "queue-only" ? "Queued." : "Delivered." };
+      inboundText: text,
+    }));
   }
 
   /** Deliver a media-group batch as ONE inbound turn (issue #9). */
   deliverImages(chatId: number, attachments: readonly { attachmentId: string; mediaType: string; bytes: number; width: number; height: number; name?: string }[], caption?: string, messageId?: number): { ok: boolean; text: string } {
     if (attachments.length === 1) return this.deliverImage(chatId, attachments[0]!, caption, messageId);
-    return this.deliverImageContent(chatId, caption, messageId, attachments.map((attachment) => ({ type: "image", attachment })));
+    return this.deliverContent(chatId, messageId, { queued: "Image queued.", delivered: "Image delivered." }, (config) => {
+      const content: unknown[] = [];
+      if (caption && caption.trim()) content.push({ type: "text", text: withReasoningDirective(config, caption.trim()) });
+      content.push(...attachments.map((attachment) => ({ type: "image", attachment })));
+      return {
+        probe: caption ?? "",
+        content,
+        inboundText: caption || `[${attachments.length} images]`,
+      };
+    });
   }
 
   /** Deliver one promoted image as the inbound turn (session.attachment path). */
   deliverImage(chatId: number, attachment: { attachmentId: string; mediaType: string; bytes: number; width: number; height: number; name?: string }, caption?: string, messageId?: number): { ok: boolean; text: string } {
-    return this.deliverImageContent(chatId, caption, messageId, [{ type: "image", attachment }]);
+    return this.deliverContent(chatId, messageId, { queued: "Image queued.", delivered: "Image delivered." }, (config) => {
+      const content: unknown[] = [];
+      if (caption && caption.trim()) content.push({ type: "text", text: withReasoningDirective(config, caption.trim()) });
+      content.push({ type: "image", attachment });
+      return {
+        probe: caption ?? "",
+        content,
+        inboundText: caption || "[1 image]",
+      };
+    });
   }
 
-  private deliverImageContent(chatId: number, caption: string | undefined, messageId: number | undefined, imageBlocks: unknown[]): { ok: boolean; text: string } {
+  /** Shared inbound-turn pipeline behind deliver()/deliverImage(): resolve
+   * the chat's agent, bind the chat and install the inbound quote BEFORE the
+   * agent can emit anything (a synchronous turn/start or assistant/message
+   * must already know its chat and quote target), then enqueue the turn. */
+  private deliverContent(
+    chatId: number,
+    messageId: number | undefined,
+    labels: { queued: string; delivered: string },
+    compose: (config: TelegramConfig) => { probe: string; content: unknown[]; inboundText: string },
+  ): { ok: boolean; text: string } {
     const agent = this.resolveAgent(chatId);
     if (!agent) return { ok: false, text: "No live agent in this session." };
     const config = this.getConfig();
-    const mode = resolveInboundMode(config, chatId, caption ?? "");
+    const parts = compose(config);
+    const mode = resolveInboundMode(config, chatId, parts.probe);
     if (mode === "muted") return { ok: true, text: "Muted \u2014 message ignored." };
-    const content: unknown[] = [];
-    if (caption && caption.trim()) content.push({ type: "text", text: withReasoningDirective(config, caption.trim()) });
-    content.push(...imageBlocks);
-    const message = createUserMessage({ content: content as never, source: { kind: "user" } });
+    const message = createUserMessage({ content: parts.content as never, source: { kind: "user" } });
     const target = agent as unknown as { send(message: unknown, target: string, wakeup: boolean): void; followup(message: unknown): void };
-    // Same ordering contract as deliver(): the binding and inbound quote must
-    // exist before the agent can emit a session event synchronously.
     const state = this.touch(chatId, agent.id);
-    const inbound = { chatId, text: caption || `[${imageBlocks.length} image${imageBlocks.length === 1 ? "" : "s"}]`, messageId, replied: false, noReply: false };
+    const inbound = { chatId, text: parts.inboundText, messageId, replied: false, noReply: false };
     state.inbound = inbound;
     state.reminded = false;
-    this.syncLegacy(chatId, state, inbound);
     if (mode === "queue-only") target.send(message, "next-turn", false);
     else target.followup(message);
-    return { ok: true, text: mode === "queue-only" ? "Image queued." : "Image delivered." };
+    return { ok: true, text: mode === "queue-only" ? labels.queued : labels.delivered };
   }
 
   /** Bot-API send options that quote the current inbound message when it
@@ -351,30 +341,24 @@ export class Bridge {
 
   /** Telegram message id of the pending inbound for a chat. */
   inboundMessageIdValue(chatId?: number): number | undefined {
-    const target = chatId ?? this.activeChat;
-    if (target === undefined) return this.inbound?.messageId;
+    const target = chatId ?? this.activeChatValue();
+    if (target === undefined) return undefined;
     return this.inboundFor(target)?.messageId;
   }
 
   markNoReply(reason?: string, chatId?: number): { ok: boolean; text: string } {
-    const target = chatId ?? this.activeChat;
+    const target = chatId ?? this.activeChatValue();
     if (target === undefined) return { ok: false, text: "No active inbound message." };
+    // Dropping the pending inbound is the whole effect: the turn/end reminder
+    // keys off `inbound === undefined || replied || noReply`.
     const state = this.chatStates.get(target);
-    const inbound = this.inboundFor(target);
-    if (inbound) {
-      inbound.noReply = true;
-    }
     if (state) state.inbound = undefined;
-    if (this.activeChat === target) {
-      this.inbound = undefined;
-      this.reminded = false;
-    }
     return { ok: true, text: reason ?? "Marked as no-reply." };
   }
 
   hasPendingInbound(chatId?: number): boolean {
-    const target = chatId ?? this.activeChat;
-    if (target === undefined) return this.inbound !== undefined && !this.inbound.replied && !this.inbound.noReply;
+    const target = chatId ?? this.activeChatValue();
+    if (target === undefined) return false;
     const inbound = this.inboundFor(target);
     return inbound !== undefined && !inbound.replied && !inbound.noReply;
   }
@@ -402,14 +386,15 @@ export class Bridge {
 
   /** Renderer plugins call this after delivering the final answer for a chat. */
   markInboundReplied(chatId?: number): void {
-    const target = chatId ?? this.activeChat;
+    const target = chatId ?? this.activeChatValue();
     if (target === undefined) return;
     const inbound = this.inboundFor(target);
     if (inbound) inbound.replied = true;
   }
 
   currentInbound(): Inbound | undefined {
-    return this.inbound;
+    const chatId = this.lastTouch?.chatId;
+    return chatId === undefined ? undefined : this.chatStates.get(chatId)?.inbound;
   }
 
   private logDroppedEvent(agentId: string, type: string | undefined): void {
@@ -437,7 +422,8 @@ export class Bridge {
           // Only diagnose events that belonged to an agent Telegram itself
           // touched. Web-owned sessions are expected to be unbound and must
           // not flood the console on every browser turn.
-          if (this.currentAgentId !== undefined && String(this.currentAgentId) === sessionId) {
+          const touched = this.lastTouch?.agentId;
+          if (touched !== undefined && String(touched) === sessionId) {
             this.logDroppedEvent(sessionId, event.type);
           }
           return;
@@ -462,7 +448,16 @@ export class Bridge {
             const consumer = this.liveFeedEnabled() ? this.assistantConsumer : undefined;
             if (consumer !== undefined) {
               // A stream-renderer plugin owns presentation and final delivery.
-              consumer(chatId, text, messageId);
+              // A throwing consumer must never escape a cordis event listener
+              // (same containment as notifyStateChange).
+              try {
+                consumer(chatId, text, messageId);
+              } catch (err) {
+                this.log(
+                  "assistant consumer failed",
+                  err instanceof Error ? `${err.message}\n${err.stack ?? ""}` : String(err),
+                );
+              }
             } else {
               // A prose reply satisfies the inbound message: the turn/end
               // reminder must not fire when the agent answered normally.
@@ -552,10 +547,10 @@ export class Bridge {
   detach(): void {
     for (const dispose of this.disposers.splice(0)) dispose();
     this.chatStates.clear();
+    this.chatByAgent.clear();
     this.droppedEvents.clear();
-    this.inbound = undefined;
-    this.currentAgentId = undefined;
-    this.activeChat = undefined;
-    this.reminded = false;
+    this.lastTouch = undefined;
+    // A stale consumer must not survive the bridge it was registered on.
+    this.assistantConsumer = undefined;
   }
 }

@@ -114,6 +114,28 @@ test('a chat binding is cleared without disturbing another chat', async () => {
   assert.equal(bridge.chatIdForAgent('agent-2'), 8);
 });
 
+test('one agent stays bound to one chat: a newer bind/touch evicts the previous chat', async () => {
+  const transport = makeTransport();
+  const agents = [{ id: 'agent-1', send: () => {}, followup: () => {} }];
+  const ctx = makeCtx(agents);
+  const bridge = await makeBridge(ctx, transport);
+  bridge.attach();
+
+  bridge.bindAgent(7, 'agent-1');
+  bridge.deliver(7, 'from chat 7', 701);
+  bridge.bindAgent(8, 'agent-1');
+  assert.equal(bridge.agentIdForChat(7), undefined, 'bind must evict the previous chat owning the agent');
+  assert.equal(bridge.chatIdForAgent('agent-1'), 8);
+
+  ctx.emit('session/event', { id: 'agent-1' }, am('answer', 'msg-1'));
+  await sleep(10);
+  assert.deepEqual(transport.sent.map((entry) => entry.chatId), [8], 'events route to the new owner only');
+
+  bridge.deliver(9, 'steal attempt');
+  assert.equal(bridge.agentIdForChat(8), undefined, 'touch keeps the index exclusive too');
+  assert.equal(bridge.chatIdForAgent('agent-1'), 9);
+});
+
 function makeBridge(ctx, transport) {
   return import('../dist/harness/bridge.js').then(({ Bridge }) =>
     new Bridge({
