@@ -30,14 +30,30 @@ function skillsOf(ctx: Context): SkillRegistryLike | undefined {
   return ctx.get("skills") as SkillRegistryLike | undefined;
 }
 
-export async function listSkills(ctx: Context, sessionId?: string): Promise<SkillEntry[]> {
+/** Web skill.list request envelope: the session addressing the catalog,
+ * the session's project cwd (the host scopes project skills by it), and the
+ * invocation scope (`user` = user-invocable entries only, like the web's
+ * command palette; omitted = everything). */
+export interface SkillListOptions {
+  sessionId?: string;
+  cwd?: string;
+  scope?: string;
+}
+
+function normalizeSkillOptions(options?: string | SkillListOptions): SkillListOptions | undefined {
+  if (options === undefined) return undefined;
+  return typeof options === "string" ? { sessionId: options } : options;
+}
+
+export async function listSkills(ctx: Context, options?: string | SkillListOptions): Promise<SkillEntry[]> {
   const skills = skillsOf(ctx);
   if (!skills) return [];
   try {
-    // Web skill.list is addressed by session: the host resolves the
-    // session's project root and returns its user-invocable catalog.
+    // Web skill.list is addressed by session + cwd + scope: the host resolves
+    // the session's project root and returns its user-invocable catalog.
     // Structural fallback: registries that take no options still work.
-    const summaries = await skills.list(sessionId === undefined ? undefined : { sessionId });
+    const normalized = normalizeSkillOptions(options);
+    const summaries = await skills.list(normalized === undefined ? undefined : { ...normalized });
     return summaries.map((skill) => {
       const invocation = skill.invocation as { model?: boolean; user?: boolean } | { modelInvocable?: boolean; userInvocable?: boolean } | undefined;
       const modelInvocable =

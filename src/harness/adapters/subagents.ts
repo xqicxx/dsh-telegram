@@ -17,6 +17,9 @@ export interface SubagentEntry {
   label?: string;
   hasChildren?: boolean;
   reason?: "corrupt" | "unsupported" | "unavailable";
+  /** Web catalog row fact: whether the parent session still has a live agent
+   * (prompt/interrupt need it). */
+  parentAvailable?: boolean;
 }
 
 interface AgentLike {
@@ -51,9 +54,13 @@ function subagentsOf(ctx: Context): SubagentRuntimeLike | undefined {
 export async function listSubagents(ctx: Context, parentSessionId: string): Promise<SubagentEntry[]> {
   const subagents = subagentsOf(ctx);
   if (!subagents) return [];
+  // Web subagent.list reports `parentAvailable`: whether the parent session
+  // still has a live agent to address prompt/interrupt through.
+  const parentAvailable = ctx.agents?.get(SessionId(parentSessionId)) !== undefined;
   try {
     const entries = await subagents.listChildren(SessionId(parentSessionId));
     return entries.map((entry) => ({
+      parentAvailable,
       id: entry.id,
       kind: entry.kind,
       // Web api-proxy remaps every child row to the LIVE AGENT status at the
@@ -85,6 +92,19 @@ export async function promptSubagent(
   if (!subagents) return fail("subagents service is unavailable in this profile");
   const parent = ctx.agents?.get(SessionId(parentSessionId));
   if (!parent) return fail(`parent session ${parentSessionId} has no live agent`);
+  // Web contract: only continuable child subagents accept prompts. Verify
+  // against the live catalog instead of trusting the caller.
+  let children: SubagentListEntryLike[];
+  try {
+    children = await subagents.listChildren(SessionId(parentSessionId));
+  } catch (err) {
+    return fail(`subagent catalog is unavailable \u2014 cannot verify ${childSessionId} is continuable: ${err instanceof Error ? err.message : String(err)}`);
+  }
+  const entry = children.find((candidate) => String(candidate.id) === childSessionId);
+  if (entry === undefined) return fail(`subagent ${childSessionId} is not listed under parent ${parentSessionId}`);
+  if (entry.kind !== "child" || entry.mode !== "continuable") {
+    return fail("subagent-prompt-locked: only continuable child subagents accept prompts");
+  }
   try {
     const clientTimeZone = options?.clientTimeZone ?? Intl.DateTimeFormat().resolvedOptions().timeZone;
     const signal = options?.signal ?? new AbortController().signal;

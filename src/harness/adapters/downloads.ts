@@ -60,6 +60,17 @@ async function loadExportSeam(): Promise<{ streamSessionLogZip: StreamZip; sessi
   return undefined;
 }
 
+/** Oversize guidance: the web URL path and the host-side location, so a
+ * >50 MB log is still reachable instead of a dead end. */
+export function oversizeGuidance(sessionId: string, totalBytes: number): string {
+  const mb = Math.max(1, Math.round(totalBytes / 1024 / 1024));
+  return [
+    `session log ZIP exceeds the 50 MB Telegram limit (${mb} MB).`,
+    `Web: open the web UI \u2192 Sessions \u2192 ${sessionId} \u2192 Log download.`,
+    "Host: the same archive lives under $DSH_HOME/sessions (default ~/.dsh/sessions).",
+  ].join("\n");
+}
+
 export interface SessionLogExport {
   result: AdapterResult;
   buffer?: Uint8Array;
@@ -101,11 +112,7 @@ export async function exportSessionLog(ctx: Context, sessionId: string, includeD
         total += value.byteLength;
         if (total > TELEGRAM_DOCUMENT_LIMIT_BYTES) {
           void reader.cancel().catch(() => {});
-          return {
-            result: fail(
-              `session log ZIP exceeds the 50 MB Telegram limit (${Math.round(total / 1024 / 1024)} MB so far) \u2014 download it from the web UI instead.`,
-            ),
-          };
+          return { result: fail(oversizeGuidance(sessionId, total)) };
         }
         chunks.push(value);
       }

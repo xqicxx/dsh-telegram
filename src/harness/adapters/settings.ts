@@ -22,11 +22,18 @@ export interface SettingsDescription {
   hasDocument: boolean;
   documentPath?: string;
   namespaces: SettingsNamespaceView[];
+  /** Namespaces the registrant marked outside the web boundary
+   * (`exposed: false`) — filtered out of `namespaces`, listed here so the UI
+   * can say what exists but is not web-addressable. */
+  internalNamespaces: string[];
   error?: string;
 }
 
 interface SettingsDescriptorLike {
   ns: string;
+  /** Web boundary marker: `false` = the web ApiProxy does not expose this
+   * namespace (internal bookkeeping); absent = exposed like every other. */
+  exposed?: boolean;
   schema?: unknown;
   value: unknown;
   base?: unknown;
@@ -78,13 +85,15 @@ export function parseJsonWithRevision(raw: string): { json: string; revision?: n
 
 export function describeSettings(ctx: Context): SettingsDescription {
   const settings = settingsOf(ctx);
-  if (!settings) return { writable: false, hasDocument: false, namespaces: [] };
+  if (!settings) return { writable: false, hasDocument: false, namespaces: [], internalNamespaces: [] };
   try {
+    const descriptors = settings.describe({ redactSecrets: true });
+    const internalNamespaces = descriptors.filter((d) => d.exposed === false).map((d) => String(d.ns));
     return {
       writable: settings.writable ?? true,
       hasDocument: settings.documentPath !== undefined,
       ...(settings.documentPath === undefined ? {} : { documentPath: settings.documentPath }),
-      namespaces: settings.describe({ redactSecrets: true }).map((descriptor) => ({
+      namespaces: descriptors.filter((descriptor) => descriptor.exposed !== false).map((descriptor) => ({
         ns: String(descriptor.ns),
         ...(descriptor.schema === undefined ? {} : { schema: descriptor.schema }),
         value: descriptor.value,
@@ -94,9 +103,10 @@ export function describeSettings(ctx: Context): SettingsDescription {
         secrets: descriptor.secrets ?? [],
         revision: descriptor.revision ?? 0,
       })),
+      internalNamespaces,
     };
   } catch (err) {
-    return { writable: false, hasDocument: false, namespaces: [], error: err instanceof Error ? err.message : String(err) };
+    return { writable: false, hasDocument: false, namespaces: [], internalNamespaces: [], error: err instanceof Error ? err.message : String(err) };
   }
 }
 

@@ -17,6 +17,9 @@ interface CredentialProviderLike {
   describe(ref: string): Promise<{ configured: boolean; source?: string; writable: boolean }>;
   set(ref: string, value: string): Promise<void>;
   unset(ref: string): Promise<void>;
+  /** Optional enumeration seam (web keeps credentials non-enumerable, but a
+   * host may expose the ref roster so UIs can offer one-tap describe). */
+  list?(): readonly string[] | Promise<readonly string[]>;
 }
 
 function credentialsOf(ctx: Context): CredentialProviderLike | undefined {
@@ -62,6 +65,19 @@ export async function describeCredentials(ctx: Context, refs: readonly string[])
     return { ok: true, text, views };
   } catch (err) {
     return fail(err instanceof Error ? err.message : String(err));
+  }
+}
+
+/** Enumerate the credential refs this host exposes (empty without the
+ * optional seam — values never ride back either way). */
+export async function listCredentialRefs(ctx: Context): Promise<string[]> {
+  const credentials = credentialsOf(ctx);
+  if (!credentials || typeof credentials.list !== "function") return [];
+  try {
+    const refs = await credentials.list();
+    return [...new Set(refs.map((ref) => String(ref)))].sort();
+  } catch {
+    return [];
   }
 }
 

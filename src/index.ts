@@ -56,12 +56,12 @@ import { listSkills } from "./harness/adapters/skills.js";
 import { listSubagents, promptSubagent, interruptSubagent, subagentHistory } from "./harness/adapters/subagents.js";
 import { listAgentPresets, selectAgentPreset, setDefaultAgentPreset, readAgentPreset, copyAgentPreset, removeAgentPreset, openAgentPresetDocument, switchAgentPresetMidSession, sessionHasStarted } from "./harness/adapters/presets.js";
 import { describeSettings, updateSettings, replaceSettings, mutateSettings, parseJsonWithRevision } from "./harness/adapters/settings.js";
-import { describeCredential, describeCredentials, setCredential, unsetCredential } from "./harness/adapters/credentials.js";
-import { modelCatalog, discoverModels } from "./harness/adapters/llm.js";
+import { describeCredential, describeCredentials, setCredential, unsetCredential, listCredentialRefs } from "./harness/adapters/credentials.js";
+import { modelCatalog, providerCatalog, discoverModels } from "./harness/adapters/llm.js";
 import { REASONING_DEFAULT, REASONING_EFFORTS, isReasoningEffort, reasoningLabel } from "./reasoning.js";
 import { reasoningExtension } from "./extensions/reasoning.js";
 import type { TelegramExtension, ExtensionHost } from "./extensions/types.js";
-import { describeHost, listDirectory, createDirectory, isDirectory, parentOf, openPath, pickDirectoryHint } from "./harness/adapters/host.js";
+import { describeHost, hostVersionOf, breadcrumbSegments, listDirectory, createDirectory, isDirectory, parentOf, openPath, pickDirectoryHint } from "./harness/adapters/host.js";
 import { listCommands, executeCommand } from "./harness/adapters/commands.js";
 import { listJobs } from "./harness/adapters/jobs.js";
 import { exportSessionLog } from "./harness/adapters/downloads.js";
@@ -98,6 +98,8 @@ import {
   buildQueueKeyboard,
   inputPromptKeyboard,
   buildModelsKeyboard,
+  buildProvidersKeyboard,
+  buildNewSessionKeyboard,
   buildModelDetailKeyboard,
   buildThinkingKeyboard,
   buildGoalsKeyboard,
@@ -737,6 +739,14 @@ function currentAgent(chatId?: number): Agent | undefined {
   return agents[0];
 }
 
+/** The live session's project cwd (web skill.list / session.create scope). */
+function boundSessionCwd(ctx: Context, agentId: string | undefined): string | undefined {
+  if (agentId === undefined) return undefined;
+  const agent = ctx.agents?.get(agentId as never);
+  const cwd = (agent as unknown as { session?: { header?: { cwd?: string } } } | undefined)?.session?.header?.cwd;
+  return typeof cwd === "string" && cwd !== "" ? cwd : undefined;
+}
+
 /** Per-chat serialization for session creation. With router UI lanes, a
  * first inbound message and a fast `✨ New` / model-select tap can run
  * concurrently; this gate guarantees they still produce one session. */
@@ -919,7 +929,28 @@ async function openModelsCard(chatId: number): Promise<void> {
   for (const failure of catalog.failures) lines.push(`\u26A0\uFE0F ${plain(failure.provider)}: ${plain(failure.message)}`);
   lines.push("", "Tap a provider to switch the current session's model.");
   log(`models card: groups=${catalog.groups.map((g) => g.id).join(",")} failures=${catalog.failures.length}`);
-  await openCard(chatId, lines.join("\n"), buildModelsKeyboard(catalog.groups));
+  await openCard(chatId, lines.join("\n"), buildModelsKeyboard(catalog.groups, "m:providers"));
+}
+
+/** Standalone Providers view (llm.providers): deployment facts per provider
+ * \u2014 where it is configured (settingsNs/settingsPath), whether an adapter is
+ * mounted (active), and whether settings declared it (declared). */
+async function openProvidersCard(chatId: number): Promise<void> {
+  const catalog = await cardLoad(chatId, "llm providers", () => providerCatalog(requireCtx()));
+  if (catalog === undefined) return;
+  const lines = [`\u{1F6F0}\uFE0F Providers (${catalog.providers.length})`, ""];
+  for (const provider of catalog.providers.slice(0, 20)) {
+    lines.push(`\u2022 ${plain(provider.id)} \u00B7 ${plain(provider.name)}`);
+    lines.push(`  settings: ${plain(provider.settingsNs ?? "\u2014")}${provider.settingsPath ? ` (${plain(truncate(provider.settingsPath, 40))})` : ""} \u00B7 active: ${provider.active === undefined ? "\u2014" : provider.active ? "yes" : "no"} \u00B7 declared: ${provider.declared === undefined ? "\u2014" : provider.declared ? "yes" : "no"}`);
+  }
+  if (catalog.providers.length === 0) lines.push("No providers registered in the llm registry.");
+  for (const failure of catalog.failures) lines.push(`\u26A0\uFE0F ${plain(failure.provider)}: ${plain(failure.message)}`);
+  await openCard(chatId, lines.join("\n"), buildProvidersKeyboard(
+    catalog.providers.slice(0, 20).map((provider) => ({
+      label: `\u{1F4E1} ${provider.name}`,
+      cb: token({ action: "provider", provider: provider.id }),
+    })),
+  ));
 }
 
 const MODELS_PAGE_SIZE = 12;
@@ -1455,8 +1486,14 @@ async function openGoalsCard(chatId: number): Promise<void> {
 }
 
 async function openSkillsCard(chatId: number): Promise<void> {
+  const ctx = requireCtx();
   const agent = currentAgent(chatId);
-  const skills = await cardLoad(chatId, "skills list", () => listSkills(requireCtx(), agent?.id));
+  // Web skill.list is addressed by session + cwd + scope: pass the live
+  // session's project root (header cwd, else the workspace root) and ask for
+  // the user-invocable scope, then filter client-side for registries that
+  // ignore the scope option.
+  const cwd = boundSessionCwd(ctx, agent?.id) ?? state.workspaceRoot;
+  const skills = await cardLoad(chatId, "skills list", () => listSkills(ctx, { ...(agent?.id === undefined ? {} : { sessionId: agent.id }), cwd, scope: "user" }));
   if (skills === undefined) return;
   const userSkills = skills.filter((skill) => skill.userInvocable);
   const lines = [`\u{1F9D1}\u200D\u{1F3EB} Skills (${userSkills.length} user-invocable)`, ""];
@@ -1484,6 +1521,7 @@ async function openSubagentsCard(chatId: number): Promise<void> {
     const flags: string[] = [entry.kind, entry.activity];
     if (entry.mode !== undefined) flags.push(entry.mode);
     if (entry.hasChildren === true) flags.push("children");
+    flags.push(entry.parentAvailable === false ? "parent:unavailable" : "parent:available");
     lines.push(`\u2022 ${plain(truncate(entry.id, 28))} \u00B7 ${flags.join("/")}${entry.label ? ` \u00B7 ${plain(truncate(entry.label, 20))}` : ""}`);
     if (entry.kind === "diagnostic") lines.push(`  reason: ${plain(entry.reason ?? "unavailable")}`);
   }
@@ -1511,7 +1549,7 @@ async function openSubagentDetailCard(chatId: number, parentId: string, childId:
     `parent: ${plain(truncate(parentId, 24))}`,
     entry === undefined
       ? "catalog entry: not listed"
-      : `kind: ${entry.kind} \u00B7 activity: ${entry.activity}${entry.mode ? ` \u00B7 mode: ${entry.mode}` : ""}${entry.hasChildren === true ? " \u00B7 has children" : ""}`,
+      : `kind: ${entry.kind} \u00B7 activity: ${entry.activity}${entry.mode ? ` \u00B7 mode: ${entry.mode}` : ""}${entry.hasChildren === true ? " \u00B7 has children" : ""}${entry.parentAvailable === false ? " \u00B7 parent unavailable" : ""}`,
     entry?.label ? `label: ${plain(truncate(entry.label, 40))}` : "",
     entry?.kind === "diagnostic" ? `reason: ${plain(entry.reason ?? "unavailable")}` : "",
   ].filter((line) => line !== "");
@@ -1527,6 +1565,28 @@ async function openSubagentDetailCard(chatId: number, parentId: string, childId:
   };
   if (!continuable) lines.push("", "This subagent is not continuable \u2014 history is read-only.");
   await openCard(chatId, lines.join("\n"), buildSubagentDetailKeyboard(callbacks));
+}
+
+/** New-session preset picker (web session.create's agentPreset): use the
+ * roster's default preset with one tap, or pick a specific preset. Profiles
+ * without presets fall straight through to creation. */
+async function openNewSessionCard(chatId: number): Promise<void> {
+  const presetsView = await cardLoad(chatId, "agent presets", () => listAgentPresets(requireCtx()));
+  if (presetsView === undefined) return;
+  const { presets } = presetsView;
+  const lines = [
+    "\u2728 New session",
+    "",
+    presets.length > 0
+      ? "Compose the session from a preset, or use the roster default:"
+      : "This profile composes no agent presets \u2014 the new session uses the profile default.",
+    "",
+    ...presets.slice(0, 12).map((preset) => `${preset.isDefault ? "\u2B50" : "\u2022"} ${plain(preset.id)}${preset.isDefault ? " (default)" : ""}`),
+  ];
+  await openCard(chatId, lines.join("\n"), buildNewSessionKeyboard(
+    token({ action: "new-default" }),
+    presets.slice(0, 12).map((preset) => ({ id: preset.id, isDefault: preset.isDefault, cb: token({ action: "preset-new", presetId: preset.id }) })),
+  ));
 }
 
 async function openPresetsCard(chatId: number): Promise<void> {
@@ -1563,13 +1623,16 @@ async function openPresetDetailCard(chatId: number, presetId: string): Promise<v
 }
 
 async function openHostSettingsCard(chatId: number): Promise<void> {
-  const { writable, hasDocument, documentPath, namespaces } = describeSettings(requireCtx());
+  const { writable, hasDocument, documentPath, namespaces, internalNamespaces } = describeSettings(requireCtx());
   const lines = [`\u2699\uFE0F Host settings \u00B7 writable: ${writable} \u00B7 document: ${hasDocument ? plain(truncate(documentPath ?? "yes", 48)) : "none"}`, ""];
   for (const ns of namespaces.slice(0, 15)) {
     const secrets = ns.secrets.filter((secret) => secret.set).length;
     lines.push(`\u2022 ${plain(truncate(ns.ns, 36))} \u00B7 applies: ${ns.applies} \u00B7 rev ${ns.revision} \u00B7 secrets set: ${secrets}`);
   }
   if (namespaces.length === 0) lines.push("No settings namespaces registered.");
+  if (internalNamespaces.length > 0) {
+    lines.push("", `Outside the web boundary (not listed): ${internalNamespaces.slice(0, 8).map(plain).join(", ")}${internalNamespaces.length > 8 ? "\u2026" : ""}`);
+  }
   lines.push("", "Describe: /settingsdescribe [ns] \u00B7 Update: /settingsupdate &lt;ns&gt; &lt;json patch&gt;");
   await openCard(chatId, lines.join("\n"), buildSettingsKeyboard(namespaces.map((ns) => ns.ns)));
 }
@@ -1591,23 +1654,31 @@ async function openSettingsNamespaceCard(chatId: number, ns: string): Promise<vo
 }
 
 async function openCredentialsCard(chatId: number): Promise<void> {
+  const refs = await listCredentialRefs(requireCtx());
   const lines = [
     "\u{1F511} Credentials",
     "",
     "Describe: /credential &lt;REF&gt; [REF...] (configured/source/writable, value never shown)",
     "Set: /credentialset &lt;REF&gt; &lt;value&gt; \u00B7 Unset: /credentialunset &lt;REF&gt;",
     "",
+    refs.length > 0 ? `Available refs (${refs.length}) \u2014 tap to describe:` : "This host exposes no ref roster (credentials are non-enumerable here).",
+    ...refs.slice(0, 12).map((ref) => `\u2022 ${plain(ref)}`),
+    refs.length > 12 ? `\u2026 +${refs.length - 12}` : "",
+    "",
     "The secret value never rides back \u2014 same as the web form.",
-  ];
-  await openCard(chatId, lines.join("\n"), buildCredentialsKeyboard());
+  ].filter((line) => line !== "");
+  await openCard(chatId, lines.join("\n"), buildCredentialsKeyboard(refs.slice(0, 12).map((ref) => ({ ref, cb: token({ action: "credential-show", ref }) }))));
 }
 
 async function openHostCard(chatId: number): Promise<void> {
-  const host = describeHost(requireCtx(), state.workspaceRoot, version);
+  // No hardcoded version: the host version comes from the hostInfo seam or
+  // DSH_VERSION; when the profile exposes neither, say so instead of showing
+  // a bridge-owned number (the bridge version lives in About).
+  const host = describeHost(requireCtx(), state.workspaceRoot);
   const lines = [
     "\u{1F5A5} Host",
     "",
-    `version: ${host.version} \u00B7 cwd: ${plain(truncate(host.cwd, 40))}`,
+    `version: ${host.version ? plain(host.version) : "unknown (not exposed to plugins)"} \u00B7 cwd: ${plain(truncate(host.cwd, 40))}`,
     `model default: ${host.provider ? `${plain(host.provider)}/` : ""}${host.model ? plain(host.model) : "default"}`,
     `attached sessions: ${host.attachedSessions} \u00B7 canOpenPath: ${host.canOpenPath}`,
     "",
@@ -1638,12 +1709,21 @@ async function openHostDirectoryCard(chatId: number, path: string, page = 0): Pr
     "",
   ];
   if (res.ok && pageDirs.length === 0) lines.push("(this directory contains files only)");
+  // Breadcrumb: every ancestor up to the current directory is one tap.
+  const crumbs = breadcrumbSegments(target);
+  if (res.ok && crumbs.length > 1) {
+    const shown = crumbs.length > 3 ? [{ label: "\u2026", path: crumbs[crumbs.length - 3]!.path }, ...crumbs.slice(-2)] : crumbs.slice(0, -1);
+    lines.splice(2, 0, shown.map((crumb) => plain(crumb.label)).join(" \u203A "));
+  }
   await openCard(chatId, lines.join("\n"), buildProjectKeyboard(
     pageDirs.map((entry) => ({ label: entry.name, cb: token({ action: "host-open", path: join(target, entry.name) }) })),
     {
       up: token({ action: "host-open", path: parentOf(target) }),
       home: token({ action: "host-open", path: homedir() }),
       root: token({ action: "host-open", path: parse(target).root }),
+      breadcrumb: (res.ok && crumbs.length > 1 ? (crumbs.length > 3 ? [{ label: "\u2026", path: crumbs[crumbs.length - 3]!.path }, ...crumbs.slice(-2)] : crumbs.slice(0, -1)) : []).map(
+        (crumb) => ({ label: crumb.label, cb: token({ action: "host-open", path: crumb.path }) }),
+      ),
       paging: [
         ...(safe > 0 ? [{ text: "\u2039 Prev", cb: token({ action: "host-page", path: target, page: String(safe - 1) }) }] : []),
         ...(safe + 1 < totalPages ? [{ text: "More \u203A", cb: token({ action: "host-page", path: target, page: String(safe + 1) }) }] : []),
@@ -1968,6 +2048,15 @@ async function dispatchToken(chatId: number, payload: Record<string, string>): P
     }
     case "preset":
       return openPresetDetailCard(chatId, payload["presetId"] ?? "");
+    case "providers":
+      return openProvidersCard(chatId);
+    case "provider":
+      return openProviderModelsCard(chatId, payload["provider"] ?? "");
+    case "credential-show": {
+      const res = await describeCredentials(requireCtx(), [payload["ref"] ?? ""]);
+      await uiSend(chatId, res.ok ? plain(res.text) : `\u274C ${plain(res.text)}`, { parse_mode: "HTML" });
+      return openCredentialsCard(chatId);
+    }
     case "preset-new": {
       const presetId = payload["presetId"] ?? "";
       const created = await createSessionForChat(chatId, state.config.model, presetId);
@@ -2509,7 +2598,9 @@ async function dispatchCallback(chatId: number, data: string): Promise<void> {
       return openAboutCard(chatId);
     case "status":
       return openStatusPanel(chatId);
-    case "new": {
+    case "new":
+      return openNewSessionCard(chatId);
+    case "new-default": {
       const { result: res, agentId } = await createSessionForChat(chatId);
       const bound = bindCreatedSession(chatId, agentId);
       await sendWithLiveBar(chatId, res.ok

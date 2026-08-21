@@ -30,8 +30,26 @@ export interface ModelCatalog {
   routable: boolean;
 }
 
+/** One llm.providers row: the web also reports where the provider is
+ * configured (settingsNs/settingsPath), whether an adapter is currently
+ * mounted (active), and whether the provider was declared by settings
+ * (declared) as opposed to discovered at runtime. */
+export interface ProviderEntry {
+  id: string;
+  name: string;
+  settingsNs?: string;
+  settingsPath?: string;
+  active?: boolean;
+  declared?: boolean;
+}
+
+export interface ProviderCatalog {
+  providers: ProviderEntry[];
+  failures: { provider: string; message: string }[];
+}
+
 interface LlmLike {
-  listProviders(): { id: string; name: string }[];
+  listProviders(): { id: string; name: string; settingsNs?: string; settingsPath?: string; active?: boolean; declared?: boolean }[];
   listModels(provider: string): Promise<{ id: string; name: string; description?: string }[]>;
   resolveModelInfo(provider: string, model: string): Promise<{
     reasoning?: { efforts: { id: string; name: string; description?: string }[]; defaultEffort?: string };
@@ -83,6 +101,28 @@ export async function modelCatalog(ctx: Context, current?: { provider?: string; 
     current: current ?? {},
     routable: current?.provider === undefined || providers.some((entry) => entry.id === current.provider),
   };
+}
+
+/** llm.providers: the provider roster with deployment facts, failures kept
+ * separate so one broken registration never hides the rest. */
+export async function providerCatalog(ctx: Context): Promise<ProviderCatalog> {
+  const llm = llmOf(ctx);
+  if (!llm) return { providers: [], failures: [] };
+  try {
+    return {
+      providers: llm.listProviders().map((provider) => ({
+        id: provider.id,
+        name: provider.name,
+        ...(provider.settingsNs === undefined ? {} : { settingsNs: provider.settingsNs }),
+        ...(provider.settingsPath === undefined ? {} : { settingsPath: provider.settingsPath }),
+        ...(provider.active === undefined ? {} : { active: provider.active }),
+        ...(provider.declared === undefined ? {} : { declared: provider.declared }),
+      })),
+      failures: [],
+    };
+  } catch (err) {
+    return { providers: [], failures: [{ provider: "*", message: err instanceof Error ? err.message : String(err) }] };
+  }
 }
 
 export interface DiscoveredModel {

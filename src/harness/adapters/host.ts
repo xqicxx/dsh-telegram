@@ -5,7 +5,7 @@
  * to path-based flows with the same data.
  */
 import { mkdir, readdir, stat } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, parse, resolve } from "node:path";
 import type { Context } from "@deepseek-ai/cordis";
 import { fail, ok, type AdapterResult } from "./types.js";
 
@@ -30,7 +30,9 @@ function withFsTimeout<T>(promise: Promise<T>): Promise<T> {
 }
 
 export interface HostView {
-  version: string;
+  /** The real host version when the profile exposes one; never a guessed or
+   * bridge-owned number (the bridge version lives in About). */
+  version?: string;
   cwd: string;
   provider?: string;
   model?: string;
@@ -38,7 +40,22 @@ export interface HostView {
   canOpenPath: boolean;
 }
 
-export function describeHost(ctx: Context, activeCwd: string = process.cwd(), version = "0.0.1"): HostView {
+/** Best-effort host version discovery: an explicit `hostInfo` seam first,
+ * then the launcher's DSH_VERSION env. Plugins cannot see the host package
+ * version, so absence is reported as `undefined` instead of a fake number. */
+export function hostVersionOf(ctx: Context, env: NodeJS.ProcessEnv = process.env): string | undefined {
+  const info = ctx.get("hostInfo") as { version?: unknown } | undefined;
+  if (info && typeof info.version === "string" && info.version.trim() !== "") return info.version;
+  const fromEnv = env.DSH_VERSION;
+  if (typeof fromEnv === "string" && fromEnv.trim() !== "") return fromEnv;
+  return undefined;
+}
+
+export function describeHost(
+  ctx: Context,
+  activeCwd: string = process.cwd(),
+  version: string | undefined = hostVersionOf(ctx),
+): HostView {
   // Same source as web host.describe and session.create's fallback: the
   // saved default selection is what the NEXT session will start from.
   const selection = (
@@ -80,6 +97,20 @@ export async function listDirectory(path: string): Promise<AdapterResult & { ent
     }
     return fail(err instanceof Error ? err.message : String(err));
   }
+}
+
+/** Breadcrumb segments for host.listDirectory navigation: root first, then
+ * every ancestor up to and including the path itself. */
+export function breadcrumbSegments(path: string): { label: string; path: string }[] {
+  const abs = resolve(path);
+  const root = parse(abs).root;
+  const segments: { label: string; path: string }[] = [{ label: "/", path: root }];
+  let current = root;
+  for (const part of abs.slice(root.length).split(/[/\\]+/).filter(Boolean)) {
+    current = join(current, part);
+    segments.push({ label: part, path: current });
+  }
+  return segments;
 }
 
 /** True only when the path exists and resolves to a directory. */

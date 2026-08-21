@@ -241,6 +241,9 @@ export interface ProjectActions {
   newFolder?: string;
   quick?: readonly ProjectRow[];
   paging?: readonly { text: string; cb: string }[];
+  /** Breadcrumb segment buttons (host.listDirectory navigation), rendered
+   * right below the Up/Home/Root row. */
+  breadcrumb?: readonly ProjectRow[];
 }
 
 /** Folder picker: nav row (Up/Home/Root) + quick workspace paths, then
@@ -254,6 +257,10 @@ export function buildProjectKeyboard(dirs: readonly ProjectRow[], actions: Proje
   if (actions.root !== undefined) nav.push({ text: "\u{1F5A5}\uFE0F /", cb: actions.root });
   if (nav.length > 0) {
     rows.push(nav.slice(0, 3).map((button) => ({ text: button.text, callback_data: button.cb })));
+  }
+  const breadcrumb = (actions.breadcrumb ?? []).slice(0, 3);
+  if (breadcrumb.length > 0) {
+    rows.push(breadcrumb.map((segment) => ({ text: `\u{1F4C2} ${segment.label.slice(0, 16)}`, callback_data: segment.cb })));
   }
   for (const quick of (actions.quick ?? []).slice(0, 3)) rows.push([{ text: quick.label.slice(0, 40), callback_data: quick.cb }]);
   const seen = new Set<string>();
@@ -474,12 +481,33 @@ export function buildQueueKeyboard(items: readonly QueueRow[]): InlineKeyboard {
   return InlineKeyboard.from(rows);
 }
 
-export function buildModelsKeyboard(groups: readonly { id: string; name: string }[]): InlineKeyboard {
+export function buildModelsKeyboard(groups: readonly { id: string; name: string }[], providersCb?: string): InlineKeyboard {
   const kb = new InlineKeyboard();
   for (const group of groups.slice(0, 20)) {
     kb.text(`\u{1F4E1} ${group.name.slice(0, 30)}`, encodedCallback("mo:", group.id)).row();
   }
+  if (providersCb !== undefined) kb.row().text("\u{1F6F0}\uFE0F Providers", providersCb);
   return kb.row().text("\u{1F50D} Discover models", "m:discover").text("\u2190 Back", "m:back");
+}
+
+/** Standalone Providers view (llm.providers): one row per provider plus back
+ * to the Models card. Tapping a provider opens its model list. */
+export function buildProvidersKeyboard(rows: readonly { label: string; cb: string }[]): InlineKeyboard {
+  const kb = new InlineKeyboard();
+  for (const row of rows.slice(0, 20)) {
+    kb.text(row.label.slice(0, 48), row.cb).row();
+  }
+  return kb.row().text("\u2190 Models", "m:models").text("\u2190 Back", "m:back");
+}
+
+/** New-session preset picker (web session.create's agentPreset): one
+ * full-width default button plus a row per preset. */
+export function buildNewSessionKeyboard(defaultCb: string, presets: readonly { id: string; isDefault: boolean; cb: string }[]): InlineKeyboard {
+  const kb = new InlineKeyboard().text("\u2728 Use default preset", defaultCb);
+  for (const preset of presets.slice(0, 12)) {
+    kb.row().text(`\u{1F3AD} ${preset.isDefault ? "\u2B50 " : ""}${preset.id.slice(0, 32)}`, preset.cb);
+  }
+  return kb.row().text("\u2716 Close", "m:close");
 }
 
 export interface ModelPaging {
@@ -594,8 +622,12 @@ export function buildSettingsKeyboard(namespaces: readonly string[]): InlineKeyb
   return kb.row().text("\u2190 Back", "m:back");
 }
 
-export function buildCredentialsKeyboard(): InlineKeyboard {
-  return new InlineKeyboard().row().text("\u{1F511} Describe ref", "m:cred-describe").text("\u2190 Back", "m:back");
+export function buildCredentialsKeyboard(refs?: readonly { ref: string; cb: string }[]): InlineKeyboard {
+  const kb = new InlineKeyboard();
+  for (const row of (refs ?? []).slice(0, 12)) {
+    kb.text(`\u{1F511} ${row.ref.slice(0, 40)}`, row.cb).row();
+  }
+  return kb.row().text("\u{1F511} Describe ref", "m:cred-describe").text("\u2190 Back", "m:back");
 }
 
 export function buildHostKeyboard(): InlineKeyboard {

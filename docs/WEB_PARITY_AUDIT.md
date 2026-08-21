@@ -192,18 +192,18 @@ Web 端组装文件 `packages/api/remotes/src/client/index.ts` 只 mount 这 24 
       router 入站按 chat FIFO。
 - [x] session.list 按 `lastPromptAt desc` 排序并 10 条/页翻页（无 projection 依赖）。
 - [x] session.history 给 `Load older` 按钮和窗口分页（message 边界分页仍未实现）。
-- [ ] skill.list 传入当前 session 的 `cwd` + scope，并过滤 user-invocable。
-- [ ] llm.providers 展示 `settingsNs/settingsPath/active/declared`；Models 卡提供单独 Providers 视图。
-- [ ] selectModel 暴露 `reasoningEffort`（模型行 → Thinking 选择）。
-- [ ] subagent.list 展示 `mode/label/hasChildren/diagnostic` 和 `parentAvailable`。
-- [ ] subagent.prompt 校验 continuable、补 AbortSignal（按 web 契约）。
-- [ ] credentials.describe 支持批量；Credential 卡把可用 ref 列出来。
-- [ ] host.describe 不写死版本；用真实宿主默认 model/provider seam。
-- [ ] host.listDirectory 在 /ls 之外提供 breadcrumb 逐级按钮（复用 Project 选择器或独立浏览卡）。
-- [ ] settings.describe 按 web 边界过滤 namespace，或至少标记哪些 namespace web 不暴露。
+- [x] skill.list 传入当前 session 的 `cwd` + `scope: "user"`，卡片只显示 user-invocable。
+- [x] llm.providers 展示 `settingsNs/settingsPath/active/declared`；Models 卡新增 Providers 按钮 + 独立 Providers 卡。
+- [x] selectModel 暴露 `reasoningEffort`（模型行 → Thinking 行 → 五档 picker，`model-effort` 回调）。
+- [x] subagent.list 展示 `mode/label/hasChildren/diagnostic` 和 `parentAvailable`（父会话无 live agent 时标 `parent:unavailable`）。
+- [x] subagent.prompt 适配器层校验子代理在目录中且为 continuable（否则 `subagent-prompt-locked`），clientTimeZone + AbortSignal 随 options 传递。
+- [x] credentials.describe 支持批量（≤64、去重）；Credential 卡经可选 `list()` seam 列出可用 ref，点按即 describe。
+- [x] host.describe 不写死版本：`hostVersionOf()` 依次读 `hostInfo` seam 与 `DSH_VERSION`，都没有则显示 unknown；model/provider 走 `agentDefaultModel` seam。
+- [x] host.listDirectory 浏览卡带 breadcrumb：`breadcrumbSegments()` 逐级祖先一键跳转 + Up/Home/Root。
+- [x] settings.describe 过滤 `exposed: false` 的 namespace，并在卡片标注"Outside the web boundary"清单。
 - [x] goal.edit 支持 maxGoalRounds（`/goaledit <objective> [maxRounds]`）。
 - [x] agentPreset.copy 支持回复自定义新 id（`/cancel` 中止）。
-- [ ] downloads 超过 50 MB 时给出 web URL/路径指引，而非只报错。
+- [x] downloads 超过 50 MB 时给出 web UI 路径（Sessions → 会话 → Log）与宿主 `$DSH_HOME/sessions` 路径指引（`oversizeGuidance()`）。
 
 ### P2：让 Telegram 真正“顺手”（体验增强）
 
@@ -298,6 +298,9 @@ Map<chatId, {
 ---
 
 ## 5. 本轮已落地的修复
+
+- [x] P0 `session.create` agentPreset：`✨ New` 改为 preset 选择卡（默认 preset 一键新建 + 逐 preset 选择）；`/new` 命令保留默认 preset 直建。
+- [x] P1 全部 10 项落地（skill.list cwd+scope、Providers 卡、reasoningEffort、subagent parentAvailable + continuable 校验、credentials ref 枚举、host 版本不写死 + breadcrumb、settings web 边界过滤、downloads 超限指引）；测试 357/357 全绿。
 
 - [x] 修复 `subagent.prompt`：原来把 `UserMessage` 对象当作 `ContentBlock[]` 传给
       `ctx.subagents.followup`（会触发 web 契约外的错误）；现改为 `[{ type: 'text', text }]`。
