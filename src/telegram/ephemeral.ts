@@ -80,18 +80,17 @@ export class Ephemeral {
   }
 
   /** Update the current card in place (instant) when possible; otherwise
-   * fall back to a fresh send. Navigation never deletes before sending. */
+   * fall back to a fresh send. Navigation never deletes before sending.
+   * There is deliberately NO text/markup no-op early return: `last` may
+   * point at a message deleted outside this cache, and treating the tap as
+   * a no-op left the button feeling completely dead. Every tap goes through
+   * editText: alive + identical → Telegram's "message is not modified" is
+   * swallowed as success (transport); deleted → edit fails → state clears
+   * and the card is re-sent fresh. */
   replace(chatId: number, ops: ChatOps, text: string, options?: Record<string, unknown>): Promise<number | undefined> {
     return this.serialize(chatId, async () => {
       const current = this.last.get(chatId);
       const markup = JSON.stringify(options?.reply_markup ?? null);
-      // A re-render with identical text AND identical keyboard is a true
-      // no-op. Identical text with a NEW keyboard (fresh callback tokens)
-      // must still edit in place, otherwise repeated taps on the same card
-      // leave stale buttons and look completely dead.
-      if (current !== undefined && this.lastText.get(chatId) === text && this.lastMarkup.get(chatId) === markup) {
-        return current;
-      }
       if (current !== undefined) {
         const edited = await ops.editText(chatId, current, text, options).catch(() => false);
         if (edited) {

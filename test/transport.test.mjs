@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { TelegramTransport, callbackUpdateChatId } from '../dist/telegram/transport.js';
+import { GrammyError } from 'grammy';
 
 function makeTransport() {
   return new TelegramTransport({
@@ -303,4 +304,22 @@ test('handlePhotos batches media groups through onPhotos', async () => {
   assert.equal(batches[0].chatId, 9);
   assert.equal(batches[0].groupId, 'grp');
   assert.deepEqual(batches[0].photos.map((p) => p.fileId), ['a', 'b']);
+});
+
+test('editText treats "message is not modified" as success (#models card dead taps)', async () => {
+  const transport = makeTransport();
+  transport.api.editMessageText = async () => {
+    throw new GrammyError('Bad Request: message is not modified', { error_code: 400, description: 'Bad Request: message is not modified' }, 'editMessageText', {});
+  };
+  assert.equal(await transport.editText(7, 5, 'same content'), true, 'alive message already showing the target content = logical success');
+
+  transport.api.editMessageText = async () => {
+    throw new GrammyError('Bad Request: message to edit not found', { error_code: 400, description: 'Bad Request: message to edit not found' }, 'editMessageText', {});
+  };
+  assert.equal(await transport.editText(7, 5, 'x'), false, 'genuine GrammyErrors stay failures');
+
+  transport.api.editMessageText = async () => {
+    throw new Error('network down');
+  };
+  await assert.rejects(transport.editText(7, 5, 'x'), /network down/, 'non-Grammy errors still propagate');
 });

@@ -445,7 +445,15 @@ export class TelegramTransport {
         return true;
       } catch (err) {
         this.log(`editText FAILED chatId=${chatId} messageId=${messageId} err=${err instanceof Error ? err.message : String(err)}`, err);
-        if (err instanceof GrammyError) return false;
+        if (err instanceof GrammyError) {
+          // "message is not modified" means the message is alive and already
+          // shows the target content — that IS the desired end state, so the
+          // edit logically succeeded. Reporting false here made Ephemeral
+          // drop a perfectly good message id and re-send the card (#models
+          // card taps feeling dead). Every other GrammyError stays a failure.
+          if (/message is not modified/i.test(err.message)) return true;
+          return false;
+        }
         throw err;
       }
     });
