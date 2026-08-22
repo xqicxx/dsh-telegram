@@ -379,6 +379,13 @@ export function createDispatchers(deps: DispatchDeps): {
    * getter so a remount's fresh watcher instance is picked up. */
   const compactionWatcher = deps.compactionWatcher;
 
+  /** Serializes watchtoggle's read-modify-write of the GLOBAL watching flag.
+   * Two concurrent taps both reading `watching === false` used to interleave
+   * transport start/stop (check-then-act race); the flag is bot-global, so
+   * one chain guards it across all chats. Each link strips rejection first,
+   * so a failed toggle never poisons later ones. */
+  let watchToggleChain: Promise<unknown> = Promise.resolve();
+
 
 
 /** The callback/bar reply shape: inline ❌ on failure, HTML parse mode. */
@@ -588,12 +595,19 @@ async function dispatchToken(chatId: number, payload: Record<string, string>): P
       return openGoalsCard(chatId);
     }
     case "goal-clear-confirm": {
-      const goal = agent ? getGoal(requireCtx(), agent.id) : undefined;
-      if (!agent || !goal) {
+      // The confirm token carries the agentId minted when the card rendered
+      // (review orange-5): if the chat rebinds a different session between
+      // the tap and the confirmation, clearing must hit the minted session's
+      // goal, not whatever the chat resolves to now. Fall back to the current
+      // resolution only when the payload carries no id.
+      const mintedId = payload["agentId"] ?? "";
+      const clearAgent = (mintedId !== "" ? requireCtx().agents?.get(mintedId as never) : undefined) ?? agent;
+      const goal = clearAgent ? getGoal(requireCtx(), clearAgent.id) : undefined;
+      if (!clearAgent || !goal) {
         await uiSend(chatId, "\u274C No current goal to clear.", { parse_mode: "HTML" });
         return openGoalsCard(chatId);
       }
-      const res = await clearGoal(requireCtx(), agent.id, goal.id, goal.revision);
+      const res = await clearGoal(requireCtx(), clearAgent.id, goal.id, goal.revision);
       await uiSend(chatId, res.ok ? plain(res.text) : `\u274C ${plain(res.text)}`, { parse_mode: "HTML" });
       refreshAllPanels();
       return openGoalsCard(chatId);
@@ -765,8 +779,12 @@ async function dispatchToken(chatId: number, payload: Record<string, string>): P
       return openSearchCard(chatId, query, Number.isFinite(page) && page > 0 ? page : 0);
     }
     case "history-older": {
-      const beforeSeq = Number(payload["beforeSeq"] ?? "");
-      return openHistoryCard(chatId, payload["sessionId"] ?? "", Number.isFinite(beforeSeq) ? beforeSeq : undefined);
+      // A missing/empty beforeSeq must read as "no cursor": Number("") === 0
+      // would wrongly page from the top of the log. Only a present, finite,
+      // >= 0 value is a valid cursor; anything else reopens page 1.
+      const rawSeq = payload["beforeSeq"];
+      const beforeSeq = rawSeq === undefined || rawSeq === "" ? Number.NaN : Number(rawSeq);
+      return openHistoryCard(chatId, payload["sessionId"] ?? "", Number.isFinite(beforeSeq) && beforeSeq >= 0 ? beforeSeq : undefined);
     }
     case "preset-read": {
       const res = await readAgentPreset(requireCtx(), payload["presetId"] ?? "");
@@ -1284,9 +1302,16 @@ async function dispatchCallback(chatId: number, data: string): Promise<void> {
       if (pendingStartAfterAllow.delete(chatId)) return dispatchCommand(chatId, "start", "");
       return openAllowedCard(chatId);
     }
-    case "watchtoggle":
-      if (state.watching) await stopWatching();
-      else await startWatching();
+    case "watchtoggle": {
+      // Read-modify-write of `state.watching` runs on the shared chain so a
+      // second tap cannot interleave its check between this one's check and
+      // its transport start/stop.
+      const toggle = watchToggleChain.catch(() => {}).then(async () => {
+        if (state.watching) await stopWatching();
+        else await startWatching();
+      });
+      watchToggleChain = toggle;
+      await toggle;
       await uiSend(
         chatId,
         state.watching
@@ -1295,6 +1320,7 @@ async function dispatchCallback(chatId: number, data: string): Promise<void> {
         { parse_mode: "HTML" },
       );
       return openWatchCard(chatId);
+    }
     case "workspaces":
       return actions["workspaces"](actionCtx);
     case "goals":

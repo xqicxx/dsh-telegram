@@ -9,6 +9,7 @@ import { readdirSync } from "node:fs";
 import { join } from "node:path";
 import type { Context } from "@deepseek-ai/cordis";
 import { fail, ok, type AdapterResult } from "./types.js";
+import { dshHome } from "./mode.js";
 
 export const TELEGRAM_DOCUMENT_LIMIT_BYTES = 50 * 1024 * 1024;
 /** The ZIP is capped at 50 MB, so 120s is generous even on slow links; a
@@ -24,15 +25,29 @@ interface ExportDepsLike {
 
 type StreamZip = (deps: ExportDepsLike, root: unknown, sessionId: string, includeDescendants: boolean, level: number, signal: AbortSignal) => ReadableStream<Uint8Array>;
 
-async function loadExportSeam(): Promise<{ streamSessionLogZip: StreamZip; sessionLogExportDeps(ctx: Context): ExportDepsLike; flushLiveSessionLog(deps: ExportDepsLike, id: string, signal: AbortSignal): Promise<void> } | undefined> {
+interface ExportSeam {
+  streamSessionLogZip: StreamZip;
+  sessionLogExportDeps(ctx: Context): ExportDepsLike;
+  flushLiveSessionLog(deps: ExportDepsLike, id: string, signal: AbortSignal): Promise<void>;
+}
+
+/** Blue-7: one probe costs readdirSync + require.resolve + a dynamic import.
+ * The resolution promise is cached at module level so every export after the
+ * first — including concurrent calls and permanent misses (negative cache;
+ * profile dependencies do not appear mid-process) — reuses that single
+ * result instead of re-walking the filesystem on each /sessionlog. */
+let exportSeamPromise: Promise<ExportSeam | undefined> | undefined;
+
+async function probeExportSeam(): Promise<ExportSeam | undefined> {
   // The web session-export seam lives inside `@deepseek-ai/dsh-host-apiproxy`,
   // which is a PROFILE dependency, not a dependency of this plugin. Resolve it
-  // from plausible profile roots (workspace cwd, DSH_HOME, each profile dir)
+  // from plausible profile roots (workspace cwd, DSH_HOME or the ~/.dsh
+  // default — same fallback as mode.ts dshHome(), each profile dir)
   // instead of only this plugin's node_modules.
   const bases = new Set<string>([process.cwd()]);
-  const home = process.env.DSH_HOME;
-  if (home !== undefined && home !== "") bases.add(home);
-  if (home !== undefined) {
+  const home = dshHome();
+  if (home !== "") {
+    bases.add(home);
     try {
       for (const entry of readdirSync(join(home, "profiles"))) {
         bases.add(join(home, "profiles", entry));
@@ -46,17 +61,20 @@ async function loadExportSeam(): Promise<{ streamSessionLogZip: StreamZip; sessi
       const require = createRequire(join(base, "noop.js"));
       const pkg = require.resolve("@deepseek-ai/dsh-host-apiproxy/package.json");
       const moduleUrl = pathToFileURL(pkg.replace(/package\.json$/, "lib/types/session-export.js")).href;
-      const seam = (await import(moduleUrl)) as {
-        streamSessionLogZip: StreamZip;
-        sessionLogExportDeps(ctx: Context): ExportDepsLike;
-        flushLiveSessionLog(deps: ExportDepsLike, id: string, signal: AbortSignal): Promise<void>;
-      };
+      const seam = (await import(moduleUrl)) as ExportSeam;
       if (typeof seam.streamSessionLogZip === "function") return seam;
     } catch {
       /* try the next profile root */
     }
   }
   return undefined;
+}
+
+function loadExportSeam(): Promise<ExportSeam | undefined> {
+  if (exportSeamPromise === undefined) {
+    exportSeamPromise = probeExportSeam().catch(() => undefined);
+  }
+  return exportSeamPromise;
 }
 
 /** Oversize guidance: the web URL path and the host-side location, so a

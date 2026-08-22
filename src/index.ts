@@ -170,6 +170,8 @@ function teardownMount(): void {
   todoCardTimers.clear();
   for (const timer of state.barTimers.values()) clearTimeout(timer);
   state.barTimers.clear();
+  // A pending coalesced panel refresh must not fire after teardown.
+  cancelScheduledPanelRefresh();
   state.lastSessionsProject.clear();
   state.barCollapsed.clear();
   state.barCounts.clear();
@@ -904,7 +906,44 @@ function notifyTodoChange(chatId: number, previous: readonly TodoView[], next: r
   void uiSend(chatId, lines.join("\n"), { parse_mode: "HTML" });
 }
 
+/** Blue-1 refresh-storm guard: bridge.notifyStateChange fires on every
+ * tool/call, tool/result, step/start, step/end, assistant/message and
+ * turn/start event, and each notification used to pay a full renderStatus +
+ * editMessage sweep over every chat. Event-driven callers enter through
+ * schedulePanelRefresh, which coalesces a burst into one dirty flag and
+ * renders once at the trailing edge — so the LAST state change always lands
+ * on the panels. User-initiated seams (dispatchers, extension host, config
+ * apply, extension hot-plug) keep calling refreshAllPanels directly, which
+ * doubles as the immediate flush: it renders now and cancels the pending
+ * trailing edge so one action never pays two sweeps. The subagent-count
+ * latch inside refreshAllPanels and StatusPanel's same-text skip are
+ * untouched; only WHEN panels render changes, never WHAT. */
+const PANEL_REFRESH_DEBOUNCE_MS = 400;
+let panelsRefreshDirty = false;
+let panelsRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+
+function schedulePanelRefresh(): void {
+  panelsRefreshDirty = true;
+  if (panelsRefreshTimer !== undefined) return;
+  panelsRefreshTimer = setTimeout(() => {
+    panelsRefreshTimer = undefined;
+    if (!panelsRefreshDirty) return;
+    panelsRefreshDirty = false;
+    refreshAllPanels();
+  }, PANEL_REFRESH_DEBOUNCE_MS);
+}
+
+/** Cancel a coalesced refresh that a direct render just made redundant. */
+function cancelScheduledPanelRefresh(): void {
+  panelsRefreshDirty = false;
+  if (panelsRefreshTimer !== undefined) {
+    clearTimeout(panelsRefreshTimer);
+    panelsRefreshTimer = undefined;
+  }
+}
+
 function refreshAllPanels(): void {
+  cancelScheduledPanelRefresh();
   if (!state.transport) return;
   const transport = state.transport;
   // Share one subagent-count refresh across event bursts; the panel rerender
@@ -1065,7 +1104,9 @@ async function mountTransport(ctx: Context): Promise<void> {
     ctx,
     transport: state.transport,
     getConfig: () => state.config,
-    onStateChange: refreshAllPanels,
+    // Blue-1: the bridge notifies on every streaming event; coalesce bursts
+    // behind the debounce instead of sweeping all panels per event.
+    onStateChange: schedulePanelRefresh,
     onTurnRunning: setTurnRunning,
     log,
   });
@@ -1127,7 +1168,9 @@ async function mountTransport(ctx: Context): Promise<void> {
     todoSnapshots,
     statusSubagentCounts,
     refreshActiveCards,
-    refreshAllPanels,
+    // Blue-1: forwarded/host refresh events ride the same coalescing window
+    // as bridge notifications (trailing edge still renders the final state).
+    refreshAllPanels: schedulePanelRefresh,
     scheduleBarSync,
     notifyTodoChange,
   }));
