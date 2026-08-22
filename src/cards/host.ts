@@ -54,7 +54,7 @@ export function createHostCards(deps: HostCardsDeps): {
     const lines = [`\u2699\uFE0F Host settings \u00B7 writable: ${writable} \u00B7 document: ${hasDocument ? plain(truncate(documentPath ?? "yes", 48)) : "none"}`, ""];
     for (const ns of namespaces.slice(0, 15)) {
       const secrets = ns.secrets.filter((secret) => secret.set).length;
-      lines.push(`\u2022 ${plain(truncate(ns.ns, 36))} \u00B7 applies: ${ns.applies} \u00B7 rev ${ns.revision} \u00B7 secrets set: ${secrets}`);
+      lines.push(`\u2022 ${plain(truncate(ns.ns, 36))} \u00B7 applies: ${plain(ns.applies)} \u00B7 rev ${ns.revision} \u00B7 secrets set: ${secrets}`);
     }
     if (namespaces.length === 0) lines.push("No settings namespaces registered.");
     if (internalNamespaces.length > 0) {
@@ -71,14 +71,14 @@ export function createHostCards(deps: HostCardsDeps): {
     const lines = [
       `\u2699\uFE0F ${plain(truncate(ns, 40))}`,
       "",
-      `applies: ${view.applies} \u00B7 revision: ${view.revision}`,
+      `applies: ${plain(view.applies)} \u00B7 revision: ${view.revision}`,
       view.schema !== undefined ? `schema: ${plain(truncate(JSON.stringify(view.schema), 300))}` : "schema: (not declared)",
       // RF-3: the settings contract types value as unknown (undefined allowed);
       // JSON.stringify(undefined) returns undefined and truncate would crash
       // reading .length, so render null like every other JSON line.
       `value: ${plain(truncate(JSON.stringify(view.value ?? null), 300))}`,
       view.user !== undefined ? `user: ${plain(truncate(JSON.stringify(view.user), 200))}` : "",
-      `secrets: ${view.secrets.map((secret) => `${secret.path.join(".")}=${secret.set ? "set" : "unset"}`).join(", ") || "none"}`,
+      `secrets: ${view.secrets.map((secret) => `${plain(secret.path.join("."))}=${secret.set ? "set" : "unset"}`).join(", ") || "none"}`,
     ].filter((line) => line !== "");
     await openCard(chatId, lines.join("\n"), buildSettingsKeyboard([ns]));
   }

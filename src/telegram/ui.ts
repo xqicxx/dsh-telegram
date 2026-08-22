@@ -54,10 +54,20 @@ export function strike(value: string): string {
  * Bot API date-time entity rendering a client-localized RELATIVE time
  * ("3 minutes ago", localized on the user's phone). The escaped fallback
  * keeps older clients / notifications readable.
+ *
+ * Host seams occasionally deliver a timestamp that violates the number
+ * contract despite the adapter types — session event `at` folds are blind-cast
+ * (`event.at ?? event.data?.createdAt as number`) and workspace registry rows
+ * pass through unvalidated. A NaN/undefined-coerced/non-positive value would
+ * render `<tg-time unix="NaN">`, which Telegram's entity parser rejects with
+ * an HTTP 400 that kills the whole card, so garbage degrades here to the
+ * escaped fallback text WITHOUT the tg-time wrapper.
  */
 export function relTime(atMs: number, fallback?: string): string {
-  const unix = Math.floor(atMs / 1000);
-  const shown = fallback ?? new Date(atMs).toLocaleString();
+  const at = Number(atMs);
+  const unix = Math.floor(at / 1000);
+  if (!Number.isFinite(unix) || unix <= 0) return escapeHtml(fallback ?? "\u2014");
+  const shown = fallback ?? new Date(at).toLocaleString();
   return `<tg-time unix="${unix}" format="r">${escapeHtml(shown)}</tg-time>`;
 }
 

@@ -113,8 +113,8 @@ export function createWorkspaceCards(deps: WorkspaceCardsDeps): {
         `sessions ${workspace.sessionIds.length}`,
         workspace.sessionIds.length > 0 ? mono(workspace.sessionIds.slice(0, 6).map((id) => truncate(id, 16)).join(",")) + (workspace.sessionIds.length > 6 ? "\u2026" : "") : undefined,
       ),
-      workspace.createdAt !== undefined ? `created ${relTime(workspace.createdAt)}` : "",
-      workspace.updatedAt !== undefined ? `updated ${relTime(workspace.updatedAt)}` : "",
+      workspace.createdAt !== undefined ? `created ${relTime(workspace.createdAt, "unknown")}` : "",
+      workspace.updatedAt !== undefined ? `updated ${relTime(workspace.updatedAt, "unknown")}` : "",
     ].filter((line) => line !== "");
     await openCard(chatId, lines.join("\n"), buildWorkspaceDetailKeyboard(workspaceId, {
       use: token({ action: "workspace-use", workspaceId }),

@@ -122,7 +122,10 @@ export function createSessionCards(deps: SessionCardsDeps): {
       const state_ = session.running ? " \u25B6\uFE0F" : session.live ? "" : " \u00B7 cold";
       lines.push(`${marker} ${bold(truncate(title, 32))}${state_}`);
       if (session.lastPromptAt !== undefined) {
-        lines.push(`   ${metaJoin(`\u23F1\uFE0F ${relTime(session.lastPromptAt)}`, hasTitle ? mono(truncate(session.id, 14)) : undefined)}`);
+        // session-read's scanMeta blind-casts `event.at ?? data.createdAt` to
+        // number, so a string/missing ts can reach this card despite the type;
+        // the fallback keeps the line text-only instead of a broken tg-time.
+        lines.push(`   ${metaJoin(`\u23F1\uFE0F ${relTime(session.lastPromptAt, "unknown")}`, hasTitle ? mono(truncate(session.id, 14)) : undefined)}`);
       } else if (hasTitle) {
         lines.push(`   ${mono(truncate(session.id, 14))}`);
       }
@@ -201,7 +204,7 @@ export function createSessionCards(deps: SessionCardsDeps): {
       "",
       metaJoin(...statusWords),
       metaJoin(`events ${session.eventCount}`, session.cwd ? `cwd ${mono(truncate(session.cwd, 28))}` : undefined),
-      session.lastPromptAt !== undefined ? `\u23F1\uFE0F last prompt ${relTime(session.lastPromptAt)}` : "",
+      session.lastPromptAt !== undefined ? `\u23F1\uFE0F last prompt ${relTime(session.lastPromptAt, "unknown")}` : "",
     ].filter((line) => line !== "");
     await openCard(chatId, lines.join("\n"), buildSessionDetailKeyboard(session.id, session.archived, token({ action: "sessions-open" })));
   }
