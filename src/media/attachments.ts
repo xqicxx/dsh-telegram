@@ -182,7 +182,14 @@ export function makeAttachmentHandlers(deps: AttachmentHandlersDeps): {
     for (const photo of downloads) {
       const saved = await saveImageAttachment(requireCtx(), photo.data!, "image/jpeg", `telegram-${photo.fileId}.jpg`);
       if (!saved.ok || !saved.attachment) {
-        await uiSend(chatId, `\u274C ${plain(saved.text)}`, { parse_mode: "HTML" });
+        // Partial batch (B14): nothing was delivered, and the durable
+        // attachment store is append-only — no delete seam exists to free
+        // already-committed bytes. Release what CAN be released: surface the
+        // surviving refs to the user so they stay reachable through
+        // /attachment instead of stranding silent, unreachable orphans.
+        const savedIds = attachments.map((entry) => entry.attachmentId);
+        const suffix = savedIds.length > 0 ? `\n\u{1F5BC} Already saved (${savedIds.length}): /attachment ${plain(savedIds.join(" "))}` : "";
+        await uiSend(chatId, `\u274C ${plain(saved.text)}${suffix}`, { parse_mode: "HTML" });
         return;
       }
       attachments.push(saved.attachment);

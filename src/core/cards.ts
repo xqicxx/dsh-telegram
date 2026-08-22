@@ -68,9 +68,34 @@ export function createCardRegistry(deps: CardRegistryDeps): {
    * card with a visible message instead of wedging the chat's UI lane forever. */
   const CARD_LOAD_TIMEOUT_MS = 10_000;
 
+  /** One shared underlying load per chat+label: after a caller's visible
+   * deadline fires, the real loader keeps running — a retry used to start a
+   * SECOND copy of the same work while the first finished unseen. Callers now
+   * join the single in-flight promise (each with their own deadline), and a
+   * late settlement after every caller timed out merely clears the entry. */
+  const inFlightCardLoads = new Map<string, Promise<unknown>>();
+
   async function cardLoad<T>(chatId: number, label: string, load: () => Promise<T>): Promise<T | undefined> {
+    const key = `${chatId}\u0000${label}`;
+    let underlying = inFlightCardLoads.get(key);
+    if (underlying === undefined) {
+      underlying = Promise.resolve().then(load);
+      inFlightCardLoads.set(key, underlying);
+      // Forget the entry once it settles; both callbacks subscribe to the
+      // rejection, so a loser that finishes after all callers timed out is
+      // observed and dropped instead of surfacing as an unhandled rejection.
+      const settled = underlying;
+      void settled.then(
+        () => {
+          if (inFlightCardLoads.get(key) === settled) inFlightCardLoads.delete(key);
+        },
+        () => {
+          if (inFlightCardLoads.get(key) === settled) inFlightCardLoads.delete(key);
+        },
+      );
+    }
     try {
-      return await withTimeout(Promise.resolve().then(load), CARD_LOAD_TIMEOUT_MS, label);
+      return await withTimeout(underlying as Promise<T>, CARD_LOAD_TIMEOUT_MS, label);
     } catch (err) {
       log(`${label} load failed`, err instanceof Error ? `${err.message}\n${err.stack ?? ""}` : String(err));
       await uiSend(chatId, `\u274C ${label} \u52A0\u8F7D\u5931\u8D25\uFF1A${plain(truncate(err instanceof Error ? err.message : String(err), 120))}`, { parse_mode: "HTML" });

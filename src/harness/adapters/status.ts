@@ -50,6 +50,13 @@ interface EventScanCache {
    * the append-only `agent-preset/selected` tail scan (#22). */
   headerPreset?: string;
 }
+/**
+ * Keyed by the EVENTS ARRAY object, not the agent: a compaction/reset can
+ * swap in a fresh array with the SAME length, which a length-only check would
+ * silently accept as "nothing appended" and keep serving the stale fold.
+ * Identity keying makes any replaced array miss the cache and force one full
+ * re-scan; scannedEnd still short-circuits pure appends on the same array.
+ */
 const eventScanCache = new WeakMap<object, EventScanCache>();
 
 /** Increment the bound session's tool-call counter (called from the bridge). */
@@ -222,13 +229,13 @@ function eventStatsFor(agent: unknown): StatusStats | undefined {
   const source = agent as SessionEventsSource | undefined;
   const events = source?.session?.events;
   if (!events) return undefined;
-  const key = agent as object;
-  const cached = eventScanCache.get(key);
+  const cached = eventScanCache.get(events);
   const end = events.length - 1;
   if (cached !== undefined && cached.scannedEnd === end) return cached.stats;
 
-  // Append-only fast path: fold only the newly appended tail. A shrunk array
-  // (compaction/reset) falls through to a full rescan.
+  // Append-only fast path: fold only the newly appended tail. A replaced or
+  // shrunk array (compaction/reset) misses the identity-keyed cache and falls
+  // through to a full rescan.
   let stats: StatusStats | undefined;
   let start = 0;
   const fullRescan = cached === undefined || cached.scannedEnd >= end;
@@ -246,7 +253,7 @@ function eventStatsFor(agent: unknown): StatusStats | undefined {
   // incremental path can always reuse its cached header preset.
   const headerPreset = fullRescan ? sessionHeaderPreset(source) : cached!.headerPreset;
   const preset = latestPreset(source, cached?.preset, cached?.scannedEnd) ?? headerPreset;
-  eventScanCache.set(key, { scannedEnd: end, stats: result, preset, headerPreset });
+  eventScanCache.set(events, { scannedEnd: end, stats: result, preset, headerPreset });
   return result;
 }
 
@@ -302,9 +309,11 @@ export function statusSnapshot(ctx: Context, preferAgentId?: string, fallbackToF
   const hasStats = eventStats !== undefined || projected !== undefined || usage !== undefined || toolCalls > 0;
   const selection = agentId === undefined ? {} : currentSessionModel(ctx, String(agentId));
   // eventStatsFor above populates the shared scan cache (preset tail cache +
-  // session-header fallback) for the same agent, so this is O(1) after the
-  // first scan; the direct call only covers agents without event logs.
-  const cachedScan = eventScanCache.get(agent as object);
+  // session-header fallback) for the same agent's event array, so this is
+  // O(1) after the first scan; the direct call only covers agents without
+  // event logs. The cache is keyed by the events array itself (see above).
+  const scanEvents = (agent as SessionEventsSource | undefined)?.session?.events;
+  const cachedScan = scanEvents === undefined ? undefined : eventScanCache.get(scanEvents);
   const preset = cachedScan?.preset ?? cachedScan?.headerPreset ?? (cachedScan === undefined ? sessionHeaderPreset(agent as SessionEventsSource | undefined) : undefined);
   const presetText = preset === undefined ? undefined : String(preset);
   return {

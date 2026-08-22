@@ -81,6 +81,16 @@ test('listTodos rescans when the event array shrank', () => {
   assert.deepEqual(listTodos(ctx, 'a'), [todo('first', 'completed')]);
 });
 
+test('listTodos rescans when the events array is replaced at the same length', () => {
+  // Compaction/reset can swap in a fresh array with the SAME length; a
+  // length-only cache check would serve the stale snapshot forever.
+  const agent = { session: { events: [{ type: 'todo/write', data: { todos: [todo('stale', 'pending')] } }] } };
+  const ctx = { agents: { get: () => agent } };
+  assert.deepEqual(listTodos(ctx, 'a'), [todo('stale', 'pending')]);
+  agent.session.events = [{ type: 'todo/write', data: { todos: [todo('fresh', 'in_progress')] } }];
+  assert.deepEqual(listTodos(ctx, 'a'), [todo('fresh', 'in_progress')]);
+});
+
 test('normalizeTodos coerces malformed entries into display-safe views', () => {
   assert.deepEqual(normalizeTodos([
     { content: 'ok', status: 'completed' },

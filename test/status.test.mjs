@@ -113,6 +113,27 @@ test('event stats scan incrementally instead of re-walking the whole log (#20)',
   assert.equal(elementReads, readsAfterFirst + 2, 'append walks only the newly appended tail');
 });
 
+test('event stats rescan when the events array is replaced at the same length', async () => {
+  const { statusSnapshot } = await import('../dist/harness/adapters/status.js');
+  const agent = {
+    id: 'swap',
+    status: 'running',
+    options: { provider: 'opencode-go', model: 'deepseek-v4-flash' },
+    session: {
+      events: [{ type: 'turn/start', data: {} }, { type: 'step/start', data: {} }],
+      header: {},
+    },
+    inbox: { nextTurn: [], nextStep: [] },
+  };
+  const ctx = { agents: { list: () => [agent], get: () => agent }, get: () => ({ list: () => [] }) };
+  assert.equal(statusSnapshot(ctx).stats.turns, 1);
+
+  // Compaction/reset can swap in a FRESH array with the SAME length; a
+  // length-only cache keyed by the agent would keep serving the stale fold.
+  agent.session.events = [{ type: 'turn/start', data: {} }, { type: 'turn/start', data: {} }];
+  assert.equal(statusSnapshot(ctx).stats.turns, 2);
+});
+
 test('renderStatsStrip mirrors the web stats line verbatim', async () => {
   const { renderStatsStrip } = await import('../dist/index.js');
   const strip = renderStatsStrip({

@@ -4,7 +4,7 @@
  */
 import type { Context } from "@deepseek-ai/cordis";
 import { SessionId } from "@deepseek-ai/dsh-session";
-import { forkSession, resumeSession } from "./sessions.js";
+import { deleteSession, forkSession, resumeSession } from "./sessions.js";
 import { fail, ok, type AdapterResult } from "./types.js";
 
 export interface AgentPresetEntry {
@@ -69,12 +69,19 @@ export function selectAgentPreset(ctx: Context, sessionId: string, presetId: str
   if (!presets) return Promise.resolve(fail("this profile composes no agent presets"));
   const agent = ctx.agents?.get(SessionId(sessionId));
   if (!agent) return Promise.resolve(fail(`session ${sessionId} has no live agent`));
-  const events = ((agent as unknown as { session: { events: readonly { type: string }[] } }).session).events;
+  const events = (agent as unknown as { session?: { events?: readonly { type: string }[] } }).session?.events;
+  // A malformed live agent (no readable event log) must fail like every
+  // sibling adapter instead of throwing synchronously out of the boundary.
+  if (!Array.isArray(events)) {
+    return Promise.resolve(fail(`session ${sessionId} exposes no readable event log \u2014 cannot verify it is blank`));
+  }
   if (events.some((event) => event.type === "turn/start")) {
     return Promise.resolve(fail("agent-preset-locked: presets can only be selected while the session is blank"));
   }
-  return presets
-    .recompose((agent as unknown as { ctx: Context }).ctx, presetId)
+  // Invoked lazily so even a synchronous throw from a malformed seam lands
+  // in the catch below as a clean AdapterResult failure.
+  return Promise.resolve()
+    .then(() => presets.recompose((agent as unknown as { ctx: Context }).ctx, presetId))
     .then((installed) => {
       const preset = installed as { id: string };
       // Recorded only after the swap committed: the log states what the
@@ -126,12 +133,25 @@ export async function switchAgentPresetMidSession(
   if (boundary === undefined) return fail("the current turn has not finished — wait for it to end, then switch again");
   const fork = forkSession(ctx, sourceSessionId, boundary);
   if (!fork.ok || fork.childId === undefined) return fail(fork.text);
+  const childId = fork.childId;
+  // From here on, a failed switch must not strand the freshly forked child:
+  // nobody re-binds a chat to it, so its durable record would linger forever
+  // as an orphan session. Rollback is best-effort (dispose + record removal)
+  // and never replaces the original failure as the reported outcome.
+  const discardOrphanFork = async (): Promise<void> => {
+    try {
+      await deleteSession(ctx, childId);
+    } catch {
+      /* rollback is best-effort */
+    }
+  };
   // Inherit the SOURCE session's provider/model explicitly: letting the
   // resume fall back to "the only/first live agent" could pick another
   // chat's model in multi-chat rosters (🟠-17).
-  const resumed = await resumeSession(ctx, fork.childId, sourceSessionId);
+  const resumed = await resumeSession(ctx, childId, sourceSessionId);
   if (!resumed.ok || resumed.agentId === undefined) {
-    return fail(`forked to ${fork.childId}, but resuming it failed: ${resumed.text}`);
+    await discardOrphanFork();
+    return fail(`forked to ${childId}, but resuming it failed: ${resumed.text}`);
   }
   const disposeHandle = (handle: unknown) => {
     const candidate = handle as { dispose?: () => unknown } | undefined;
@@ -144,6 +164,7 @@ export async function switchAgentPresetMidSession(
   const child = ctx.agents?.get(SessionId(resumed.agentId));
   if (!child) {
     disposeHandle(resumed.handle);
+    await discardOrphanFork();
     return fail(`forked agent ${resumed.agentId} is not live after resume`);
   }
   try {
@@ -153,6 +174,7 @@ export async function switchAgentPresetMidSession(
     });
   } catch (err) {
     disposeHandle(resumed.handle);
+    await discardOrphanFork();
     return fail(err instanceof Error ? err.message : String(err));
   }
   return {

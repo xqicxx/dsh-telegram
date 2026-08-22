@@ -1,5 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { copyAgentPreset, listAgentPresets, selectAgentPreset, sessionHasStarted, switchAgentPresetMidSession } from '../dist/harness/adapters/presets.js';
 
 function key(id) {
@@ -48,6 +51,25 @@ test('selectAgentPreset propagates recompose errors', async () => {
   const res = await selectAgentPreset(ctx, 's1', 'preset-a');
   assert.equal(res.ok, false);
   assert.ok(res.text.includes('boom'));
+});
+
+test('selectAgentPreset converts a synchronous recompose throw into a clean failure', async () => {
+  const { ctx } = fakeCtx({ recomposeImpl: () => { throw new Error('sync boom'); } });
+  const res = await selectAgentPreset(ctx, 's1', 'preset-a');
+  assert.equal(res.ok, false);
+  assert.ok(res.text.includes('sync boom'));
+});
+
+test('selectAgentPreset fails cleanly on a malformed live agent', async () => {
+  // A missing/non-array event log used to throw a synchronous TypeError out
+  // of the adapter boundary instead of returning an AdapterResult.
+  const malformed = [{}, { session: {} }, { session: { events: 'nope' } }];
+  for (const agent of malformed) {
+    const ctx = { agents: { get: () => agent }, get: () => ({ recompose: async () => ({ id: 'preset-a' }) }) };
+    const res = await selectAgentPreset(ctx, 's1', 'preset-a');
+    assert.equal(res.ok, false);
+    assert.match(res.text, /event log/);
+  }
 });
 
 test('sessionHasStarted mirrors the web sessionBlank inverse', () => {
@@ -190,6 +212,94 @@ test('mid-session switch disposes the resumed fork when recompose fails', async 
   assert.ok(res.text.includes('preset conflict'));
   assert.equal(disposed, 1);
   assert.equal(calls.fork.length, 1);
+});
+
+// The fork child exists only for the mid-session switch: a failure after the
+// fork must roll it back instead of stranding an orphan session record.
+function seedOrphanHome(childId) {
+  const base = mkdtempSync(join(tmpdir(), 'dsh-presets-'));
+  const orphanDir = join(base, 'sessions', 'proj', childId);
+  mkdirSync(orphanDir, { recursive: true });
+  writeFileSync(join(orphanDir, 'events.jsonl'), '{}\n');
+  return { base, orphanDir };
+}
+
+test('mid-session switch deletes the orphan fork record when resuming fails', async () => {
+  const { ctx } = midSessionCtx({
+    sourceEvents: [
+      { seq: 0, type: 'user/message' },
+      { seq: 1, type: 'turn/start' },
+      { seq: 2, type: 'turn/end' },
+    ],
+  });
+  const originalGet = ctx.get;
+  ctx.get = (name) => {
+    if (name === 'sessions') {
+      const store = originalGet('sessions');
+      return {
+        get: store.get,
+        // Deterministic child id so the durable rollback is observable.
+        fork: () => ({ id: 'telegram-orphan-child', events: [] }),
+      };
+    }
+    return originalGet(name);
+  };
+  ctx.agents.resume = async () => { throw new Error('resume boom'); };
+  const { base, orphanDir } = seedOrphanHome('telegram-orphan-child');
+  const oldHome = process.env.DSH_HOME;
+  process.env.DSH_HOME = base;
+  try {
+    const res = await switchAgentPresetMidSession(ctx, 'source-session', 'preset-b');
+    assert.equal(res.ok, false);
+    assert.ok(res.text.includes('resume boom'), res.text);
+    assert.equal(existsSync(orphanDir), false, 'orphan fork session record was rolled back');
+  } finally {
+    if (oldHome === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = oldHome;
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test('mid-session switch deletes the orphan fork record when recompose fails', async () => {
+  const { ctx } = midSessionCtx({
+    sourceEvents: [
+      { seq: 0, type: 'user/message' },
+      { seq: 1, type: 'turn/start' },
+      { seq: 2, type: 'turn/end' },
+    ],
+  });
+  const originalGet = ctx.get;
+  let disposed = 0;
+  const originalResume = ctx.agents.resume;
+  ctx.agents.resume = async (options) => {
+    const resumed = await originalResume(options);
+    return { ...resumed, dispose: async () => { disposed += 1; } };
+  };
+  ctx.get = (name) => {
+    if (name === 'sessions') {
+      const store = originalGet('sessions');
+      return {
+        get: store.get,
+        fork: () => ({ id: 'telegram-orphan-child', events: [] }),
+      };
+    }
+    if (name === 'agentPresets') return { recompose: async () => { throw new Error('preset conflict'); } };
+    return undefined;
+  };
+  const { base, orphanDir } = seedOrphanHome('telegram-orphan-child');
+  const oldHome = process.env.DSH_HOME;
+  process.env.DSH_HOME = base;
+  try {
+    const res = await switchAgentPresetMidSession(ctx, 'source-session', 'preset-b');
+    assert.equal(res.ok, false);
+    assert.ok(res.text.includes('preset conflict'));
+    assert.equal(disposed, 1, 'the live fork agent handle is disposed');
+    assert.equal(existsSync(orphanDir), false, 'orphan fork session record was rolled back');
+  } finally {
+    if (oldHome === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = oldHome;
+    rmSync(base, { recursive: true, force: true });
+  }
 });
 
 

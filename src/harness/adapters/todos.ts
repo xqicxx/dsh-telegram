@@ -36,6 +36,12 @@ export function normalizeTodos(todos: readonly TodoView[]): TodoView[] {
  * re-scan the whole array for every bar sync / 5-second card refresh. The
  * first call scans once and records the scanned end index; later calls only
  * inspect newly appended events.
+ *
+ * Keyed by the EVENTS ARRAY object itself, not the agent: a compaction/reset
+ * can swap in a fresh array with the SAME length, which a length-only check
+ * would silently accept as "nothing appended" and serve stale todos. With
+ * identity keying any replaced array misses the cache and forces one full
+ * re-scan; scannedEnd still short-circuits pure appends on the same array.
  */
 const todoListCache = new WeakMap<object, { scannedEnd: number; todos: TodoView[] }>();
 
@@ -47,7 +53,7 @@ export function listTodos(ctx: Context, agentId: string): TodoView[] {
   const events = agent?.session?.events;
   if (!events) return [];
   const end = events.length - 1;
-  const cached = todoListCache.get(agent as object);
+  const cached = todoListCache.get(events);
   if (cached !== undefined && cached.scannedEnd === end) return cached.todos;
 
   if (cached !== undefined && cached.scannedEnd < end) {
@@ -56,24 +62,25 @@ export function listTodos(ctx: Context, agentId: string): TodoView[] {
       const event = events[index];
       if (event?.type === "todo/write" && Array.isArray(event.data?.todos)) {
         const todos = normalizeTodos(event.data.todos);
-        todoListCache.set(agent as object, { scannedEnd: end, todos });
+        todoListCache.set(events, { scannedEnd: end, todos });
         return todos;
       }
     }
     return cached.todos;
   }
 
-  // First scan, or the events array shrank (compaction/reset): walk the
-  // whole array once and cache the result, including the empty result.
+  // First scan on this array, or the events array was REPLACED at any length
+  // (compaction/reset): walk the whole array once and cache the result,
+  // including the empty result.
   for (let index = end; index >= 0; index -= 1) {
     const event = events[index];
     if (event?.type === "todo/write" && Array.isArray(event.data?.todos)) {
       const todos = normalizeTodos(event.data.todos);
-      todoListCache.set(agent as object, { scannedEnd: end, todos });
+      todoListCache.set(events, { scannedEnd: end, todos });
       return todos;
     }
   }
-  todoListCache.set(agent as object, { scannedEnd: end, todos: [] });
+  todoListCache.set(events, { scannedEnd: end, todos: [] });
   return [];
 }
 

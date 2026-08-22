@@ -1074,10 +1074,12 @@ async function syncBar(chatId: number): Promise<void> {
   if (!t) return;
   const count = currentQueueCount(chatId);
   const todoCount = currentTodoCount(chatId);
-  log(`bar sync chatId=${chatId} count=${count} todo=${todoCount} last=${state.barCounts.get(chatId)}`);
   // A collapsed bar stays gone until explicitly restored.
   if (state.barCollapsed.get(chatId) === true) return;
   if (count === state.barCounts.get(chatId) && todoCount === state.barTodoCounts.get(chatId)) return;
+  // Logged only for real swaps — the no-change path used to emit one line
+  // per chat every debounce tick (🔵-12b).
+  log(`bar sync chatId=${chatId} count=${count} todo=${todoCount} last=${state.barCounts.get(chatId)}`);
   state.barCounts.set(chatId, count);
   state.barTodoCounts.set(chatId, todoCount);
   await replaceBarCarrier(chatId, t, count);
