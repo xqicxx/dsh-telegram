@@ -96,3 +96,23 @@ test('a throwing settings service degrades probing to a no-op and the next probe
   assert.equal(await ensureOpencodeGoResponsesRoute(ctx, (message) => logs.push(message)), true);
   assert.equal(writes.length, 1, 'the retried probe performs the provisioning write');
 });
+
+test('a malformed opencode-go settings value skips cleanly instead of throwing (RG-2)', async () => {
+  const makeCtx = (goRouteValue) => ({
+    get: (name) => {
+      if (name === 'llm') return { listProviders: () => [{ id: 'opencode-go' }] };
+      if (name === 'settings') {
+        return {
+          writable: true,
+          describe: () => [{ ns: 'llm-pi-ai', revision: 1, value: { providers: { 'opencode-go': goRouteValue } } }],
+        };
+      }
+      return undefined;
+    },
+  });
+  for (const malformed of [null, 42, 'yes']) {
+    const logs = [];
+    assert.equal(await ensureOpencodeGoResponsesRoute(makeCtx(malformed), (message) => logs.push(message)), false);
+    assert.match(logs.at(-1), /malformed/, `value ${JSON.stringify(malformed)} must degrade to a clean skip`);
+  }
+});

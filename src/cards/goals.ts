@@ -18,6 +18,7 @@ import type { Agent } from "@deepseek-ai/dsh-agent";
 import { getGoal } from "../harness/adapters/goals.js";
 import { listTodos } from "../harness/adapters/todos.js";
 import { plain, truncate } from "../telegram/html.js";
+import { bold, headerLine, metaJoin, relTime } from "../telegram/ui.js";
 import { renderTodosCard } from "../telegram/todos-card.js";
 import { safeWrap } from "../telegram/safe.js";
 import { Ephemeral, type ChatOps } from "../telegram/ephemeral.js";
@@ -110,7 +111,9 @@ export function createGoalCards(deps: GoalCardsDeps): {
 
   async function openGoalsCard(chatId: number): Promise<void> {
     const agent = currentAgent(chatId);
-    const lines = ["\u{1F3AF} Goal", ""];
+    // Design language: bold header, then the objective itself as the bold
+    // content line, quiet kv strip beneath (phase/activation/rounds, rev/time).
+    const lines: string[] = [];
     let hasGoal = false;
     let paused = false;
     if (agent) {
@@ -118,14 +121,21 @@ export function createGoalCards(deps: GoalCardsDeps): {
       if (goal) {
         hasGoal = true;
         paused = goal.phase === "paused";
-        lines.push(`phase: ${goal.phase} \u00B7 activation: ${goal.activation} \u00B7 rounds: ${goal.roundsStarted}${goal.maxGoalRounds !== undefined ? `/${goal.maxGoalRounds}` : ""}`);
-        lines.push(`objective: ${plain(truncate(goal.objective, 120))}`);
-        lines.push(`revision: ${goal.revision} \u00B7 created: ${plain(new Date(goal.createdAt).toLocaleString())}`);
+        lines.push(headerLine("\u{1F3AF}", "Goal", paused ? "\u23F8 paused" : undefined), "");
+        lines.push(bold(truncate(goal.objective, 120)));
+        lines.push(
+          metaJoin(
+            `phase ${goal.phase}`,
+            `activation ${goal.activation}`,
+            `rounds ${goal.roundsStarted}${goal.maxGoalRounds !== undefined ? `/${goal.maxGoalRounds}` : ""}`,
+          ),
+        );
+        lines.push(metaJoin(`rev ${goal.revision}`, `created ${relTime(goal.createdAt)}`));
       } else {
-        lines.push("(no current goal)");
+        lines.push(headerLine("\u{1F3AF}", "Goal"), "", "(no current goal)");
       }
     } else {
-      lines.push("No live agent \u2014 goals are per-agent.");
+      lines.push(headerLine("\u{1F3AF}", "Goal"), "", "No live agent \u2014 goals are per-agent.");
     }
     const goalPayload = agent ? { action: "goal", agentId: agent.id } : { action: "goal", agentId: "" };
     const callbacks = {

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { BAR_LABELS, ABORT_BTN, buildBackKeyboard, buildBarKeyboard, buildCollapsedBarKeyboard, buildConfirmKeyboard, buildGoalsKeyboard, buildHistoryKeyboard, buildMenuPage, buildModelsKeyboard, buildPagingKeyboard, buildProjectKeyboard, buildQueueKeyboard, buildSearchKeyboard, buildSessionsKeyboard, buildSessionProjectsKeyboard, buildSettingsKeyboard, buildSubagentDetailKeyboard, buildThinkingKeyboard, buildModelDetailKeyboard, buildWorkspaceKeyboard, buildWorkspaceDetailKeyboard, CALLBACK_RE, COLLAPSE_BTN, decodeCallbackValue, encodedCallback, GOAL_BTN, inputPromptKeyboard, LEGACY_COLLAPSE_BTN, LEGACY_RETURN_BTN, normalizeBarLabel, PRESETS_BTN, queueBarLabel, RETURN_BTN, STOP_BTN, TODO_BTN, todoBarLabel } from '../dist/telegram/keyboard.js';
+import { BAR_LABELS, ABORT_BTN, buildBackKeyboard, buildBarKeyboard, buildCollapsedBarKeyboard, buildConfirmKeyboard, buildGoalsKeyboard, buildHistoryKeyboard, buildMenuPage, buildModelsKeyboard, buildPagingKeyboard, buildProjectKeyboard, buildQueueKeyboard, buildSearchKeyboard, buildSessionDetailKeyboard, buildSessionsKeyboard, buildSessionProjectsKeyboard, buildSettingsKeyboard, buildSubagentDetailKeyboard, buildThinkingKeyboard, buildModelDetailKeyboard, buildWorkspaceKeyboard, buildWorkspaceDetailKeyboard, CALLBACK_RE, COLLAPSE_BTN, decodeCallbackValue, encodedCallback, GOAL_BTN, inputPromptKeyboard, LEGACY_COLLAPSE_BTN, LEGACY_RETURN_BTN, normalizeBarLabel, PRESETS_BTN, queueBarLabel, RETURN_BTN, STOP_BTN, TODO_BTN, todoBarLabel } from '../dist/telegram/keyboard.js';
 
 test('reply bar layout is Menu/New/Models, Sessions/Plugins/Status, Goal/Queue/Compact, Todos/Abort/收起', () => {
   const bar = buildBarKeyboard();
@@ -341,4 +341,65 @@ test('inputPromptKeyboard uses Telegram ForceReply with a placeholder', () => {
     input_field_placeholder: 'Send the corrected message\u2026',
   });
   assert.equal(inputPromptKeyboard('x'.repeat(100)).input_field_placeholder.length, 64);
+});
+
+// ---------------------------------------------------------------------------
+// RE-9: Telegram caps callback_data at 64 BYTES, not 64 UTF-16 code units.
+// A CJK/emoji id sliced by code units could still exceed the byte budget
+// (whole-card 400) or silently retarget the tap. Every s:/w:/q: payload now
+// goes through the byte-safe encodedCallback path.
+// ---------------------------------------------------------------------------
+
+const byteLength = (value) => new TextEncoder().encode(value).length;
+
+function assertByteSafe(kb, prefix) {
+  for (const button of kb.inline_keyboard.flat()) {
+    if (!button.callback_data.startsWith(prefix)) continue;
+    assert.ok(
+      byteLength(button.callback_data) <= 64,
+      `callback_data ${JSON.stringify(button.callback_data)} exceeds 64 bytes`,
+    );
+  }
+}
+
+test('non-ASCII session ids keep every callback payload within 64 bytes (RE-9)', () => {
+  const cjk = '\u4f1a'.repeat(40); // 40 CJK chars = 120 UTF-8 bytes, fit nowhere raw
+  assert.ok(byteLength(`s:${cjk}`) > 64, 'fixture must exceed the byte budget before encoding');
+
+  assertByteSafe(buildSearchKeyboard([cjk]), 's:');
+  assertByteSafe(buildSessionsKeyboard([{ id: cjk, title: cjk }]), 's:');
+  assertByteSafe(buildHistoryKeyboard(cjk), 's:');
+  assertByteSafe(buildSessionDetailKeyboard(cjk, false), 's:');
+});
+
+test('non-ASCII workspace and queue ids keep every callback payload within 64 bytes (RE-9)', () => {
+  const cjk = '\u5de5'.repeat(40);
+  assertByteSafe(buildWorkspaceKeyboard([{ id: cjk, title: cjk }]), 'w:');
+  assertByteSafe(buildWorkspaceDetailKeyboard(cjk), 'w:');
+  assertByteSafe(buildQueueKeyboard([{ itemId: cjk, kind: 'next-turn' }, { itemId: cjk, kind: 'next-step' }]), 'q:');
+});
+
+test('action suffixes survive on byte-trimmed detail payloads (RE-9)', () => {
+  const long = 's'.repeat(200);
+  const kb = buildSessionDetailKeyboard(long, false);
+  const callbacks = kb.inline_keyboard.flat().map((button) => button.callback_data);
+  for (const action of ['use', 'history', 'rename', 'fork', 'archive', 'model', 'queue', 'steer', 'log', 'stop', 'delete']) {
+    assert.ok(callbacks.some((cb) => cb.endsWith(`:${action}`)), `:${action} button lost`);
+  }
+  for (const cb of callbacks) {
+    assert.ok(byteLength(cb) <= 64, `callback_data ${JSON.stringify(cb)} exceeds 64 bytes`);
+    assert.doesNotThrow(() => decodeCallbackValue(cb.slice(2).split(':')[0]), 'encoded id segment must stay decodable');
+  }
+});
+
+test('ASCII ids produce unchanged payloads — no gratuitous re-encoding (RE-9)', () => {
+  assert.equal(buildSearchKeyboard(['s-one']).inline_keyboard[0][0].callback_data, 's:s-one');
+  assert.equal(buildHistoryKeyboard('s1').inline_keyboard.at(-1)[0].callback_data, 's:s1');
+  const detail = buildSessionDetailKeyboard('abc', false);
+  assert.ok(detail.inline_keyboard.flat().some((b) => b.callback_data === 's:abc:use'));
+  const queue = buildQueueKeyboard([{ itemId: 'q-9', kind: 'next-turn' }]);
+  assert.deepEqual(
+    queue.inline_keyboard[0].map((b) => b.callback_data),
+    ['q:q-9:r', 'q:q-9:s'],
+  );
 });

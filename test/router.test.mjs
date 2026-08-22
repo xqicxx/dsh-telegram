@@ -216,3 +216,46 @@ test('router gates unsupported media by the whitelist and delegates allowed chat
   await h.onDocument(7, 'video', 'v', 'clip.mp4', 'video/mp4');
   assert.deepEqual(calls, ['unauthorized:9', { chatId: 7, kind: 'video', fileId: 'v', name: 'clip.mp4', mimeType: 'video/mp4' }]);
 });
+
+test('group-style /cmd@BotName routes as its command with the suffix stripped (RE-12)', async () => {
+  const calls = [];
+  const t = fakeTransport();
+  attachRouter({
+    transport: t,
+    isAllowed: () => true,
+    onCommand: (_chatId, command, args) => calls.push(`command:${command}:${args}`),
+    onBarButton: () => calls.push('bar'),
+    onCallback: () => calls.push('callback'),
+    onUserText: () => calls.push('text'),
+    onPhoto: () => calls.push('photo'),
+    onUnauthorized: () => calls.push('unauthorized'),
+  });
+  const h = t.handlers();
+  await h.onText(7, '/status@MyBot');
+  await h.onText(7, '/status@MyBot hello world');
+  await h.onText(7, '/plain args');
+  await h.onText(7, 'not-a-command@Bot');
+  assert.deepEqual(
+    calls,
+    ['command:status:', 'command:status:hello world', 'command:plain:args', 'text'],
+    '@BotName suffix must not hide the command nor leak into it',
+  );
+});
+
+test('unauthorized @BotName commands still report the bare command name (RE-12)', async () => {
+  const calls = [];
+  const t = fakeTransport();
+  attachRouter({
+    transport: t,
+    isAllowed: () => false,
+    onCommand: () => calls.push('command'),
+    onBarButton: () => calls.push('bar'),
+    onCallback: () => calls.push('callback'),
+    onUserText: () => calls.push('text'),
+    onPhoto: () => calls.push('photo'),
+    onUnauthorized: (_chatId, reason) => calls.push(`unauthorized:${reason ?? 'text'}`),
+  });
+  const h = t.handlers();
+  await h.onText(9, '/start@OtherBot');
+  assert.deepEqual(calls, ['unauthorized:command:start']);
+});

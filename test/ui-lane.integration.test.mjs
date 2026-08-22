@@ -145,7 +145,10 @@ test('Back from a bar-opened card closes to chat; the same card from the menu re
   try {
     // Bar entry: every bar button marks the card origin before opening.
     await env.state.handlers.onText(7, TODO_BTN);
-    assert.ok(env.state.sends.some((entry) => /📋 Todos/.test(entry.text)), 'bar Todos card opened');
+    // The Todos card header tracks the design language (todos-card.ts):
+    // icon (📋 old / 📌 pending / ✅ complete) + possibly bolded "Todos".
+    // This assertion is about "the Todos card opened", not the glyph.
+    assert.ok(env.state.sends.some((entry) => /(?:📋|📌|✅) (?:<b>)?Todos/.test(entry.text)), 'bar Todos card opened');
     const sendsBefore = env.state.sends.length;
     const deletesBefore = env.state.deletes.length;
 
@@ -159,7 +162,7 @@ test('Back from a bar-opened card closes to chat; the same card from the menu re
     env.state.deletes.length = 0;
     env.state.edits.length = 0;
     await env.state.handlers.onCallback(7, 'm:todos');
-    assert.ok(env.state.sends.some((entry) => /📋 Todos/.test(entry.text)), 'menu Todos card opened');
+    assert.ok(env.state.sends.some((entry) => /(?:📋|📌|✅) (?:<b>)?Todos/.test(entry.text)), 'menu Todos card opened');
     await env.state.handlers.onCallback(7, 'm:back');
     assert.ok(env.state.edits.some((entry) => /🤖 dsh/.test(entry.text)), 'menu Back returns to the menu page');
     assert.equal(env.state.sends.length, 1, 'menu Back updates the card in place, no close+reopen');

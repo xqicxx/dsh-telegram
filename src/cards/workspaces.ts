@@ -20,6 +20,7 @@ import { writeConfig } from "../config.js";
 import { listWorkspaces } from "../harness/adapters/workspace.js";
 import { isDirectory, listDirectory, parentOf } from "../harness/adapters/host.js";
 import { plain, truncate } from "../telegram/html.js";
+import { bold, headerLine, metaJoin, mono, relTime } from "../telegram/ui.js";
 import { buildProjectKeyboard, buildWorkspaceDetailKeyboard, buildWorkspaceKeyboard } from "../telegram/keyboard.js";
 import type { TelegramTransport } from "../telegram/transport.js";
 import type { OpenCard } from "../core/cards.js";
@@ -65,17 +66,19 @@ export function createWorkspaceCards(deps: WorkspaceCardsDeps): {
       const items = listed.items;
       const archivedSessionIds = listed.archivedSessionIds;
       log(`workspaces listed items=${items.length} archived=${archivedSessionIds.length}`);
-      const lines = [`\u{1F5C2} Workspaces (${items.length})`, ""];
+      // Design language: bold header + count, bold workspace titles with an
+      // indented mono path/sessions line beneath.
+      const lines = [headerLine("\u{1F5C2}\uFE0F", "Workspaces", `${items.length}`), ""];
       for (const workspace of items.slice(0, 15)) {
         const title = typeof workspace.title === "string" && workspace.title !== "" ? workspace.title : basename(workspace.path || "workspace");
-        lines.push(`\u2022 ${plain(truncate(title, 28))} \u00B7 ${plain(truncate(workspace.path, 24))}`);
-        lines.push(`  sessions: ${workspace.sessionIds.length} \u00B7 id: ${plain(truncate(workspace.workspaceId, 20))}`);
+        lines.push(`\u2022 ${bold(truncate(title, 28))}`);
+        lines.push(metaJoin(`  ${mono(truncate(workspace.path, 24))}`, `${workspace.sessionIds.length} sessions`, mono(truncate(workspace.workspaceId, 20))));
       }
       if (items.length === 0) {
-        lines.push(`\u2022 Current project: ${plain(truncate(state.workspaceRoot, 48))}`);
+        lines.push(`\u2022 Current project: ${mono(truncate(state.workspaceRoot, 48))}`);
         lines.push("No registered workspaces yet \u2014 /workspacecreate &lt;path&gt; [title], or use Project to register this one.");
       }
-      if (archivedSessionIds.length > 0) lines.push("", `Archived sessions: ${archivedSessionIds.length}`);
+      if (archivedSessionIds.length > 0) lines.push("", `\u{1F5C4} Archived sessions: ${archivedSessionIds.length}`);
       log(`workspaces card rendering lines=${lines.length}`);
       await openCard(
         chatId,
@@ -99,14 +102,19 @@ export function createWorkspaceCards(deps: WorkspaceCardsDeps): {
     const { items } = listWorkspaces(requireCtx());
     const workspace = items.find((candidate) => candidate.workspaceId === workspaceId);
     if (!workspace) return openWorkspacesCard(chatId);
+    // Design language: bold title header, mono id subtitle, quiet kv rows;
+    // timestamps render as client-localized relative time.
     const lines = [
-      `\u{1F5C2} ${plain(truncate(workspace.title, 40))}`,
+      headerLine("\u{1F5C2}\uFE0F", truncate(workspace.title, 40)),
+      mono(workspace.workspaceId),
       "",
-      `path: ${plain(truncate(workspace.path, 60))}`,
-      `id: ${plain(truncate(workspace.workspaceId, 32))}`,
-      `sessions (${workspace.sessionIds.length}): ${workspace.sessionIds.slice(0, 6).map((id) => plain(truncate(id, 16))).join(", ")}${workspace.sessionIds.length > 6 ? "\u2026" : ""}`,
-      workspace.createdAt !== undefined ? `created: ${plain(new Date(workspace.createdAt).toLocaleString())}` : "",
-      workspace.updatedAt !== undefined ? `updated: ${plain(new Date(workspace.updatedAt).toLocaleString())}` : "",
+      metaJoin("path", mono(truncate(workspace.path, 60))),
+      metaJoin(
+        `sessions ${workspace.sessionIds.length}`,
+        workspace.sessionIds.length > 0 ? mono(workspace.sessionIds.slice(0, 6).map((id) => truncate(id, 16)).join(",")) + (workspace.sessionIds.length > 6 ? "\u2026" : "") : undefined,
+      ),
+      workspace.createdAt !== undefined ? `created ${relTime(workspace.createdAt)}` : "",
+      workspace.updatedAt !== undefined ? `updated ${relTime(workspace.updatedAt)}` : "",
     ].filter((line) => line !== "");
     await openCard(chatId, lines.join("\n"), buildWorkspaceDetailKeyboard(workspaceId, {
       use: token({ action: "workspace-use", workspaceId }),
@@ -137,14 +145,14 @@ export function createWorkspaceCards(deps: WorkspaceCardsDeps): {
     };
 
     if (!(await isDirectory(path))) {
-      const lines = [`\u{1F4C1} ${plain(truncate(path, 60))}`, "", "\u274C Not a directory (or not readable).", "", "Go up a level, or pick a quick root below."];
+      const lines = [headerLine("\u{1F4C1}", truncate(path, 60)), "", "\u274C Not a directory (or not readable).", "", "Go up a level, or pick a quick root below."];
       await openCard(chatId, lines.join("\n"), buildProjectKeyboard([], baseActions));
       return;
     }
 
-    const listing = await listDirectory(path);
+    const listing = await listDirectory(path, state.config.security.browseRoots);
     if (!listing.ok) {
-      const lines = [`\u{1F4C1} ${plain(truncate(path, 60))}`, "", `\u274C ${plain(listing.text)}`, "", "The folder itself is valid \u2014 use it as the project, or go up."];
+      const lines = [headerLine("\u{1F4C1}", truncate(path, 60)), "", `\u274C ${plain(listing.text)}`, "", "The folder itself is valid \u2014 use it as the project, or go up."];
       await openCard(chatId, lines.join("\n"), buildProjectKeyboard([], { ...baseActions, use: token({ action: "project-select", path }) }));
       return;
     }
@@ -152,11 +160,11 @@ export function createWorkspaceCards(deps: WorkspaceCardsDeps): {
     const entries = listing.entries ?? [];
     const dirs = entries.filter((entry) => entry.kind === "directory");
     const files = entries.length - dirs.length;
-    const active = path === state.workspaceRoot ? " \u00B7 \u2705 current project" : "";
+    const active = path === state.workspaceRoot;
     const lines = [
-      `\u{1F4C1} ${plain(truncate(path, 60))}${active}`,
+      headerLine("\u{1F4C1}", truncate(path, 60), active ? "\u2705 current" : undefined),
       "",
-      `folders: ${dirs.length} \u00B7 files: ${files}`,
+      metaJoin(`folders ${dirs.length}`, `files ${files}`),
       "",
       "Pick a folder to open it, or use this one as the project.",
     ];
@@ -213,14 +221,14 @@ export function createWorkspaceCards(deps: WorkspaceCardsDeps): {
       await uiSend(chatId, `\u274C Not a directory: ${plain(truncate(target, 60))}`, { parse_mode: "HTML" });
       return openWorkspaceCreatePicker(chatId, parentOf(target));
     }
-    const listing = await listDirectory(target);
+    const listing = await listDirectory(target, state.config.security.browseRoots);
     const dirs = (listing.ok ? listing.entries ?? [] : []).filter((entry) => entry.kind === "directory");
     const safe = Math.max(0, Math.min(offset, Math.max(0, Math.ceil(dirs.length / WORKSPACE_PICK_PAGE_SIZE) - 1)));
     const pageDirs = dirs.slice(safe * WORKSPACE_PICK_PAGE_SIZE, (safe + 1) * WORKSPACE_PICK_PAGE_SIZE);
     const paging: { text: string; cb: string }[] = [];
     if (safe > 0) paging.push({ text: "\u2B05\uFE0F Prev", cb: token({ action: "ws-pick-page", path: target, page: String(safe - 1) }) });
     if ((safe + 1) * WORKSPACE_PICK_PAGE_SIZE < dirs.length) paging.push({ text: "Next \u27A1\uFE0F", cb: token({ action: "ws-pick-page", path: target, page: String(safe + 1) }) });
-    const lines = [`\u{1F5C2} Create workspace at:\n${plain(truncate(target, 60))}`, "", `folders: ${dirs.length}`, "", "Browse to a folder, then tap \u2705 Create here."];
+    const lines = [headerLine("\u{1F5C2}\uFE0F", "Create workspace"), mono(truncate(target, 60)), "", metaJoin(`folders ${dirs.length}`), "", "Browse to a folder, then tap \u2705 Create here."];
     await openCard(chatId, lines.join("\n"), buildProjectKeyboard(
       pageDirs.map((entry) => ({ label: entry.name, cb: token({ action: "ws-pick-open", path: joinPath(target, entry.name) }) })),
       {

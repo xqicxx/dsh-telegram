@@ -1,5 +1,5 @@
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve, sep } from 'node:path';
 import { REASONING_DEFAULT, REASONING_EFFORTS } from './reasoning.js';
 import { DEFAULT_TRANSCRIBE_MODEL } from './harness/adapters/media.js';
 
@@ -30,6 +30,13 @@ export interface TelegramConfig {
   security: {
     /** Chat id whitelist for inbound traffic. Empty means ALL inbound chat is rejected. */
     allowedChatIds: number[];
+    /**
+     * Optional absolute-path whitelist (B-7r) constraining the Host/Workspace
+     * browse seams (/ls, /mkdir, /open, workspace create). Absent = the seams
+     * stay unconstrained (behavior unchanged); when set, a path is only
+     * browsable when it resolves inside one of these roots.
+     */
+    browseRoots?: string[];
   };
   watch: {
     /** Start long-polling automatically when the plugin mounts. */
@@ -222,6 +229,8 @@ export function normalizeConfig(raw: unknown): TelegramConfig {
     if (!isRecord(security)) throw new ConfigError('security', 'must be an object');
     const ids = readIdArray(security, 'allowedChatIds', 'security');
     if (ids !== undefined) base.security.allowedChatIds = ids;
+    const browseRoots = readStringArray(security, 'browseRoots', 'security');
+    if (browseRoots !== undefined) base.security.browseRoots = browseRoots;
   }
 
   const watch = raw['watch'];
@@ -435,6 +444,25 @@ export function resolveInboundMode(config: TelegramConfig, chatId: number, text:
 /** Whether inbound messages from this chat are accepted at all. */
 export function isChatAllowed(config: TelegramConfig, chatId: number): boolean {
   return config.security.allowedChatIds.includes(chatId);
+}
+
+/**
+ * B-7r: optional root confinement for the host/workspace browse seams.
+ * `undefined`/empty roots are a no-op (the default config keeps behavior
+ * unchanged); otherwise `path` must resolve inside one of the roots — both
+ * sides go through `resolve`, and the comparison uses `root + sep` so a
+ * sibling directory that merely shares a prefix (`/a/home-evil` vs `/a/home`)
+ * never slips through. Throws so adapters can degrade to their own fail text.
+ */
+export function assertBrowsable(path: string, roots: readonly string[] | undefined): void {
+  if (roots === undefined || roots.length === 0) return;
+  const target = resolve(path);
+  for (const root of roots) {
+    const base = resolve(root);
+    const prefix = base.endsWith(sep) ? base : base + sep;
+    if (target === base || target.startsWith(prefix)) return;
+  }
+  throw new Error(`path is outside the configured security.browseRoots: ${path}`);
 }
 
 /** Bot token comes only from the environment; it is never persisted. */

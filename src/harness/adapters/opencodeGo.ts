@@ -97,15 +97,22 @@ async function provisionOnce(ctx: Context, log: (message: string, error?: unknow
       await sleep(300);
       continue;
     }
-    const goRoute = providers["opencode-go"];
+    const goRoute: unknown = (providers as Record<string, unknown>)["opencode-go"];
     if (goRoute === undefined) {
       log(`skipped ${OPENCODE_GO_RESPONSES_ROUTE} provisioning: no opencode-go provider is configured`);
+      return false;
+    }
+    // RG-2: settings values are arbitrary user JSON — a null/scalar route
+    // must degrade to the module's own clean skip instead of throwing a
+    // TypeError out of provisionOnce past every degradation seam.
+    if (typeof goRoute !== "object" || goRoute === null) {
+      log(`skipped ${OPENCODE_GO_RESPONSES_ROUTE} provisioning: the opencode-go provider setting is malformed`);
       return false;
     }
     const patch = {
       providers: {
         [OPENCODE_GO_RESPONSES_ROUTE]: {
-          apiKeyEnv: goRoute.apiKeyEnv ?? "OPENCODE_GO_API_KEY",
+          apiKeyEnv: (goRoute as { apiKeyEnv?: string }).apiKeyEnv ?? "OPENCODE_GO_API_KEY",
           api: "openai-responses",
           baseURL: "https://opencode.ai/zen/go/v1",
           // The Go gateway does not maintain stateful Responses sessions;

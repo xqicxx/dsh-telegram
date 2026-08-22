@@ -88,6 +88,9 @@ export async function promptSubagent(
   text: string,
   options?: { clientTimeZone?: string; signal?: AbortSignal },
 ): Promise<AdapterResult> {
+  // RG-6: blank text would be delivered as [{ type: "text", text: "" }] — a
+  // wasted turn plus a false "delivered" impression in the parent session.
+  if (text.trim() === "") return fail("subagent prompt must not be blank");
   const subagents = subagentsOf(ctx);
   if (!subagents) return fail("subagents service is unavailable in this profile");
   const parent = ctx.agents?.get(SessionId(parentSessionId));

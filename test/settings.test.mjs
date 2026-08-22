@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { replaceSettings, mutateSettings, describeSettings, parseJsonWithRevision } from '../dist/harness/adapters/settings.js';
+import { replaceSettings, mutateSettings, updateSettings, describeSettings, parseJsonWithRevision } from '../dist/harness/adapters/settings.js';
 
 function ctxWith(service) {
   return { get: (key) => (key === 'settings' ? service : undefined) };
@@ -58,9 +58,34 @@ test('describeSettings carries the serialized schema envelope', () => {
 });
 
 
-test('parseJsonWithRevision keeps JSON string whitespace intact', () => {
-  assert.deepEqual(parseJsonWithRevision('{"a": 1}'), { json: '{"a": 1}' });
-  assert.deepEqual(parseJsonWithRevision('{"a": "x  y"} 7'), { json: '{"a": "x  y"}', revision: 7 });
-  assert.deepEqual(parseJsonWithRevision('[1, 2] 3'), { json: '[1, 2]', revision: 3 });
+test('parseJsonWithRevision keeps JSON string whitespace intact and parses once (A-2)', () => {
+  assert.deepEqual(parseJsonWithRevision('{"a": 1}'), { json: '{"a": 1}', value: { a: 1 } });
+  assert.deepEqual(parseJsonWithRevision('{"a": "x  y"} 7'), { json: '{"a": "x  y"}', value: { a: 'x  y' }, revision: 7 });
+  assert.deepEqual(parseJsonWithRevision('[1, 2] 3'), { json: '[1, 2]', value: [1, 2], revision: 3 });
   assert.equal(parseJsonWithRevision('not json'), undefined);
+});
+
+test('updateSettings rejects scalar/array patches but still forwards objects (RG-5)', async () => {
+  const calls = [];
+  const service = {
+    describe: () => [{ ns: 'llm', value: {}, applies: 'live', revision: 1 }],
+    replace: async () => {},
+    mutate: async () => {},
+    update: async (ns, patch, expectedRevision) => {
+      calls.push({ ns, patch, expectedRevision });
+    },
+  };
+  const ctx = ctxWith(service);
+  const scalar = await updateSettings(ctx, 'llm', 456);
+  assert.equal(scalar.ok, false);
+  assert.match(scalar.text, /JSON object/);
+  const array = await updateSettings(ctx, 'llm', [1, 2]);
+  assert.equal(array.ok, false);
+  assert.match(array.text, /JSON object/);
+  const nully = await updateSettings(ctx, 'llm', null);
+  assert.equal(nully.ok, false);
+  assert.deepEqual(calls, [], 'rejected patches never reach the settings service');
+  const good = await updateSettings(ctx, 'llm', { provider: 'x' }, 5);
+  assert.equal(good.ok, true);
+  assert.deepEqual(calls, [{ ns: 'llm', patch: { provider: 'x' }, expectedRevision: 5 }]);
 });

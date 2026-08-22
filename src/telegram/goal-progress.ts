@@ -7,10 +7,11 @@
  * cache hit-rate line. The feed is pure bookkeeping + render; all Telegram
  * effects go through the injected ops.
  */
-import type { Context } from "@deepseek-ai/cordis";
 import type { StatusStats } from "../harness/adapters/status.js";
 import type { TodoView } from "../harness/adapters/todos.js";
 import { safeWrap } from "./safe.js";
+import { escapeHtml } from "./html.js";
+import { bold, metaJoin, progressBar } from "./ui.js";
 import { renderTurnReceipt } from "./turn-receipt.js";
 
 export interface ProgressGoal {
@@ -46,6 +47,14 @@ export interface ProgressSnapshot {
   elapsedMs: number;
   todosDone: number;
   todosTotal: number;
+}
+
+/** Structural subset of the host context this feed needs (audit R3-6):
+ * register one event listener and receive its disposer. Keeps the telegram
+ * layer decoupled from the cordis `Context` type — any object with a
+ * compatible `on` satisfies it, including plain test doubles. */
+export interface ProgressContext {
+  on(event: string, listener: (...args: never[]) => unknown): () => void;
 }
 
 interface Running {
@@ -92,9 +101,7 @@ const EDIT_THROTTLE_MS = 250;
 export const LIVENESS_HEARTBEAT_MS = 30_000;
 
 function bar(done: number, total: number): string {
-  const width = 10;
-  const filled = total === 0 ? 0 : Math.max(0, Math.min(width, Math.round((done / total) * width)));
-  return `${"\u2593".repeat(filled)}${"\u2591".repeat(width - filled)} ${Math.round(total === 0 ? 0 : (done / total) * 100)}%`;
+  return progressBar(done, total);
 }
 
 export class GoalProgressFeed {
@@ -103,9 +110,8 @@ export class GoalProgressFeed {
 
   constructor(private readonly deps: ProgressDeps) {}
 
-  attach(ctx: Context): void {
-    const on = ctx.on.bind(ctx) as (name: string, listener: (...args: unknown[]) => void) => () => void;
-    this.dispose = on("session/event", (...args: unknown[]) => {
+  attach(ctx: ProgressContext): void {
+    this.dispose = ctx.on("session/event", (...args: unknown[]) => {
       const session = args[0] as { id: unknown };
       const event = args[1] as EventLike;
       const chatId = this.deps.chatIdForAgent(String(session.id));
@@ -212,10 +218,13 @@ export class GoalProgressFeed {
     const total = todos.length;
     const done = todos.filter((todo) => todo.status === "completed").length;
     const seconds = Math.max(1, Math.round((Date.now() - draft.startedAt) / 1000));
-    const lines = [`\u{1F4CA} ${draft.objective.slice(0, 60)}`, ""];
-    if (total > 0) lines.push(`${bar(done, total)} \u00B7 todo ${done}/${total}`);
-    lines.push(`step ${draft.step} \u00B7 tools ${draft.tools} \u00B7 \u23F1\uFE0F ${seconds}s`);
-    if (draft.currentTool !== undefined) lines.push(`\u{1F6E0}\uFE0F ${draft.currentTool}`);
+    // Design language: bold objective header; the objective is USER text and
+    // this card is sent with parse_mode HTML — it must be escaped or a single
+    // `<` in the goal would fail the whole send (HTTP 400).
+    const lines = [`\u{1F3AF} ${bold(draft.objective.slice(0, 60))}`, ""];
+    if (total > 0) lines.push(metaJoin(`${bar(done, total)}`, `todo ${done}/${total}`));
+    lines.push(metaJoin(`step ${draft.step}`, `tools ${draft.tools}`, `\u23F1\uFE0F ${seconds}s`));
+    if (draft.currentTool !== undefined) lines.push(`\u{1F6E0}\uFE0F ${escapeHtml(draft.currentTool)}`);
     return lines.join("\n");
   }
 
@@ -248,7 +257,11 @@ export class GoalProgressFeed {
       if (id !== undefined) draft.messageId = id;
       return id !== undefined;
     }), this.deps.log).then((sent) => {
-      if (sent !== true) {
+      // Audit RE-6: only clear THIS turn's entry. A newer turn/start may have
+      // replaced the draft while our send was still in flight; deleting it by
+      // chatId alone would kill the new card/receipt/recovery state (same
+      // identity check openclaw.ts applies to its failure callbacks).
+      if (sent !== true && this.running.get(chatId) === draft) {
         draft.sending = undefined;
         this.running.delete(chatId);
       }

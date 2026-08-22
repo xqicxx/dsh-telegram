@@ -52,3 +52,14 @@ test('setCredential rejects empty values and unsetCredential delegates', async (
   assert.equal((await unsetCredential(ctx, 'REF')).ok, true);
   assert.deepEqual(service.calls.slice(0, 2).map((call) => call.op), ['set', 'unset']);
 });
+
+test('unsetCredential enforces the same ref shape as set/describe (RG-4)', async () => {
+  const { ctx, service } = makeCtx();
+  for (const bad of ['FOO-BAR', '9LIVES', 'has space', '']) {
+    const res = await unsetCredential(ctx, bad);
+    assert.equal(res.ok, false, `ref ${JSON.stringify(bad)} must be rejected`);
+    assert.match(res.text, /POSIX/);
+  }
+  assert.deepEqual(service.calls, [], 'an invalid ref never reaches the credentials service');
+  assert.equal((await unsetCredential(ctx, 'VALID_REF')).ok, true);
+});

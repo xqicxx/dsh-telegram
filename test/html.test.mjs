@@ -100,3 +100,17 @@ test('splitText rebalances nested tags without leaking stray closers', () => {
   }
   assert.ok(parts.at(-1).endsWith('</b></i>'));
 });
+
+test('splitText reopens tags with their raw attributes intact (RE-2)', () => {
+  // A bare `<a>` without href is rejected by Telegram with a non-retryable
+  // 400, so a cut landing inside link text must replay the FULL open tag.
+  const href = '<a href="https://example.test/very/long/path?utm=split">';
+  const parts = checkHtmlSplit(`${href}${'x'.repeat(5000)}</a>`, 4096);
+  assert.ok(parts.length > 1);
+  assert.ok(parts[1].startsWith(href), `reopened anchor must keep its href, got: ${JSON.stringify(parts[1].slice(0, 60))}`);
+
+  // Attributes on styling tags survive too, and nesting keeps closing in order.
+  const styled = checkHtmlSplit(`<b class="x"><a href="https://e.test/a">${'y'.repeat(5000)}</a></b>`, 4096);
+  assert.ok(styled[1].startsWith('<b class="x"><a href="https://e.test/a">'));
+  assert.ok(styled.at(-1).endsWith('</a></b>'));
+});

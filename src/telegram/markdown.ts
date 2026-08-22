@@ -140,10 +140,20 @@ export function cellDisplayWidth(text: string): number {
   return width;
 }
 
+/** Placeholder protecting a GFM escaped pipe (`\|`) across the naive column
+ * split; NUL cannot collide with real model content (audit RE-11). */
+const ESCAPED_PIPE = "\u0000";
+
 function parseTableRow(line: string): string[] | undefined {
   const trimmed = line.trim();
   if (!trimmed.startsWith("|") || !trimmed.endsWith("|")) return undefined;
-  return trimmed.slice(1, -1).split("|").map((cell) => cell.trim());
+  // `\|` is a literal pipe inside a cell, not a column break: shield it from
+  // the split and restore it after trimming (audit RE-11).
+  return trimmed
+    .slice(1, -1)
+    .replace(/\\\|/g, ESCAPED_PIPE)
+    .split("|")
+    .map((cell) => cell.trim().split(ESCAPED_PIPE).join("|"));
 }
 
 function isTableSeparator(cells: string[]): boolean {
@@ -157,11 +167,17 @@ function renderTableBlock(rows: readonly string[]): string | undefined {
   if (!isTableSeparator(parsed[1]!)) return undefined;
   const body = parsed.slice(2).filter((row) => row.length > 0);
   const columns = header.length;
+  // Cells beyond the header's column count are kept, not silently dropped:
+  // the overflow folds into the last column (rejoined with the pipes that
+  // separated it) so a wide row stays complete (audit RE-11).
+  const grid = [
+    header,
+    ...body.map((row) => (row.length <= columns ? row : [...row.slice(0, columns - 1), row.slice(columns - 1).join(" | ")])),
+  ];
   // Widths come from header + body cells only: the separator row's dash
   // padding is model-styled (often longer than any cell) and must not
   // inflate the rendered column. Every cell's display width is measured
   // exactly once into this matrix; padding below reads the stored value.
-  const grid = [header, ...body];
   const cellWidths = grid.map((row) => header.map((_, index) => cellDisplayWidth(row[index] ?? "")));
   const widths = header.map((_, index) => Math.max(3, ...cellWidths.map((row) => row[index]!)));
   const rowText = (cells: readonly string[], measured: readonly number[]): string =>
@@ -176,9 +192,9 @@ function renderTableBlock(rows: readonly string[]): string | undefined {
       .join(" | ")} |`;
   const separator = `| ${header.map((_, index) => "-".repeat(widths[index]!)).join(" | ")} |`;
   return `<pre><code>${[
-    rowText(header, cellWidths[0] ?? []),
+    rowText(grid[0]!, cellWidths[0] ?? []),
     separator,
-    ...body.map((row, rowIndex) =>
+    ...grid.slice(1).map((row, rowIndex) =>
       rowText([...Array(columns)].map((_, index) => row[index] ?? ""), cellWidths[rowIndex + 1] ?? []),
     ),
   ].join("\n")}</code></pre>`;
@@ -227,23 +243,29 @@ function renderInline(input: string, depth = 0): string {
       const labelEnd = input.indexOf("](", index + 1);
       if (labelEnd !== -1) {
         const hrefStart = labelEnd + 2;
-        let depth = 0;
+        // Parenthesis counter for the URL part (which may contain balanced
+        // parens). Deliberately NOT named `depth`: that would shadow the
+        // recursion depth parameter and feed ~1-2 into every recursive call,
+        // silently disabling MAX_INLINE_DEPTH for nested links (audit RE-5).
+        let parenDepth = 0;
         let hrefEnd = -1;
         for (let cursor = hrefStart; cursor < input.length; cursor += 1) {
           const candidate = input[cursor];
-          if (candidate === "(") depth += 1;
+          if (candidate === "(") parenDepth += 1;
           else if (candidate === ")") {
-            if (depth === 0) {
+            if (parenDepth === 0) {
               hrefEnd = cursor;
               break;
             }
-            depth -= 1;
+            parenDepth -= 1;
           }
         }
         if (hrefEnd > hrefStart) {
           const href = input.slice(hrefStart, hrefEnd);
           const label = input.slice(index + 1, labelEnd);
           if (safeHref(href) && label !== "") {
+            // Recurse with the REAL outer depth so nested links eventually
+            // hit the MAX_INLINE_DEPTH guard instead of overflowing the stack.
             out += `<a href="${escapeHtml(href)}">${renderInline(label, depth + 1)}</a>`;
             index = hrefEnd + 1;
             continue;

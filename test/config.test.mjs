@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import {
   ConfigError,
   DEFAULT_CONFIG,
+  assertBrowsable,
   getConfigPath,
   isChatAllowed,
   normalizeConfig,
@@ -258,4 +259,43 @@ test('overlayConfig keeps flat-key overlay semantics unchanged', () => {
   const arrays = overlayConfig(base, { security: { allowedChatIds: [3] } });
   assert.deepEqual(arrays.changed, ['security']);
   assert.deepEqual(arrays.config.security.allowedChatIds, [3], 'array values still replace wholesale');
+});
+
+// ---------------------------------------------------------------------------
+// B-7r: optional security.browseRoots whitelist for the browse seams
+// ---------------------------------------------------------------------------
+
+test('security.browseRoots defaults to absent and validates as a string array (B-7r)', () => {
+  const defaults = normalizeConfig(undefined);
+  assert.equal('browseRoots' in defaults.security, false, 'default config stays unconstrained (behavior unchanged)');
+  const configured = normalizeConfig({ security: { browseRoots: [' /srv/projects ', '/tmp/work'] } });
+  assert.deepEqual(configured.security.browseRoots, ['/srv/projects', '/tmp/work']);
+  assert.throws(() => normalizeConfig({ security: { browseRoots: '/srv' } }), ConfigError);
+  assert.throws(() => normalizeConfig({ security: { browseRoots: ['/srv', ''] } }), ConfigError);
+  assert.equal(getConfigPath(configured, 'security.browseRoots.0'), '/srv/projects');
+});
+
+test('overlayConfig hot-applies security.browseRoots without clobbering siblings (B-7r)', () => {
+  const base = normalizeConfig({ security: { allowedChatIds: [1] } });
+  const { config, changed } = overlayConfig(base, { security: { browseRoots: ['/srv'] } });
+  assert.ok(changed.includes('security'));
+  assert.deepEqual(config.security.browseRoots, ['/srv']);
+  assert.deepEqual(config.security.allowedChatIds, [1], 'a partial security overlay keeps sibling keys');
+});
+
+test('assertBrowsable enforces a resolve-prefix whitelist only when configured (B-7r)', () => {
+  // Unconfigured (undefined or empty): no-op — the default behavior.
+  assertBrowsable('/anywhere/at/all', undefined);
+  assert.doesNotThrow(() => assertBrowsable('/anywhere/at/all', []));
+  // Inside a root and the root itself: allowed.
+  assert.doesNotThrow(() => assertBrowsable('/srv/projects/app', ['/srv/projects']));
+  assert.doesNotThrow(() => assertBrowsable('/srv/projects', ['/srv/projects']));
+  // Outside a root: rejected with a readable message.
+  assert.throws(() => assertBrowsable('/srv/private', ['/srv/projects']), /browseRoots/);
+  // A sibling that merely shares the string prefix must not slip through.
+  assert.throws(() => assertBrowsable('/srv/projects-evil', ['/srv/projects']), /browseRoots/);
+  // The filesystem root whitelists everything absolute.
+  assert.doesNotThrow(() => assertBrowsable('/anything', ['/']));
+  // Relative paths resolve against cwd first (cwd is not under /srv/projects here).
+  assert.throws(() => assertBrowsable('relative/escape', ['/srv/projects']), /browseRoots/);
 });

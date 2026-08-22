@@ -36,7 +36,7 @@ test('goal receipt keeps the goal prefix on the same single line', () => {
     goalObjective: 'ship the release',
     tokens: { uncachedInputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 },
   });
-  assert.equal(receipt, '✅ ship the release · ⏱️ 1380s · 🛠️ 3 次工具');
+  assert.equal(receipt, '✅ <b>ship the release</b> · ⏱️ 1380s · 🛠️ 3 次工具');
 });
 
 test('cache hit is omitted when there is no billed input', () => {
@@ -45,5 +45,5 @@ test('cache hit is omitted when there is no billed input', () => {
     reasoningSteps: 2,
     tokens: { uncachedInputTokens: 0, outputTokens: 50, cacheReadTokens: 0, cacheWriteTokens: 0 },
   });
-  assert.equal(receipt, '⚙️ 完成 · ⏱️ 1s · 🧠 2 次思考');
+  assert.equal(receipt, '⚙️ <b>完成</b> · ⏱️ 1s · 🧠 2 次思考');
 });

@@ -4,6 +4,7 @@
  * (`[P0]`/`high`/🔴…) for display only — never invented into the model list.
  */
 import type { Context } from "@deepseek-ai/cordis";
+import { escapeHtml } from "../../telegram/html.js";
 
 export interface TodoView {
   content: string;
@@ -120,14 +121,16 @@ export function todoIcon(todo: TodoView): string {
   return todoPriority(todo.content) === "high" ? "\u{1F534}" : todoPriority(todo.content) === "medium" ? "\u{1F7E1}" : "\u{1F7E2}";
 }
 
-/** One-line card renderer shared by /todo and the todo card. */
+/** One-line card renderer shared by the todo card. Typography (design
+ * language, telegram/ui.ts): icon + content only — completed items are struck
+ * through and priority lives in the dot color, so no `[status]` tag noise.
+ * Output is Telegram HTML; every card lane sends it with parse_mode HTML. */
 export function renderTodos(todos: readonly TodoView[]): string {
   if (todos.length === 0) return "(no todos yet)";
   return todos
     .map((todo) => {
-      const tag = todo.status === "completed" ? "[completed]" : todo.status === "in_progress" ? "[in_progress]" : "[pending]";
-      const priority = todo.status === "completed" ? "" : ` \u00B7 ${todoPriority(todo.content)}`;
-      return `${todoIcon(todo)} ${todo.content} \u00B7 ${tag}${priority}`;
+      const content = escapeHtml(todo.content);
+      return todo.status === "completed" ? `${todoIcon(todo)} <s>${content}</s>` : `${todoIcon(todo)} ${content}`;
     })
     .join("\n");
 }

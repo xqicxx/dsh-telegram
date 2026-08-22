@@ -113,7 +113,11 @@ test('openclaw streams reasoning and tool lines then collapses to a summary', as
 
   const summary = edits[edits.length - 1];
   // Issue #21: one compact line with the five user-facing metrics only.
-  assert.equal(summary.text, '\u2699\uFE0F \u5B8C\u6210 \u00B7 \u23F1\uFE0F 1s \u00B7 \u{1F9E0} 1 \u6B21\u601D\u8003 \u00B7 \u{1F6E0}\uFE0F 1 \u6B21\u5DE5\u5177');
+  // (markup-tolerant: the receipt header may render 完成 in bold)
+  assert.match(
+    summary.text,
+    /^\u2699\uFE0F (?:<b>)?\u5B8C\u6210(?:<\/b>)? \u00B7 \u23F1\uFE0F 1s \u00B7 \u{1F9E0} 1 \u6B21\u601D\u8003 \u00B7 \u{1F6E0}\uFE0F 1 \u6B21\u5DE5\u5177$/u,
+  );
   assert.equal(summary.text.includes('\u{1F3AF} OpenClaw'), false, 'internal edit metrics stay out of the user receipt');
   assert.equal(summary.text.includes('\u2500'), false, 'no separator line');
   assert.equal(host.deletes.length, 0);
@@ -200,7 +204,11 @@ test('tool line commits the reasoning burst and the next burst starts a new line
   assert.ok(first >= 0 && tool >= 0 && second >= 0);
   assert.ok(first < tool && tool < second, 'bursts interleave with the tool line');
   const summary = host.edits.at(-1);
-  assert.equal(summary.text, '\u2699\uFE0F \u5B8C\u6210 \u00B7 \u23F1\uFE0F 1s \u00B7 \u{1F9E0} 2 \u6B21\u601D\u8003 \u00B7 \u{1F6E0}\uFE0F 1 \u6B21\u5DE5\u5177');
+  // (markup-tolerant: the receipt header may render 完成 in bold)
+  assert.match(
+    summary.text,
+    /^\u2699\uFE0F (?:<b>)?\u5B8C\u6210(?:<\/b>)? \u00B7 \u23F1\uFE0F 1s \u00B7 \u{1F9E0} 2 \u6B21\u601D\u8003 \u00B7 \u{1F6E0}\uFE0F 1 \u6B21\u5DE5\u5177$/u,
+  );
 });
 
 test('reasoning text is HTML-escaped and whitespace folds to one line', async () => {
@@ -777,4 +785,23 @@ test('a failed final-answer delivery degrades to a notice and keeps the inbound 
   assert.equal(host.feedback.length, 0, 'no feedback keyboard on a failed delivery');
   assert.equal(host.inboundRepliedMarks, 0, 'the inbound stays pending so the reminder machinery can fire');
   assert.equal(host.inboundPending, true);
+});
+
+test('goal objective is HTML-escaped in the draft title and the goal receipt (RE-1)', async () => {
+  const { host, ctx } = await setup();
+  host.goalForChat = () => ({ objective: 'ship <b>it</b> & run' });
+
+  ctx.emit('agent-1', ev('turn/start', { turn: 1 }));
+  ctx.emit('agent-1', ev('tool/call', { callId: 'call_re', name: 'bash', arguments: 'ls' }));
+  await sleep(1100);
+  const streamEdit = host.edits.find((e) => e.text.includes('ship &lt;b&gt;it&lt;/b&gt; &amp; run'));
+  assert.ok(streamEdit, 'the draft title renders the escaped objective');
+
+  ctx.emit('agent-1', ev('turn/end', { turn: 1, reason: { kind: 'completed' } }));
+  await sleep(20);
+  const receipt = [...host.edits.map((e) => e.text), ...host.sends.map((s) => s.text)].at(-1);
+  assert.match(receipt, /✅ (?:<b>)?ship &lt;b&gt;it&lt;\/b&gt; &amp; run/, 'the receipt keeps the objective literal');
+  for (const text of [...host.edits.map((e) => e.text), ...host.sends.map((s) => s.text)]) {
+    assert.equal(text.includes('<b>it</b>'), false, 'raw user markup must never leak into an HTML message');
+  }
 });

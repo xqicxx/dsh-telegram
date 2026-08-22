@@ -5,12 +5,13 @@
  * ctx.loader.update, durable via the profile's cordis.patch.yml user layer.
  */
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
 import type { Context } from "@deepseek-ai/cordis";
 import type {} from "@deepseek-ai/cordis-plugin-loader";
 import { fail, ok, type AdapterResult } from "./types.js";
-import { detectProfile } from "./mode.js";
+// R3-4: one home-resolution helper for the whole adapter family — the
+// hand-rolled `env ?? join(homedir(), ".dsh")` copy drifted from dshHome().
+import { detectProfile, dshHome } from "./mode.js";
 
 /** pluginInventory/list entry: the web's exact projection shape. */
 export interface PluginEntry {
@@ -78,8 +79,7 @@ export function patchFilePathFor(profile: string | undefined, home: string): str
 }
 
 function patchFilePath(): string | undefined {
-  const home = process.env.DSH_HOME ?? join(homedir(), ".dsh");
-  return patchFilePathFor(detectProfile(), home);
+  return patchFilePathFor(detectProfile(), dshHome());
 }
 
 function yamlQuote(value: string): string {

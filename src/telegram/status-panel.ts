@@ -4,6 +4,7 @@
  * skipped entirely; a deleted message falls back to a fresh send.
  */
 import { ChatOps } from "./ephemeral.js";
+import { serializePerKey } from "./serialize-per-key.js";
 
 export interface PanelOps extends ChatOps {
   editText(chatId: number, messageId: number, text: string, options?: Record<string, unknown>): Promise<boolean>;
@@ -19,10 +20,7 @@ export class StatusPanel {
   private readonly locks = new Map<number, Promise<unknown>>();
 
   private serialize<T>(chatId: number, fn: () => Promise<T>): Promise<T> {
-    const prev = this.locks.get(chatId) ?? Promise.resolve();
-    const run = prev.then(fn, fn);
-    this.locks.set(chatId, run.then(noop, noop));
-    return run;
+    return serializePerKey(this.locks, chatId, fn);
   }
 
   /** Create the card on demand (Status button / command) or update it in
@@ -38,6 +36,12 @@ export class StatusPanel {
           panel.text = text;
           return;
         }
+        // The edit failed (the card message was deleted by hand, the chat was
+        // cleared, ...): the stored id is dead and must not be retried — drop
+        // the entry so live refreshes stop hammering it until the user asks
+        // for the panel again (audit RE-8; mirrors Ephemeral.replace's
+        // edit-failure self-healing).
+        this.panels.delete(chatId);
       }
       if (!createIfMissing) return;
       const id = await ops.sendText(chatId, text).catch(() => undefined);
@@ -51,8 +55,4 @@ export class StatusPanel {
     this.panels.clear();
     this.locks.clear();
   }
-}
-
-function noop(): void {
-  /* swallow chain errors */
 }

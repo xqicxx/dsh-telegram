@@ -427,6 +427,16 @@ function takeTrackedHandle(agentId: string): AgentHandle | undefined {
  * model selection, and remove its durable session directory. There is no web
  * RPC for this — it is a Telegram-side convenience. */
 export async function deleteSession(ctx: Context, sessionId: string): Promise<AdapterResult> {
+  // D-1: the raw id feeds `join(root, project, candidate)` and `rm -rf` below,
+  // and the token payload it arrives in can be forged by any authorized chat.
+  // Sanitize BEFORE any filesystem work: "" would collapse the path to the
+  // project directory itself, and `..`/separators could escape the sessions
+  // root. Legal internal ids contain none of these shapes, so they pass
+  // byte-for-byte; `encodeSegment` candidates below stay unchanged.
+  const safeId = sessionId.replace(/[/\\]/g, "_").slice(0, 200);
+  if (sessionId === "" || sessionId === "." || sessionId === ".." || safeId !== sessionId.trim()) {
+    return fail(`invalid session id: ${JSON.stringify(sessionId.slice(0, 50))}`);
+  }
   // 🟠-14: disposal funnels through SessionLifecycle's own bookkeeping —
   // claim the tracked handle first (so plugin teardown sees no residue) and
   // dispose it through the same guarded path as close(); only untracked

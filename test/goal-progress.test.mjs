@@ -5,16 +5,16 @@ import { GoalProgressFeed } from '../dist/telegram/goal-progress.js';
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const ev = (type, data = {}) => ({ type, data });
 
-function harness({ liveRenderer = false, pending = false, notify = { onComplete: true, onLongTask: true } } = {}) {
+function harness({ liveRenderer = false, pending = false, notify = { onComplete: true, onLongTask: true }, objective = 'research the market', send } = {}) {
   const listeners = new Map();
   const sends = [];
   const edits = [];
   const deps = {
     ops: {
-      send: async (chatId, text, options) => {
+      send: send ?? (async (chatId, text, options) => {
         sends.push({ chatId, text, options });
         return sends.length;
-      },
+      }),
       edit: async (chatId, messageId, text, options) => {
         edits.push({ chatId, messageId, text, options });
         return true;
@@ -23,7 +23,7 @@ function harness({ liveRenderer = false, pending = false, notify = { onComplete:
     },
     log: () => {},
     chatIdForAgent: (agentId) => (agentId === 'agent-1' ? 7 : undefined),
-    goalFor: () => ({ objective: 'research the market' }),
+    goalFor: () => ({ objective }),
     todosFor: () => [
       { content: 'collect data', status: 'completed' },
       { content: 'write report', status: 'in_progress' },
@@ -70,7 +70,8 @@ test('goal turn gets a progress card that finalizes into the openclaw receipt wi
   emit('agent-1', ev('turn/end', { turn: 1, reason: { kind: 'completed' } }));
   await sleep(20);
   const final = edits.at(-1).text;
-  assert.match(final, /✅ research the market/);
+  // (markup-tolerant: the objective may render bold in the receipt header)
+  assert.match(final, /✅ (?:<b>)?research the market(?:<\/b>)?/);
   assert.match(final, /🛠️ 1 次工具/);
   assert.match(final, /💾 命中 44%/, 'openclaw receipt keeps the cache hit-rate line');
   assert.equal(feed.snapshot(7), undefined, 'turn end clears the running snapshot');
@@ -105,7 +106,8 @@ test('goal heartbeat keeps the elapsed timer moving and completion pushes a fres
   emit('agent-1', ev('turn/end', { turn: 1, reason: { kind: 'completed' } }));
   assert.equal(sends.length, 2, 'completion is a NEW message, not just an in-place edit');
   assert.equal(sends[1].options.disable_notification, false, 'completion push rings the user');
-  assert.match(sends[1].text, /✅ research the market/);
+  // (markup-tolerant: the objective may render bold in the receipt header)
+  assert.match(sends[1].text, /✅ (?:<b>)?research the market(?:<\/b>)?/);
   feed.detach();
 });
 
@@ -121,5 +123,44 @@ test('notify.onLongTask/onComplete=false disables heartbeat and completion push 
   assert.equal(edits.length, 0, 'heartbeat switch off');
   emit('agent-1', ev('turn/end', { turn: 1, reason: { kind: 'completed' } }));
   assert.equal(sends.length, 1, 'completion push switch off');
+  feed.detach();
+});
+
+test('objective and current tool are HTML-escaped in card and receipt (RE-1)', async () => {
+  const { feed, sends, edits, emit } = harness({ objective: 'fix a <b> & c > d' });
+  emit('agent-1', ev('turn/start', { turn: 1 }));
+  assert.match(sends[0].text, /fix a &lt;b&gt; &amp; c &gt; d/, 'card header shows the escaped objective');
+  assert.doesNotMatch(sends[0].text, /<b> & c/, 'raw objective markup must not leak into the HTML card');
+
+  emit('agent-1', ev('tool/call', { name: '<script>' }));
+  await sleep(280);
+  assert.match(edits.at(-1).text, /&lt;script&gt;/, 'current tool line escapes its name');
+
+  emit('agent-1', ev('turn/end', { turn: 1, reason: { kind: 'completed' } }));
+  await sleep(20);
+  assert.match(edits.at(-1).text, /✅ (?:<b>)?fix a &lt;b&gt; &amp; c &gt; d/, 'receipt keeps the objective literal');
+  feed.detach();
+});
+
+test('a failed initial send must not delete a newer turn draft (RE-6)', async () => {
+  const deferred = [];
+  const { feed, emit } = harness({
+    // every card send parks until this test resolves it manually
+    send: () => new Promise((resolve) => deferred.push(resolve)),
+  });
+
+  emit('agent-1', ev('turn/start', { turn: 1 })); // turn A card -> deferred[0]
+  emit('agent-1', ev('turn/start', { turn: 2 })); // turn B replaces A while A's send is in flight
+  assert.ok(feed.snapshot(7), 'turn B owns the running state');
+
+  deferred[0](undefined); // turn A's send "fails" (no message id) after B took over
+  await sleep(20);
+  assert.ok(feed.snapshot(7), 'stale failure callback must not delete the newer draft');
+
+  deferred[1](5); // turn B's card lands with message id 5
+  await sleep(20);
+  emit('agent-1', ev('turn/end', { turn: 2, reason: { kind: 'completed' } }));
+  await sleep(20);
+  assert.ok(feed.snapshot(7) === undefined, 'turn B finalizes and clears normally');
   feed.detach();
 });

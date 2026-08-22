@@ -14,6 +14,7 @@
 import { homedir } from "node:os";
 import { join, parse, resolve } from "node:path";
 import type { Context } from "@deepseek-ai/cordis";
+import type { TelegramConfig } from "../config.js";
 import { describeSettings } from "../harness/adapters/settings.js";
 import { listCredentialRefs } from "../harness/adapters/credentials.js";
 import { breadcrumbSegments, describeHost, listDirectory, parentOf } from "../harness/adapters/host.js";
@@ -25,6 +26,8 @@ import type { OpenCard } from "../core/cards.js";
 interface HostCardsStateSlice {
   /** Active project root (host card cwd context). */
   readonly workspaceRoot: string;
+  /** Live config — security.browseRoots gates every directory listing. */
+  readonly config: TelegramConfig;
 }
 
 export interface HostCardsDeps {
@@ -70,7 +73,10 @@ export function createHostCards(deps: HostCardsDeps): {
       "",
       `applies: ${view.applies} \u00B7 revision: ${view.revision}`,
       view.schema !== undefined ? `schema: ${plain(truncate(JSON.stringify(view.schema), 300))}` : "schema: (not declared)",
-      `value: ${plain(truncate(JSON.stringify(view.value), 300))}`,
+      // RF-3: the settings contract types value as unknown (undefined allowed);
+      // JSON.stringify(undefined) returns undefined and truncate would crash
+      // reading .length, so render null like every other JSON line.
+      `value: ${plain(truncate(JSON.stringify(view.value ?? null), 300))}`,
       view.user !== undefined ? `user: ${plain(truncate(JSON.stringify(view.user), 200))}` : "",
       `secrets: ${view.secrets.map((secret) => `${secret.path.join(".")}=${secret.set ? "set" : "unset"}`).join(", ") || "none"}`,
     ].filter((line) => line !== "");
@@ -118,7 +124,7 @@ export function createHostCards(deps: HostCardsDeps): {
    * large folder never overflows the callback keyboard. */
   async function openHostDirectoryCard(chatId: number, path: string, page = 0): Promise<void> {
     const target = resolve(path);
-    const res = await listDirectory(target);
+    const res = await listDirectory(target, state.config.security.browseRoots);
     const dirs = (res.entries ?? []).filter((entry) => entry.kind === "directory");
     const files = (res.entries ?? []).length - dirs.length;
     const totalPages = Math.max(1, Math.ceil(dirs.length / HOST_BROWSE_PAGE_SIZE));

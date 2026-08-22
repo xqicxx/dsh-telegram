@@ -7,6 +7,12 @@
  * every operation is queued fire-and-forget style.
  */
 
+import { serializePerKey } from "./serialize-per-key.js";
+
+/** Retry base delay used wherever a consumer does not configure one
+ * explicitly (audit R3-3: the default literal lives in exactly one place). */
+export const DEFAULT_RETRY_BASE_DELAY_MS = 500;
+
 export interface QueueOptions {
   /** Max sends allowed per window. */
   maxPerWindow?: number;
@@ -75,7 +81,7 @@ export class SendQueue {
     this.maxPerWindow = positiveNumber(options.maxPerWindow, 20);
     this.windowMs = positiveNumber(options.windowMs, 1000);
     this.retryAttempts = nonNegativeNumber(options.retry?.attempts, 3);
-    this.retryBaseDelayMs = nonNegativeNumber(options.retry?.baseDelayMs, 500);
+    this.retryBaseDelayMs = nonNegativeNumber(options.retry?.baseDelayMs, DEFAULT_RETRY_BASE_DELAY_MS);
     this.sleep = options.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
     this.now = options.now ?? Date.now;
   }
@@ -104,13 +110,7 @@ export class SendQueue {
   /** Serialize per chat, then rate-limit globally, then run with retries. */
   push<T>(key: number | string, fn: () => Promise<T>): Promise<T> {
     this.queued += 1;
-    const prev = this.chains.get(key) ?? Promise.resolve();
-    const run = prev.then(
-      () => this.execute(fn),
-      () => this.execute(fn),
-    );
-    this.chains.set(key, run.then(noop, noop));
-    return run;
+    return serializePerKey(this.chains, key, () => this.execute(fn));
   }
 
   private async execute<T>(fn: () => Promise<T>): Promise<T> {
@@ -138,8 +138,4 @@ export class SendQueue {
   pendingCount(): number {
     return this.queued + this.active;
   }
-}
-
-function noop(): void {
-  /* keep the chain flowing after rejections */
 }

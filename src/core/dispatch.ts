@@ -168,13 +168,15 @@ export interface DispatchStateSlice {
 //    "stop" mean abort, the command means close — a semantic split.
 export type ActionOrigin = "token" | "callback" | "bar" | "command";
 export type ActionReply = (text: string, ok?: boolean) => Promise<void>;
+/** RA-2: the context carries only fields every entry actually reads — the
+ * former dead `payload?`/`args?`/`messageId?` slots (never read by any
+ * entry, never attached by dispatchCallback) are gone; re-add a field the
+ * day an entry consumes it. `"token"` is live since RA-1 wired the
+ * new-default token face. */
 export interface ActionContext {
   chatId: number;
   origin: ActionOrigin;
   reply: ActionReply;
-  payload?: Record<string, string>;
-  args?: string;
-  messageId?: number;
 }
 
 /** Everything the routing layer closes over, provided once by index.ts.
@@ -395,6 +397,20 @@ function uiReply(chatId: number): ActionReply {
   };
 }
 
+/** B-5r: confirm/action tokens minted with an `agentId` act on that session
+ * even when the chat rebinds between card render and tap (clearing the wrong
+ * goal / stopping the wrong plugin). A present-but-vanished id falls back to
+ * the chat's current resolution, exactly like goal-clear-confirm; a payload
+ * without the field behaves as before. */
+function resolveMintedAgent(chatId: number, payload: Record<string, string>): Agent | undefined {
+  const mintedId = payload["agentId"] ?? "";
+  if (mintedId !== "") {
+    const minted = requireCtx().agents?.get(mintedId as never);
+    if (minted !== undefined) return minted;
+  }
+  return currentAgent(chatId);
+}
+
 /** Shared create+bind behind callback `new-default`, bar ✨ and /new. Only the
  * announcement differs: surfaces with a live bar get ✨ and a bar refresh;
  * /new gets a plain send() reply (no ✨, no bar refresh). */
@@ -410,7 +426,12 @@ async function runNewSessionCreate(c: ActionContext): Promise<void> {
     : `❌ ${plain(res.text)}`);
 }
 
-const actions: Record<string, (c: ActionContext) => Promise<void> | void> = {
+/** RA-3: the literal keys survive on `actions` (satisfies instead of a
+ * widened `Record<string, …>` annotation), so a misspelled registry key or
+ * lookup — `actions["abrt"]` — fails at compile time instead of silently
+ * routing nowhere. */
+type ActionHandler = (c: ActionContext) => Promise<void> | void;
+const actions = {
   // Card openers — verbatim identical on every surface that carries them.
   "menu": (c) => openMenuAt(c.chatId, 0),
   "sessions": (c) => openSessionsCard(c.chatId, lastProjectKey(c.chatId)),
@@ -461,7 +482,11 @@ const actions: Record<string, (c: ActionContext) => Promise<void> | void> = {
     state.bridge?.bindAgent(c.chatId, undefined);
     await c.reply(res.ok ? `${res.text} — send any message to start a new session.` : res.text, res.ok);
   },
-};
+} satisfies Record<string, ActionHandler>;
+
+/** Every registry key above, for type-safe references to an action name
+ * without retyping the literal union. */
+type ActionKey = keyof typeof actions;
 
 // ---------------------------------------------------------------------------
 // Callback dispatch
@@ -476,6 +501,12 @@ async function dispatchToken(chatId: number, payload: Record<string, string>): P
   }
   const agent = currentAgent(chatId);
   switch (action) {
+    // RA-1: the New Session card's "✨ Use default preset" button mints
+    // `t:` tokens with action "new-default"; without this case the tap fell
+    // into `default:` and silently did nothing. Routes through the same
+    // registry entry the callback surface uses (create + bind + ✨ announce).
+    case "new-default":
+      return actions["new-default"]({ chatId, origin: "token", reply: uiReply(chatId) });
     case "project-open": {
       const offset = Number(payload["offset"] ?? "0");
       return openProjectCard(chatId, payload["path"], Number.isFinite(offset) && offset > 0 ? offset : 0);
@@ -827,7 +858,10 @@ async function dispatchToken(chatId: number, payload: Record<string, string>): P
     // confirms first because it deletes every immutable Package version.
     case "plugin-run": {
       const pluginId = payload["pluginId"] ?? "";
-      const agent = currentAgent(chatId);
+      // B-5r: prefer the agentId minted into the token over this chat's
+      // current binding, so a rebind between card render and tap cannot run
+      // the plugin on the wrong session.
+      const agent = resolveMintedAgent(chatId, payload);
       if (!agent) {
         await uiSend(chatId, "\u274C No live session in this chat \u2014 send a message first, then run plugins.", { parse_mode: "HTML" });
         return;
@@ -839,7 +873,7 @@ async function dispatchToken(chatId: number, payload: Record<string, string>): P
     }
     case "plugin-stop": {
       const pluginId = payload["pluginId"] ?? "";
-      const agent = currentAgent(chatId);
+      const agent = resolveMintedAgent(chatId, payload);
       if (!agent) {
         await uiSend(chatId, "\u274C No live session in this chat.", { parse_mode: "HTML" });
         return;
@@ -851,16 +885,18 @@ async function dispatchToken(chatId: number, payload: Record<string, string>): P
     }
     case "plugin-remove": {
       const pluginId = payload["pluginId"] ?? "";
+      // B-5r mint side: carry the acting agent's id into the confirm token so
+      // plugin-remove-confirm resolves the same session even after a rebind.
       return askConfirm(
         chatId,
         `\u{1F5D1} Remove plugin ${plain(truncate(pluginId, 32))}? All versions and the active run are deleted.`,
-        { action: "plugin-remove-confirm", pluginId },
+        { action: "plugin-remove-confirm", pluginId, ...(agent?.id !== undefined ? { agentId: agent.id } : {}) },
         { action: "plugin-remove-cancel", pluginId },
       );
     }
     case "plugin-remove-confirm": {
       const pluginId = payload["pluginId"] ?? "";
-      const agent = currentAgent(chatId);
+      const agent = resolveMintedAgent(chatId, payload);
       if (!agent) {
         await uiSend(chatId, "\u274C No live session in this chat.", { parse_mode: "HTML" });
         return;
@@ -941,7 +977,9 @@ async function dispatchCallback(chatId: number, data: string): Promise<void> {
     return ext.handler(chatId, {}, host);
   }
   if (data.startsWith("t:")) {
-    const payload = tokens.take(data);
+    // RF-1: the tap's chatId verifies the token's minting-chat ownership;
+    // tokens minted without a chat stay usable from anywhere (legacy cards).
+    const payload = tokens.take(data, chatId);
     if (payload) {
       log(`token dispatch ${data} action=${payload["action"] ?? "-"}`);
       try {
@@ -950,7 +988,7 @@ async function dispatchCallback(chatId: number, data: string): Promise<void> {
         // A callback that failed before producing its effect must stay
         // retryable: the user would otherwise be trapped behind
         // "already handled" with no way to try again.
-        const restored = tokens.restore(data, payload);
+        const restored = tokens.restore(data, payload, chatId);
         log(`token dispatch failed and token ${restored ? "restored for retry" : "stayed consumed"} action=${payload["action"] ?? "-"}`, err);
         throw err;
       }
@@ -1076,7 +1114,11 @@ async function dispatchCallback(chatId: number, data: string): Promise<void> {
         return openSessionsCard(chatId, lastProjectKey(chatId));
       }
       const items = listQueue(requireCtx(), id);
-      await openCard(chatId, `\u231B Queue \u00B7 ${plain(truncate(id, 24))} (${items.length})`, buildQueueKeyboard(items.map((item, index) => ({ itemId: item.itemId, kind: item.target, index }))));
+      // RH-5: this card lists a SPECIFIC session's queue, so its buttons
+      // carry the owner (`q:<sessionId>:<itemId>:<kind>`) by passing the
+      // composite through buildQueueKeyboard's `q:<itemId>` prefixing. Taps
+      // then act on this session even when the chat is bound elsewhere.
+      await openCard(chatId, `\u231B Queue \u00B7 ${plain(truncate(id, 24))} (${items.length})`, buildQueueKeyboard(items.map((item, index) => ({ itemId: `${id}:${item.itemId}`, kind: item.target, index }))));
       return;
     }
     return openSessionDetailCard(chatId, id);
@@ -1104,6 +1146,14 @@ async function dispatchCallback(chatId: number, data: string): Promise<void> {
     if (sub === "up" || sub === "down") {
       const { items } = listWorkspaces(requireCtx());
       const index = items.findIndex((workspace) => workspace.workspaceId === id);
+      // RH-4: moving the first item up would compute anchor=undefined, which
+      // the registry reads as "append to the end" — the opposite of the tap.
+      // Short-circuit instead; "down" on the last item is already a no-op
+      // append, so only the up edge needs the guard.
+      if (sub === "up" && index === 0) {
+        await uiSend(chatId, "Already first.", { parse_mode: "HTML" });
+        return openWorkspacesCard(chatId);
+      }
       if (index !== -1) {
         const anchor = sub === "up" ? items[index - 1]?.workspaceId : items[index + 2]?.workspaceId;
         const res = await insertWorkspaceBefore(requireCtx(), id, anchor);
@@ -1119,9 +1169,22 @@ async function dispatchCallback(chatId: number, data: string): Promise<void> {
   }
   if (data.startsWith("q:")) {
     const parts = data.split(":");
-    const itemId = parts[1] ?? "";
+    // RH-5: newer queue cards encode the owning session into the item slot
+    // (`q:<enc("sessionId:itemId>")>:<kind>` — the composite rides through
+    // the byte-safe callback encoder, so ":" arrives as "%3A"). Resolve
+    // through THAT session so taps act on the card's queue even when the
+    // chat is bound elsewhere. Legacy `q:<itemId>:<kind>` buttons (no
+    // colon in the decoded item slot) keep the chat-bound resolution; an
+    // encoded session that is no longer live falls back too and simply
+    // misses, surfacing as the ordinary "queue item not found" reply.
     const kind = parts[2] ?? "";
-    const agent = currentAgent(chatId);
+    const decodedItem = decodeCallbackValue(parts[1] ?? "");
+    const sep = decodedItem.indexOf(":");
+    const sessionCandidate = sep === -1 ? "" : decodedItem.slice(0, sep);
+    const encodedSession = sessionCandidate !== "" && sessionLifecycle.find(requireCtx(), sessionCandidate) !== undefined;
+    const sessionId = encodedSession ? sessionCandidate : undefined;
+    const itemId = encodedSession ? decodedItem.slice(sep + 1) : decodedItem;
+    const agent = sessionId !== undefined ? sessionLifecycle.find(requireCtx(), sessionId) : currentAgent(chatId);
     if (!agent) {
       await uiSend(chatId, "\u274C No live agent owns the queue.", { parse_mode: "HTML" });
       return openQueueCard(chatId);
@@ -1291,6 +1354,14 @@ async function dispatchCallback(chatId: number, data: string): Promise<void> {
     case "compact":
       return actions["compact"](actionCtx);
     case "allowthis": {
+      // A-1: the bootstrap channel stays available by default, but a
+      // deployment may close it with security.selfAllow:false (undefined
+      // keeps the historical behavior). The key is read defensively so this
+      // compiles against config schemas that predate it.
+      if ((state.config.security as { selfAllow?: boolean }).selfAllow === false) {
+        await uiSend(chatId, "\u274C Self-allow is disabled. Ask the owner to add this chat.", { parse_mode: "HTML" });
+        return openMenuAt(chatId, menuPageIndex.get(chatId) ?? 0);
+      }
       if (!isChatAllowed(state.config, chatId)) {
         state.config.security.allowedChatIds.push(chatId);
         writeConfig(state.configRoot, state.config);
@@ -1479,7 +1550,7 @@ async function dispatchCommand(chatId: number, command: string, args: string, me
     log(`command reply chatId=${chatId} command=${command} kind=${okResult ? "ok" : "error"}`);
     await uiSend(chatId, okResult ? plain(text) : `\u274C ${plain(text)}`, { parse_mode: "HTML" });
   };
-  const actionCtx: ActionContext = { chatId, origin: "command", args, messageId, reply: send };
+  const actionCtx: ActionContext = { chatId, origin: "command", reply: send };
   // Per-invocation bundle for the implementations in ./commands.ts — this
   // function's own locals, passed whole so the moved bodies stay verbatim.
   const cmd: CommandCall = { chatId, command, args, messageId, ctx, agent, t, send };
@@ -1498,6 +1569,12 @@ async function dispatchCommand(chatId: number, command: string, args: string, me
       return barCommand(deps, cmd);
     case "menucheck":
       return menuSelfCheckCommand(deps, cmd);
+    case "todo":
+    case "todos":
+      // RH-3: /todo is registered in the native Telegram command menu but had
+      // no dispatch branch, so every tap fell through to "Unknown command".
+      // Route it (and an explicit /todos) to the same Todos card.
+      return actions["todos"](actionCtx);
     case "config":
       return configCommand(deps, cmd);
     case "history":

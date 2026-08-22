@@ -49,6 +49,23 @@ test('promptSubagent degrades cleanly without the service or parent', async () =
   assert.equal((await promptSubagent(ctx, 'missing-parent', 'child', 'x')).ok, false);
 });
 
+test('promptSubagent rejects blank prompt text (RG-6)', async () => {
+  let called = false;
+  const ctx = makeCtx({
+    async followup() {
+      called = true;
+      return 'm';
+    },
+    interrupt() {},
+  });
+  for (const blank of ['', '   ', '\n\t']) {
+    const res = await promptSubagent(ctx, 'parent-session', 'child-session', blank);
+    assert.equal(res.ok, false, `blank ${JSON.stringify(blank)} must be rejected`);
+    assert.match(res.text, /blank/);
+  }
+  assert.equal(called, false, 'no followup is fired for blank prompts');
+});
+
 test('promptSubagent only delivers to continuable child subagents (web contract)', async () => {
   const ctx = makeCtx({
     async followup() { throw new Error('must not be called'); },

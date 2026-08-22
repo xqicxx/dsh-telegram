@@ -330,23 +330,43 @@ export async function menuSelfCheckCommand(deps: DispatchDeps, c: CommandCall): 
 }
 
 
+/** Secret-shaped config leaf paths (RE-3): a get of these echoes only the
+ * last four characters, so API keys never land in the Telegram cloud chat
+ * record. Exported so the `/telegram config` twin in index.ts can mask with
+ * the exact same rule. */
+const SECRET_CONFIG_PATH_RE = /(api[-_]?key|token|secret|password)$/i;
+
+export function maskConfigValue(path: string, value: unknown): string {
+  return SECRET_CONFIG_PATH_RE.test(path) ? `***${String(value).slice(-4)}` : `${JSON.stringify(value)}`;
+}
+
 /** /config — body moved verbatim from the former
  * dispatchCommand switch case. */
 export async function configCommand(deps: DispatchDeps, c: CommandCall): Promise<void> {
   const { chatId, args, send } = c;
   const { state, applyConfigLive } = deps;
-      const [op, path, ...rest] = args.trim().split(/\s+/);
+      // RH-1: tokens split at the FIRST space after each position instead of
+      // `split(/\s+/)` + join(" "), which silently collapsed runs of spaces
+      // inside JSON values before persisting them (same discipline as
+      // settingsupdate). Leading whitespace between tokens is trimmed away —
+      // only value-interior spacing must survive.
+      const opEnd = args.indexOf(" ");
+      const op = (opEnd === -1 ? args : args.slice(0, opEnd)).trim();
+      const tail = (opEnd === -1 ? "" : args.slice(opEnd + 1)).trim();
+      const pathEnd = tail.indexOf(" ");
+      const path = (pathEnd === -1 ? tail : tail.slice(0, pathEnd)).trim();
+      const jsonText = pathEnd === -1 ? "" : tail.slice(pathEnd + 1).trimStart();
       if (!op || !path) {
         await send("/config get <path> \u00B7 /config set <path> <json> \u2014 hot-applies + persists under .pi/telegram.json\nForever-allow a tool: /config set interactive.allowByTool [\"bash\"] \u00B7 revoke: []");
         return;
       }
       try {
         if (op === "get") {
-          await send(`${path} = ${JSON.stringify(getConfigPath(state.config, path))}`);
+          await send(`${path} = ${maskConfigValue(path, getConfigPath(state.config, path))}`);
           return;
         }
         if (op === "set") {
-          const value = JSON.parse(rest.join(" "));
+          const value = JSON.parse(jsonText);
           const { config, changed } = overlayConfig(state.config, patchFromPath(path, value));
           if (changed.length === 0) {
             await send(`Unknown config path ${path}.`, false);
@@ -370,7 +390,7 @@ export async function configCommand(deps: DispatchDeps, c: CommandCall): Promise
 /** /history — body moved verbatim from the former
  * dispatchCommand switch case. */
 export async function historyCommand(deps: DispatchDeps, c: CommandCall): Promise<void> {
-  const { chatId, args, ctx, send } = c;
+  const { chatId, args, ctx, send, t } = c;
   const { boundAgentId } = deps;
       const [id, limitText] = args.trim().split(/\s+/);
       const sessionId = id || boundAgentId(chatId);
@@ -382,7 +402,16 @@ export async function historyCommand(deps: DispatchDeps, c: CommandCall): Promis
       // 轨迹 ledger. The optional second arg caps how many turns are shown.
       const maxTurns = Math.max(1, Math.min(20, Number(limitText) || 6));
       const result = await readTrajectory(ctx, sessionId, maxTurns);
-      await send(renderTrajectoryLines(sessionId, result).join("\n"));
+      // Design language: the trajectory renders Telegram HTML (bold turn
+      // labels, monospace models, expandable fold). Send it through the UI
+      // control lane with parse_mode HTML; if the API ever rejects the
+      // markup, degrade to the escaped plain reply instead of dropping it.
+      const html = renderTrajectoryLines(sessionId, result).join("\n");
+      try {
+        await t.sendTextControl(chatId, html, { parse_mode: "HTML" });
+      } catch {
+        await send(html.replace(/<[^>]+>/g, ""));
+      }
       return;
 }
 
@@ -520,8 +549,13 @@ export async function queueEditCommand(deps: DispatchDeps, c: CommandCall): Prom
 export async function goalCreateCommand(deps: DispatchDeps, c: CommandCall): Promise<void> {
   const { args, ctx, agent, send } = c;
       const parts = args.trim().split(/\s+/);
-      const maxRounds = parts.length > 1 ? Number(parts[parts.length - 1]) : undefined;
-      const objective = Number.isFinite(maxRounds) ? parts.slice(0, -1).join(" ") : parts.join(" ");
+      // RH-2: only a positive INTEGER final token counts as maxRounds —
+      // "Deploy 2.0 to prod" keeps its version number, and -3 / 0 / 2.5 are
+      // no longer silently accepted as round limits.
+      const last = parts[parts.length - 1] ?? "";
+      const n = Number(last);
+      const maxRounds = parts.length > 1 && Number.isInteger(n) && n > 0 ? n : undefined;
+      const objective = maxRounds !== undefined ? parts.slice(0, -1).join(" ") : parts.join(" ");
       if (!agent) {
         await send("No live agent \u2014 goals are per-agent.", false);
         return;
@@ -530,7 +564,7 @@ export async function goalCreateCommand(deps: DispatchDeps, c: CommandCall): Pro
         await send("usage: /goal <objective> [maxRounds]");
         return;
       }
-      const res = await createGoal(ctx, agent.id, objective, Number.isFinite(maxRounds) ? maxRounds : undefined);
+      const res = await createGoal(ctx, agent.id, objective, maxRounds);
       await send(res.text, res.ok);
       return;
 }
@@ -541,8 +575,11 @@ export async function goalCreateCommand(deps: DispatchDeps, c: CommandCall): Pro
 export async function goalEditCommand(deps: DispatchDeps, c: CommandCall): Promise<void> {
   const { args, ctx, agent, send } = c;
       const parts = args.trim().split(/\s+/);
-      const candidate = parts.length > 1 ? Number(parts[parts.length - 1]) : undefined;
-      const maxRounds = Number.isFinite(candidate) ? candidate : undefined;
+      // RH-2: same positive-integer rule as /goal — a non-integer or
+      // non-positive trailing token stays inside the objective text.
+      const last = parts[parts.length - 1] ?? "";
+      const n = Number(last);
+      const maxRounds = parts.length > 1 && Number.isInteger(n) && n > 0 ? n : undefined;
       const objective = (maxRounds === undefined ? parts : parts.slice(0, -1)).join(" ");
       const goal = agent ? getGoal(ctx, agent.id) : undefined;
       if (!agent || !goal || !objective) {
@@ -582,7 +619,7 @@ export async function workspaceCreateCommand(deps: DispatchDeps, c: CommandCall)
       const parts = args.trim().split(/\s+/);
       const path = parts[0] ?? "";
       const title = parts.slice(1).join(" ");
-      const res = await createWorkspace(ctx, path, title || undefined);
+      const res = await createWorkspace(ctx, path, title || undefined, deps.state.config.security.browseRoots);
       await send(res.text, res.ok);
       return;
 }
@@ -772,7 +809,7 @@ export async function credentialUnsetCommand(deps: DispatchDeps, c: CommandCall)
 export async function lsCommand(deps: DispatchDeps, c: CommandCall): Promise<void> {
   const { args, send } = c;
   const { state } = deps;
-      const res = await listDirectory(args.trim() || state.workspaceRoot);
+      const res = await listDirectory(args.trim() || state.workspaceRoot, state.config.security.browseRoots);
       await send(res.text, res.ok);
       return;
 }
@@ -803,7 +840,8 @@ export async function attachmentCommand(deps: DispatchDeps, c: CommandCall): Pro
  * dispatchCommand switch case. */
 export async function mkdirCommand(deps: DispatchDeps, c: CommandCall): Promise<void> {
   const { args, send } = c;
-      const res = await createDirectory(args.trim());
+  const { state } = deps;
+      const res = await createDirectory(args.trim(), state.config.security.browseRoots);
       await send(res.text, res.ok);
       return;
 }
@@ -826,7 +864,7 @@ export async function pickdirCommand(deps: DispatchDeps, c: CommandCall): Promis
 export async function openpathCommand(deps: DispatchDeps, c: CommandCall): Promise<void> {
   const { args, send } = c;
   const { state } = deps;
-      const res = openPath(args.trim() || state.workspaceRoot);
+      const res = openPath(args.trim() || state.workspaceRoot, state.config.security.browseRoots);
       await send(res.text, res.ok);
       return;
 }
@@ -876,7 +914,11 @@ export async function sessionlogCommand(deps: DispatchDeps, c: CommandCall): Pro
       await send("Building the session-log ZIP (same archive the web serves)\u2026");
       const exported = await exportSessionLog(ctx, sessionId, true);
       if (exported.result.ok && exported.buffer) {
-        await t.sendDocument(chatId, exported.buffer, `${sessionId}.zip`, `${sessionId} \u00B7 session log`);
+        // RH-8: sanitize the id into a filename the uploader accepts — raw
+        // session ids with path-ish characters made sendDocument fail on the
+        // very last step (same shape as the s:log card's `session-<id>.zip`).
+        const fileName = `session-${sessionId.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 32)}.zip`;
+        await t.sendDocument(chatId, exported.buffer, fileName, `${sessionId} \u00B7 session log`);
         await send(exported.result.text, true);
       } else {
         await send(exported.result.text, false);

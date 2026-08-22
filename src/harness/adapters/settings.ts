@@ -58,13 +58,15 @@ function settingsOf(ctx: Context): SettingsProviderLike | undefined {
 
 /** Split a Telegram command argument of the form `<json> [expectedRevision]`
  * without disturbing whitespace inside JSON string values: full JSON first,
- * then a backwards scan for a trailing integer after the closing token. */
-export function parseJsonWithRevision(raw: string): { json: string; revision?: number } | undefined {
+ * then a backwards scan for a trailing integer after the closing token.
+ * A-2: the parsed `value` rides along so callers never JSON.parse a second
+ * time; the `json` field keeps the original shape backward compatible. */
+export function parseJsonWithRevision(raw: string): { json: string; value: unknown; revision?: number } | undefined {
   const trimmed = raw.trim();
   if (trimmed === "") return undefined;
   try {
-    JSON.parse(trimmed);
-    return { json: trimmed };
+    const value: unknown = JSON.parse(trimmed);
+    return { json: trimmed, value };
   } catch {
     /* try the optional revision suffix below */
   }
@@ -74,8 +76,8 @@ export function parseJsonWithRevision(raw: string): { json: string; revision?: n
     const tail = trimmed.slice(index).trim();
     if (!/^\d+$/.test(tail)) continue;
     try {
-      JSON.parse(head);
-      return { json: head, revision: Number(tail) };
+      const value: unknown = JSON.parse(head);
+      return { json: head, value, revision: Number(tail) };
     } catch {
       continue;
     }
@@ -125,6 +127,12 @@ async function withSettingsWrite(ctx: Context, ns: string, label: string, write:
 }
 
 export async function updateSettings(ctx: Context, ns: string, patch: object, expectedRevision?: number): Promise<AdapterResult & { view?: SettingsNamespaceView }> {
+  // RG-5: the command layer hands through any parsed JSON. Scalar/array
+  // patches violate the settings.update contract — reject them here with the
+  // same clarity replace() applies to its section.
+  if (patch === null || typeof patch !== "object" || Array.isArray(patch)) {
+    return fail("settings patch must be a JSON object");
+  }
   return withSettingsWrite(ctx, ns, "updated", (settings) => settings.update(ns, patch, expectedRevision));
 }
 

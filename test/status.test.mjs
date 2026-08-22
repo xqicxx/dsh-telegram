@@ -314,3 +314,73 @@ test('zeroed projection does not shadow live event token counts', async () => {
   assert.equal(snap.stats.outputTokens, 40);
   assert.equal(snap.stats.cacheReadTokens, 900);
 });
+
+// ---------------------------------------------------------------------------
+// RE-8: TelegramStatusPanel (src/telegram/status-panel.ts) must drop its
+ // stored entry when an in-place edit fails, or live refreshes hammer the
+// dead message id forever until the user taps Status manually.
+// ---------------------------------------------------------------------------
+
+function makePanelOps() {
+  const ops = {
+    sends: [],
+    edits: [],
+    /** Message ids that no longer exist on Telegram (deleted externally). */
+    deadIds: new Set(),
+    nextId: 100,
+    async sendText(chatId, text) {
+      const id = ops.nextId++;
+      ops.sends.push({ chatId, text, id });
+      return id;
+    },
+    async deleteMessage() {},
+    async editText(chatId, messageId, text) {
+      ops.edits.push({ messageId, text });
+      if (ops.deadIds.has(messageId)) return false; // "message to edit not found"
+      return true;
+    },
+  };
+  return ops;
+}
+
+test('status panel drops a dead entry after a failed edit so it is never re-edited (RE-8)', async () => {
+  const { StatusPanel } = await import('../dist/telegram/status-panel.js');
+  const ops = makePanelOps();
+  const panel = new StatusPanel();
+
+  await panel.refresh(7, ops, 'status v1', true);
+  assert.equal(ops.sends.length, 1);
+  const cardId = ops.sends[0].id;
+
+  // The user deletes the card message by hand; the next LIVE refresh
+  // (createIfMissing=false) fails to edit and must forget the dead id.
+  ops.deadIds.add(cardId);
+  await panel.refresh(7, ops, 'status v2');
+  assert.equal(ops.sends.length, 1, 'no fallback send while createIfMissing=false');
+
+  // Later refreshes neither re-edit the corpse nor duplicate cards…
+  await panel.refresh(7, ops, 'status v2');
+  await panel.refresh(7, ops, 'status v3');
+  assert.equal(ops.edits.filter((edit) => edit.messageId === cardId).length, 1,
+    'the dead id is attempted exactly once, then dropped');
+  assert.equal(ops.sends.length, 1);
+
+  // …and an explicit Status tap re-creates a FRESH card without touching
+  // the dead id first.
+  await panel.refresh(7, ops, 'status v3', true);
+  assert.equal(ops.sends.length, 2, 'a fresh card is sent');
+  assert.equal(ops.edits.filter((edit) => edit.messageId === cardId).length, 1,
+    'the dead id stays untouched by the recreation path');
+});
+
+test('a live status card keeps updating in place — the drop only follows real failures', async () => {
+  const { StatusPanel } = await import('../dist/telegram/status-panel.js');
+  const ops = makePanelOps();
+  const panel = new StatusPanel();
+
+  await panel.refresh(7, ops, 'live v1', true);
+  await panel.refresh(7, ops, 'live v2');
+  await panel.refresh(7, ops, 'live v2'); // identical content skipped entirely
+  assert.equal(ops.sends.length, 1, 'no duplicates for a healthy card');
+  assert.deepEqual(ops.edits.map((edit) => edit.text), ['live v2'], 'in-place edits carry the updates');
+});

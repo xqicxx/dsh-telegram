@@ -6,6 +6,7 @@
  *   other text     -> onUserText  (whitelist-checked, feeds the agent inbox)
  */
 import { normalizeBarLabel } from "./keyboard.js";
+import { serializePerKey } from "./serialize-per-key.js";
 import type { TelegramTransport } from "./transport.js";
 
 export interface RouterDeps {
@@ -21,7 +22,10 @@ export interface RouterDeps {
   onUnauthorized: (chatId: number, reason?: string) => void | Promise<void>;
 }
 
-const COMMAND_RE = /^\/([a-zA-Z0-9_]+)(?:\s+([\s\S]*))?$/;
+/** `/cmd` — plus the group-chat `/cmd@BotName` form, whose bot-name suffix is
+ * accepted and excluded from the captured command (audit RE-12: `/status@MyBot`
+ * used to miss the regex entirely and fall into the agent inbox). */
+const COMMAND_RE = /^\/([a-zA-Z0-9_]+)(?:@[A-Za-z0-9_]+)?(?:\s+([\s\S]*))?$/;
 
 /** Two FIFO lanes per chat:
  * - `user`: real inbound content (text/photos/documents). These MUST stay in
@@ -34,20 +38,10 @@ const userChains = new Map<number, Promise<unknown>>();
 const uiChains = new Map<number, Promise<unknown>>();
 
 function enqueue(chains: Map<number, Promise<unknown>>, chatId: number, task: () => unknown | Promise<unknown>): Promise<void> {
-  const previous = chains.get(chatId) ?? Promise.resolve();
-  const run = previous
-    .catch(() => {})
-    .then(task)
-    .then(() => {});
-  const settled = run.then(
-    () => undefined,
-    () => undefined,
-  );
-  chains.set(chatId, settled);
-  void settled.then(() => {
-    if (chains.get(chatId) === settled) chains.delete(chatId);
-  });
-  return run;
+  // Shared per-key serialization (audit R3-2): the task runs once the
+  // previous one settles (either way), a rejected task never poisons the
+  // lane, and the map entry is swept when it is still the tail.
+  return serializePerKey(chains, chatId, task).then(() => {});
 }
 
 export function attachRouter(deps: RouterDeps): void {

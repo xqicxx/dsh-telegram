@@ -6,6 +6,7 @@
  */
 import type { StatusStats } from "../harness/adapters/status.js";
 import { renderStatsLine } from "../harness/adapters/status.js";
+import { DOT, bold, metaJoin } from "./ui.js";
 
 export interface TokenFold {
   uncachedInputTokens: number;
@@ -30,10 +31,13 @@ export interface TurnReceipt {
  * renderer instead of being shown to the user. */
 export function renderTurnReceipt(receipt: TurnReceipt): string {
   const seconds = Math.max(1, Math.round(receipt.durationMs / 1000));
+  // Design language: the outcome/objective leads in bold, quiet metrics trail.
+  // The objective is user text under parse_mode HTML — escape it (a `<` in a
+  // goal would otherwise fail the receipt send with HTTP 400).
   const parts = [
     receipt.goalObjective === undefined
-      ? `\u2699\uFE0F \u5B8C\u6210 \u00B7 \u23F1\uFE0F ${seconds}s`
-      : `\u2705 ${receipt.goalObjective.slice(0, 60)} \u00B7 \u23F1\uFE0F ${seconds}s`,
+      ? metaJoin(`\u2699\uFE0F ${bold("\u5B8C\u6210")}`, `\u23F1\uFE0F ${seconds}s`)
+      : metaJoin(`\u2705 ${bold(receipt.goalObjective.slice(0, 60))}`, `\u23F1\uFE0F ${seconds}s`),
   ];
 
   if ((receipt.reasoningSteps ?? 0) > 0) parts.push(`\u{1F9E0} ${receipt.reasoningSteps} \u6B21\u601D\u8003`);
@@ -46,5 +50,5 @@ export function renderTurnReceipt(receipt: TurnReceipt): string {
   const cached = receipt.tokens?.cacheReadTokens ?? 0;
   if (billed > 0 && cached > 0) parts.push(`\u{1F4BE} \u547D\u4E2D ${Math.round((cached / billed) * 100)}%`);
 
-  return parts.join(" \u00B7 ");
+  return parts.join(DOT);
 }

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { listPlugins, persistPluginPatch, patchFilePathFor } from '../dist/harness/adapters/plugins.js';
 
@@ -107,4 +107,43 @@ test('listPlugins mirrors the web pluginInventory projection', () => {
   assert.deepEqual(list[0], { entryId: 'a', moduleName: 'A', enabled: true, fiberPhase: 'active' });
   assert.deepEqual(list[1], { entryId: 'b', moduleName: 'B', enabled: false, fiberPhase: null });
   assert.deepEqual(list[2], { entryId: 'd', moduleName: undefined, enabled: true, fiberPhase: null });
+});
+
+test('the durable toggle path resolves its home through dshHome (R3-4/RG-3)', () => {
+  const prevHome = process.env.DSH_HOME;
+  const prevArgv = process.argv;
+  // A profile name that cannot exist under either home, so both probes fail
+  // at the missing-file check and never write anywhere.
+  const argv = ['node', 'dsh', '--profile=r34-home-probe'];
+  try {
+    // A configured DSH_HOME drives the patch path: the clean fail names the
+    // exact path, proving dshHome() is the single source.
+    process.argv = argv;
+    process.env.DSH_HOME = join(tmpdir(), 'dsh-home-plugins-r34');
+    const missing = persistPluginPatch('plugin-x', true);
+    assert.equal(missing.ok, false);
+    assert.match(missing.text, /missing/);
+    assert.ok(
+      missing.text.includes(['dsh-home-plugins-r34', 'profiles', 'r34-home-probe', 'cordis.patch.yml'].join('/')),
+      `expected the DSH_HOME-based path, got: ${missing.text}`,
+    );
+    // An empty DSH_HOME falls back to ~/.dsh instead of a cwd-relative path.
+    process.env.DSH_HOME = '';
+    const fallback = persistPluginPatch('plugin-x', true);
+    assert.equal(fallback.ok, false);
+    assert.match(fallback.text, /missing/);
+    assert.ok(
+      fallback.text.includes(join(homedir(), '.dsh', 'profiles', 'r34-home-probe', 'cordis.patch.yml')),
+      `empty DSH_HOME must fall back to ~/.dsh, got: ${fallback.text}`,
+    );
+    assert.equal(
+      fallback.text.startsWith(`patch file missing: ${process.cwd()}`),
+      false,
+      'the path must never be cwd-relative',
+    );
+  } finally {
+    if (prevHome === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = prevHome;
+    process.argv = prevArgv;
+  }
 });

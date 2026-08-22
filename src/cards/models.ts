@@ -18,6 +18,7 @@ import { REASONING_DEFAULT, REASONING_EFFORTS, isReasoningEffort, reasoningLabel
 import { currentSessionModel } from "../harness/adapters/sessions.js";
 import { modelCatalog, providerCatalog } from "../harness/adapters/llm.js";
 import { plain, truncate } from "../telegram/html.js";
+import { bold, headerLine, metaJoin, mono } from "../telegram/ui.js";
 import { buildModelDetailKeyboard, buildModelsKeyboard, buildProvidersKeyboard, buildThinkingKeyboard } from "../telegram/keyboard.js";
 import type { CardLoad, OpenCard } from "../core/cards.js";
 
@@ -57,13 +58,24 @@ export function createModelCards(deps: ModelCardsDeps): {
     const current = agent ? currentSessionModel(ctx, agent.id) : {};
     const catalog = await cardLoad(chatId, "model catalog", () => modelCatalog(ctx, current));
     if (catalog === undefined) return;
+    // Design language: bold header with the live selection in mono, provider
+    // groups bold with mono model ids indented beneath.
+    const currentModel = current.provider !== undefined || current.model !== undefined
+      ? mono(`${current.provider !== undefined ? `${current.provider}/` : ""}${current.model ?? "default"}`)
+      : undefined;
     const lines = [
-      `\u{1F9E9} Models \u00B7 current: ${current.provider ? `${plain(current.provider)}/` : ""}${plain(current.model ?? "default")}${current.reasoningEffort ? ` (${plain(current.reasoningEffort)})` : ""} \u00B7 routable: ${catalog.routable ? "yes" : "no"}`,
+      headerLine(
+        "\u{1F9E9}",
+        "Models",
+        currentModel,
+        current.reasoningEffort !== undefined ? mono(current.reasoningEffort) : undefined,
+        catalog.routable ? undefined : "\u26A0\uFE0F not routable",
+      ),
       "",
     ];
     for (const group of catalog.groups) {
-      lines.push(`\u2022 ${plain(group.name)} (${plain(group.id)})`);
-      for (const model of group.models.slice(0, 12)) lines.push(`  \u2212 ${plain(truncate(model.id, 40))}`);
+      lines.push(`\u2022 ${bold(group.name)} ${mono(group.id)}`);
+      for (const model of group.models.slice(0, 12)) lines.push(`  \u2212 ${mono(truncate(model.id, 40))}`);
       if (group.models.length > 12) lines.push(`  \u2026 +${group.models.length - 12}`);
     }
     for (const failure of catalog.failures) lines.push(`\u26A0\uFE0F ${plain(failure.provider)}: ${plain(failure.message)}`);
@@ -78,10 +90,16 @@ export function createModelCards(deps: ModelCardsDeps): {
   async function openProvidersCard(chatId: number): Promise<void> {
     const catalog = await cardLoad(chatId, "llm providers", () => providerCatalog(requireCtx()));
     if (catalog === undefined) return;
-    const lines = [`\u{1F6F0}\uFE0F Providers (${catalog.providers.length})`, ""];
+    const lines = [headerLine("\u{1F6F0}\uFE0F", "Providers", `${catalog.providers.length}`), ""];
     for (const provider of catalog.providers.slice(0, 20)) {
-      lines.push(`\u2022 ${plain(provider.id)} \u00B7 ${plain(provider.name)}`);
-      lines.push(`  settings: ${plain(provider.settingsNs ?? "\u2014")}${provider.settingsPath ? ` (${plain(truncate(provider.settingsPath, 40))})` : ""} \u00B7 active: ${provider.active === undefined ? "\u2014" : provider.active ? "yes" : "no"} \u00B7 declared: ${provider.declared === undefined ? "\u2014" : provider.declared ? "yes" : "no"}`);
+      lines.push(`\u2022 ${bold(provider.id)} \u00B7 ${plain(provider.name)}`);
+      lines.push(
+        metaJoin(
+          `  settings ${mono(provider.settingsNs ?? "\u2014")}${provider.settingsPath !== undefined ? ` (${plain(truncate(provider.settingsPath, 40))})` : ""}`,
+          `active ${provider.active === undefined ? "\u2014" : provider.active ? "yes" : "no"}`,
+          `declared ${provider.declared === undefined ? "\u2014" : provider.declared ? "yes" : "no"}`,
+        ),
+      );
     }
     if (catalog.providers.length === 0) lines.push("No providers registered in the llm registry.");
     for (const failure of catalog.failures) lines.push(`\u26A0\uFE0F ${plain(failure.provider)}: ${plain(failure.message)}`);
@@ -106,9 +124,12 @@ export function createModelCards(deps: ModelCardsDeps): {
     const safe = Math.max(0, Math.min(page, totalPages - 1));
     const pageModels = group.models.slice(safe * MODELS_PAGE_SIZE, (safe + 1) * MODELS_PAGE_SIZE);
     const lines = [
-      `\u{1F4E1} ${plain(group.name)} \u00B7 page ${safe + 1}/${totalPages}`,
+      headerLine("\u{1F4E1}", truncate(group.name, 30), `page ${safe + 1}/${totalPages}`),
       "",
-      `current: ${current.provider === providerId ? plain(current.model ?? "default") : "other provider"}`,
+      metaJoin(
+        "current",
+        current.provider === providerId ? mono(current.model ?? "default") : "other provider",
+      ),
       "",
     ];
     const models = pageModels.map((model) => ({
@@ -117,7 +138,8 @@ export function createModelCards(deps: ModelCardsDeps): {
       cb: token({ action: "model-select", provider: providerId, model: model.id }),
     }));
     for (const model of models) {
-      lines.push(`${current.provider === providerId && current.model === model.id ? "\u2705" : "\u25CB"} ${plain(truncate(model.id, 40))}`);
+      const selected = current.provider === providerId && current.model === model.id;
+      lines.push(`${selected ? "\u2705" : "\u25CB"} ${mono(truncate(model.id, 40))}`);
       if (model.name !== model.id) lines.push(`   ${plain(truncate(model.name, 40))}`);
     }
     const selectedModel = current.provider === providerId && current.model !== undefined ? current.model : undefined;
@@ -152,7 +174,7 @@ export function createModelCards(deps: ModelCardsDeps): {
       name: reasoningLabel(effort),
       cb: token({ action: "model-effort", provider: providerId, model: modelId, effort }),
     }));
-    await openCard(chatId, `\u{1F9E0} Thinking effort \u00B7 ${plain(providerId)}/${plain(modelId)}`, buildThinkingKeyboard(options, active));
+    await openCard(chatId, headerLine("\u{1F9E0}", "Thinking effort", mono(`${providerId}/${modelId}`)), buildThinkingKeyboard(options, active));
   }
 
   return { openModelsCard, openProvidersCard, openProviderModelsCard, openModelThinkingCard, currentReasoningEffort };

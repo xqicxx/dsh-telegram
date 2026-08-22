@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { SessionLifecycle, selectSessionModel, currentSessionModel } from '../dist/harness/adapters/sessions.js';
+import { mkdirSync, mkdtempSync, existsSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { SessionLifecycle, selectSessionModel, currentSessionModel, deleteSession } from '../dist/harness/adapters/sessions.js';
 
 function makeCtx({ liveAgents = [], defaultSelection = { provider: 'opencode-go', model: 'deepseek-v4-flash' } } = {}) {
   const created = [];
@@ -146,4 +149,59 @@ test('SessionLifecycle.stop keeps the single-agent default working (🟠-17)', (
   const res = lifecycle.stop(ctx);
   assert.equal(res.ok, true);
   assert.deepEqual(cancels, [['solo', { kind: 'user' }, { keepInbox: true }]]);
+});
+
+// ---------------------------------------------------------------------------
+// D-1: forged token payload ids must never reach the rm -rf path
+// ---------------------------------------------------------------------------
+
+function makeDeleteCtx() {
+  return { agents: { list: () => [], get: () => undefined } };
+}
+
+test('deleteSession rejects forged session ids before any filesystem work (D-1)', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'dsh-telegram-delsession-'));
+  const projectDir = join(base, 'sessions', 'proj');
+  mkdirSync(projectDir, { recursive: true });
+  mkdirSync(join(projectDir, '--abc--'));
+  const prev = process.env.DSH_HOME;
+  process.env.DSH_HOME = base;
+  try {
+    for (const bad of ['', '.', '..', '../escape', '..\\escape', 'a/b', ' padded']) {
+      const res = await deleteSession(makeDeleteCtx(), bad);
+      assert.equal(res.ok, false, `id ${JSON.stringify(bad)} must be rejected`);
+      assert.match(res.text, /invalid session id/);
+    }
+    assert.equal(existsSync(join(projectDir, '--abc--')), true, 'the stored session survives every rejected id');
+    const tooLong = await deleteSession(makeDeleteCtx(), 'x'.repeat(201));
+    assert.equal(tooLong.ok, false, 'ids beyond the 200-char cap are rejected');
+    assert.equal(existsSync(join(projectDir, '--abc--')), true);
+  } finally {
+    if (prev === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = prev;
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test('deleteSession still removes both stored layouts for a legal id (D-1 regression)', async () => {
+  const base = mkdtempSync(join(tmpdir(), 'dsh-telegram-delsession-ok-'));
+  const projectDir = join(base, 'sessions', 'proj');
+  // encodeSegment('abc123') wraps to `--~abc123--` (leading ~ from the initial
+  // separator run); backends also stored the raw id layout.
+  mkdirSync(join(projectDir, '--~abc123--'), { recursive: true });
+  mkdirSync(join(projectDir, 'abc123'), { recursive: true });
+  const prev = process.env.DSH_HOME;
+  process.env.DSH_HOME = base;
+  try {
+    const res = await deleteSession(makeDeleteCtx(), 'abc123');
+    assert.equal(res.ok, true);
+    assert.match(res.text, /Session abc123 deleted\.$/m);
+    assert.equal(existsSync(join(projectDir, '--~abc123--')), false, 'the encoded-segment layout is removed');
+    assert.equal(existsSync(join(projectDir, 'abc123')), false, 'the raw-id layout is removed');
+    assert.equal(existsSync(projectDir), true, 'other sessions in the project are untouched');
+  } finally {
+    if (prev === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = prev;
+    rmSync(base, { recursive: true, force: true });
+  }
 });

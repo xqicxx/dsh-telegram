@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { detectProfile, listProfiles, modeSummary, dshHome } from '../dist/harness/adapters/mode.js';
 
@@ -65,6 +65,18 @@ test('dshHome respects DSH_HOME', () => {
   process.env.DSH_HOME = '/tmp/dsh-home-test';
   try {
     assert.equal(dshHome(), '/tmp/dsh-home-test');
+  } finally {
+    if (prev === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = prev;
+  }
+});
+
+test('dshHome treats an empty DSH_HOME like unset so paths stay absolute (RG-3)', () => {
+  const prev = process.env.DSH_HOME;
+  process.env.DSH_HOME = '';
+  try {
+    assert.equal(dshHome(), join(homedir(), '.dsh'));
+    assert.equal(dshHome().startsWith(process.cwd()), false, 'never cwd-relative');
   } finally {
     if (prev === undefined) delete process.env.DSH_HOME;
     else process.env.DSH_HOME = prev;

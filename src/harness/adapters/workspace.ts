@@ -5,6 +5,7 @@
  */
 import type { Context } from "@deepseek-ai/cordis";
 import { SessionId } from "@deepseek-ai/dsh-session";
+import { assertBrowsable } from "../../config.js";
 import { fail, ok, type AdapterResult } from "./types.js";
 
 export interface WorkspaceView {
@@ -62,10 +63,13 @@ export function listWorkspaces(ctx: Context): { items: WorkspaceView[]; archived
   return { items: registry.list().map(view), archivedSessionIds: archived.map(String) };
 }
 
-export async function createWorkspace(ctx: Context, path: string, title?: string): Promise<AdapterResult & { workspace?: WorkspaceView }> {
+export async function createWorkspace(ctx: Context, path: string, title?: string, browseRoots?: readonly string[]): Promise<AdapterResult & { workspace?: WorkspaceView }> {
   const registry = registryOf(ctx);
   if (!registry) return fail("workspaceRegistry is unavailable in this profile");
   try {
+    // B-7r: enforced only when security.browseRoots is configured — unset
+    // roots keep the legacy unconstrained behavior byte-for-byte.
+    assertBrowsable(path, browseRoots);
     const workspace = await registry.create(path, title);
     return { ok: true, text: `\u{1F5C2} Workspace ${workspace.title} (${workspace.path})`, workspace: view(workspace) };
   } catch (err) {

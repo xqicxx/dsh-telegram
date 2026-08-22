@@ -157,3 +157,58 @@ test('non-positive limiter settings clamp instead of spinning forever', async ()
   queue.configure({ maxPerWindow: 0, windowMs: 0 });
   assert.equal(await queue.push('c', async () => 'ok2'), 'ok2');
 });
+
+// ---------------------------------------------------------------------------
+// R3-3: the default retry base delay is exported exactly once.
+// ---------------------------------------------------------------------------
+
+test('DEFAULT_RETRY_BASE_DELAY_MS is the shared 500ms default (R3-3)', async () => {
+  const { DEFAULT_RETRY_BASE_DELAY_MS } = await import('../dist/telegram/queue.js');
+  assert.equal(DEFAULT_RETRY_BASE_DELAY_MS, 500);
+  const sleeps = [];
+  const queue = new SendQueue({ retry: { attempts: 1 }, sleep: async (ms) => sleeps.push(ms) });
+  await assert.rejects(
+    queue.push('c', async () => {
+      const err = new Error('server error');
+      err.error_code = 500;
+      throw err;
+    }),
+  );
+  assert.deepEqual(sleeps, [DEFAULT_RETRY_BASE_DELAY_MS], 'unconfigured base delay comes from the exported constant');
+});
+
+// ---------------------------------------------------------------------------
+// R3-2: the shared serializePerKey helper.
+// ---------------------------------------------------------------------------
+
+test('serializePerKey orders same-key tasks and lets other keys proceed', async () => {
+  const { serializePerKey } = await import('../dist/telegram/serialize-per-key.js');
+  const map = new Map();
+  const order = [];
+  const slow = serializePerKey(map, 'a', async () => {
+    order.push('a1:start');
+    await delay(20);
+    order.push('a1:end');
+  });
+  const fastOther = serializePerKey(map, 'b', async () => order.push('b1'));
+  const queued = serializePerKey(map, 'a', async () => order.push('a2'));
+  await Promise.all([slow, fastOther, queued]);
+  assert.equal(order.indexOf('a2'), order.indexOf('a1:end') + 1, 'a2 waits for a1 to settle');
+  assert.ok(order.includes('b1'));
+  await new Promise((resolve) => setImmediate(resolve)); // let the sweep run
+  assert.equal(map.size, 0, 'settled lanes are swept so the map stays bounded');
+});
+
+test('serializePerKey propagates the task outcome without poisoning the lane', async () => {
+  const { serializePerKey } = await import('../dist/telegram/serialize-per-key.js');
+  const map = new Map();
+  await assert.rejects(serializePerKey(map, 7, async () => {
+    throw new Error('boom');
+  }), /boom/);
+  assert.equal(await serializePerKey(map, 7, async () => 'recovered'), 'recovered', 'a failed task never wedges the next one');
+  assert.equal(await serializePerKey(map, 7, () => 42), 42, 'sync return values work too');
+  // The lane entry is swept shortly after settlement (identity-checked);
+  // give the event loop a turn before asserting the map emptied again.
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(map.size, 0);
+});

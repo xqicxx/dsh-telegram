@@ -13,6 +13,11 @@ export interface CredentialView {
   writable: boolean;
 }
 
+/** POSIX shell identifier — refs are used verbatim as credential-store /
+ * env-file keys, so every entry point (describe/set/unset) enforces the same
+ * shape (RG-4). */
+const REF_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
 interface CredentialProviderLike {
   describe(ref: string): Promise<{ configured: boolean; source?: string; writable: boolean }>;
   set(ref: string, value: string): Promise<void>;
@@ -29,7 +34,7 @@ function credentialsOf(ctx: Context): CredentialProviderLike | undefined {
 export async function describeCredential(ctx: Context, ref: string): Promise<AdapterResult & { view?: CredentialView }> {
   const credentials = credentialsOf(ctx);
   if (!credentials) return fail("credentials service is unavailable in this profile");
-  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(ref)) return fail("credential ref must be a POSIX shell identifier");
+  if (!REF_PATTERN.test(ref)) return fail("credential ref must be a POSIX shell identifier");
   try {
     const info = await credentials.describe(ref);
     return {
@@ -50,7 +55,7 @@ export async function describeCredentials(ctx: Context, refs: readonly string[])
   const unique = [...new Set(refs.map((ref) => ref.trim()).filter((ref) => ref !== ""))];
   if (unique.length === 0) return fail("usage: /credential <REF> [REF...]");
   if (unique.length > 64) return fail("at most 64 credential refs per request (web contract)");
-  const invalid = unique.find((ref) => !/^[A-Za-z_][A-Za-z0-9_]*$/.test(ref));
+  const invalid = unique.find((ref) => !REF_PATTERN.test(ref));
   if (invalid !== undefined) return fail(`credential ref must be a POSIX shell identifier: ${invalid}`);
   try {
     const views = await Promise.all(
@@ -84,7 +89,7 @@ export async function listCredentialRefs(ctx: Context): Promise<string[]> {
 export async function setCredential(ctx: Context, ref: string, value: string): Promise<AdapterResult> {
   const credentials = credentialsOf(ctx);
   if (!credentials) return fail("credentials service is unavailable in this profile");
-  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(ref)) return fail("credential ref must be a POSIX shell identifier");
+  if (!REF_PATTERN.test(ref)) return fail("credential ref must be a POSIX shell identifier");
   if (!value) return fail("credential value must not be empty (use unset to remove)");
   try {
     await credentials.set(ref, value);
@@ -97,6 +102,9 @@ export async function setCredential(ctx: Context, ref: string, value: string): P
 export async function unsetCredential(ctx: Context, ref: string): Promise<AdapterResult> {
   const credentials = credentialsOf(ctx);
   if (!credentials) return fail("credentials service is unavailable in this profile");
+  // RG-4: set/describe validate the ref shape; unset must not accept what the
+  // others would have rejected (an invalid ref could never have been stored).
+  if (!REF_PATTERN.test(ref)) return fail("credential ref must be a POSIX shell identifier");
   try {
     await credentials.unset(ref);
     return ok(`\u{1F511} ${ref} removed`);

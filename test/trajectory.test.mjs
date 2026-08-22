@@ -167,7 +167,7 @@ test('renderTrajectoryLines renders turn headers, step icons and escapes HTML', 
     hasMore: false,
   };
   const text = renderTrajectoryLines('s1', result).join('\n');
-  assert.match(text, /📜 Trajectory · s1 \(1 turn\)/);
+  assert.match(text, /📜 <b>Trajectory<\/b> · <code>s1<\/code> · 1 turn/);
   assert.match(text, /▸ <b>Turn 1<\/b> · <code>deepseek\/deepseek-chat<\/code> · ✅ completed · ⏱️ 12s/);
   assert.match(text, /👤 hello &lt;b&gt;world&lt;\/b&gt;/);
   assert.match(text, /🧠 thinking/);
@@ -186,15 +186,19 @@ test('renderTrajectoryLines marks errors, running turns and folds long step list
     hasMore: true,
   };
   const text = renderTrajectoryLines('s1', result).join('\n');
-  assert.match(text, /\(2 turns\+\)/);
+  assert.match(text, /2 turns\+/);
   assert.match(text, /❌ error: boom/);
   assert.match(text, /⏳ running/);
-  assert.match(text, /… 3 more step\(s\)/);
+  // Overflow steps fold into an expandable blockquote (Bot API
+  // blockquote[expandable]) instead of a bare counter line.
+  assert.match(text, /<blockquote expandable>/);
+  assert.match(text, /🔧 tool 7/);
+  assert.match(text, /🔧 tool 10/);
 });
 
 test('renderTrajectoryLines renders the empty state', () => {
   const text = renderTrajectoryLines('s1', { turns: [], hasMore: false }).join('\n');
-  assert.match(text, /\(0 turns\)/);
+  assert.match(text, /0 turns/);
   assert.match(text, /\(no events\)/);
 });
 

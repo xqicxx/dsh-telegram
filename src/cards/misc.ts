@@ -28,6 +28,7 @@ import { listDynamicCordis } from "../harness/adapters/dynamicCordis.js";
 import { missingServices, probeCapabilities } from "../harness/adapters/capabilities.js";
 import { modeSummary } from "../harness/adapters/mode.js";
 import { plain, truncate } from "../telegram/html.js";
+import { DOT, bold, headerLine, metaJoin, mono, relTime } from "../telegram/ui.js";
 import {
   buildBackKeyboard,
   buildCapabilitiesKeyboard,
@@ -101,14 +102,14 @@ export function createMiscCards(deps: MiscCardsDeps): {
     const totalPages = Math.max(1, Math.ceil(plugins.length / PLUGINS_PAGE_SIZE));
     const safe = Math.max(0, Math.min(page, totalPages - 1));
     const pageItems = plugins.slice(safe * PLUGINS_PAGE_SIZE, (safe + 1) * PLUGINS_PAGE_SIZE);
-    const lines = [`\u{1F50C} Plugins (${plugins.length}) \u00B7 page ${safe + 1}/${totalPages}`, ""];
+    const lines = [headerLine("\u{1F50C}", "Plugins", `${plugins.length}`, `page ${safe + 1}/${totalPages}`), ""];
     for (const plugin of pageItems) {
-      lines.push(`${plugin.enabled ? "\u2705" : "\u26AA"} ${plain(truncate(plugin.moduleName ?? plugin.entryId, 36))} \u00B7 ${plain(plugin.fiberPhase ?? "\u2014")}`);
+      lines.push(`${plugin.enabled ? "\u2705" : "\u26AA"} ${bold(truncate(plugin.moduleName ?? plugin.entryId, 36))} ${DOT}${plain(plugin.fiberPhase ?? "\u2014")}`);
     }
     const dynamic = listDynamicCordis(ctx);
     if (dynamic.length > 0) {
       lines.push("", `Dynamic plugin packages: ${dynamic.length}`);
-      for (const row of dynamic.slice(0, 10)) lines.push(`\u2022 ${plain(String(row.pluginId))}`);
+      for (const row of dynamic.slice(0, 10)) lines.push(`\u2022 ${mono(String(row.pluginId))}`);
     }
     lines.push("", "Toggle: /pluginenable &lt;name&gt; \u00B7 /plugindisable &lt;name&gt;");
     await openCard(chatId, lines.join("\n"), buildPagingKeyboard({
@@ -129,11 +130,11 @@ export function createMiscCards(deps: MiscCardsDeps): {
     const skills = await cardLoad(chatId, "skills list", () => listSkills(ctx, { ...(agent?.id === undefined ? {} : { sessionId: agent.id }), cwd, scope: "user" }));
     if (skills === undefined) return;
     const userSkills = skills.filter((skill) => skill.userInvocable);
-    const lines = [`\u{1F9D1}\u200D\u{1F3EB} Skills (${userSkills.length} user-invocable)`, ""];
+    const lines = [headerLine("\u{1F9D1}\u200D\u{1F3EB}", "Skills", `${userSkills.length} user-invocable`), ""];
     for (const skill of userSkills.slice(0, 30)) {
-      lines.push(`\u2022 ${plain(skill.name)} \u00B7 ${plain(skill.source)}`);
+      lines.push(metaJoin(`\u2022 ${bold(skill.name)}`, plain(skill.source)));
       lines.push(`  ${plain(truncate(skill.description, 80))}`);
-      lines.push(`  model:${skill.modelInvocable ? "yes" : "no"} provider: ${plain(skill.provider)}`);
+      lines.push(metaJoin(`  model ${skill.modelInvocable ? "yes" : "no"}`, `provider ${plain(skill.provider)}`));
     }
     if (skills.length === 0) lines.push("No skills registered in this profile.");
     else if (userSkills.length === 0) lines.push("No user-invocable skills for this session's project.");
@@ -149,13 +150,13 @@ export function createMiscCards(deps: MiscCardsDeps): {
     }
     const entries = await cardLoad(chatId, "subagents list", () => listSubagents(requireCtx(), agent.id));
     if (entries === undefined) return;
-    const lines = [`\u{1F916} Subagents of ${plain(truncate(agent.id, 24))} (${entries.length})`, ""];
+    const lines = [headerLine("\u{1F916}", "Subagents", mono(truncate(agent.id, 24)), `${entries.length}`), ""];
     for (const entry of entries.slice(0, 15)) {
       const flags: string[] = [entry.kind, entry.activity];
       if (entry.mode !== undefined) flags.push(entry.mode);
       if (entry.hasChildren === true) flags.push("children");
       flags.push(entry.parentAvailable === false ? "parent:unavailable" : "parent:available");
-      lines.push(`\u2022 ${plain(truncate(entry.id, 28))} \u00B7 ${flags.join("/")}${entry.label ? ` \u00B7 ${plain(truncate(entry.label, 20))}` : ""}`);
+      lines.push(metaJoin(`\u2022 ${mono(truncate(entry.id, 28))}`, ...flags, entry.label !== undefined ? plain(truncate(entry.label, 20)) : undefined));
       if (entry.kind === "diagnostic") lines.push(`  reason: ${plain(entry.reason ?? "unavailable")}`);
     }
     if (entries.length === 0) lines.push("(none)");
@@ -177,13 +178,19 @@ export function createMiscCards(deps: MiscCardsDeps): {
     if (entries === undefined) return;
     const entry = entries.find((candidate) => candidate.id === childId);
     const lines = [
-      `\u{1F916} ${plain(truncate(childId, 32))}`,
+      headerLine("\u{1F916}", truncate(childId, 32)),
       "",
-      `parent: ${plain(truncate(parentId, 24))}`,
+      metaJoin("parent", mono(truncate(parentId, 24))),
       entry === undefined
         ? "catalog entry: not listed"
-        : `kind: ${entry.kind} \u00B7 activity: ${entry.activity}${entry.mode ? ` \u00B7 mode: ${entry.mode}` : ""}${entry.hasChildren === true ? " \u00B7 has children" : ""}${entry.parentAvailable === false ? " \u00B7 parent unavailable" : ""}`,
-      entry?.label ? `label: ${plain(truncate(entry.label, 40))}` : "",
+        : metaJoin(
+            `kind ${entry.kind}`,
+            `activity ${entry.activity}`,
+            entry.mode !== undefined ? `mode ${entry.mode}` : undefined,
+            entry.hasChildren === true ? "has children" : undefined,
+            entry.parentAvailable === false ? "parent unavailable" : undefined,
+          ),
+      entry?.label !== undefined ? metaJoin("label", plain(truncate(entry.label, 40))) : "",
       entry?.kind === "diagnostic" ? `reason: ${plain(entry.reason ?? "unavailable")}` : "",
     ].filter((line) => line !== "");
     const continuable = entry?.kind === "child" && entry.mode === "continuable";
@@ -208,10 +215,10 @@ export function createMiscCards(deps: MiscCardsDeps): {
     const totalPages = Math.max(1, Math.ceil(jobs.length / JOBS_PAGE_SIZE));
     const safe = Math.max(0, Math.min(page, totalPages - 1));
     const pageItems = jobs.slice(safe * JOBS_PAGE_SIZE, (safe + 1) * JOBS_PAGE_SIZE);
-    const lines = [`\u{1F527} Jobs (${jobs.length}) \u00B7 page ${safe + 1}/${totalPages}`, ""];
+    const lines = [headerLine("\u{1F3D7}\uFE0F", "Jobs", `${jobs.length}`, `page ${safe + 1}/${totalPages}`), ""];
     for (const job of pageItems) {
-      lines.push(`\u2022 ${plain(job.kind)} [${plain(job.id)}] \u00B7 ${job.status}${job.detail ? ` \u00B7 ${plain(truncate(job.detail, 30))}` : ""}`);
-      lines.push(`  ${plain(truncate(job.label, 60))} \u00B7 started ${plain(new Date(job.startedAt).toLocaleString())}`);
+      lines.push(metaJoin(`\u2022 ${bold(job.kind)} ${mono(job.id)}`, job.status, job.detail !== undefined ? plain(truncate(job.detail, 30)) : undefined));
+      lines.push(`  ${plain(truncate(job.label, 60))} \u00B7 started ${relTime(job.startedAt)}`);
     }
     if (jobs.length === 0) lines.push("(none)");
     await openCard(chatId, lines.join("\n"), buildPagingKeyboard({
@@ -223,14 +230,21 @@ export function createMiscCards(deps: MiscCardsDeps): {
 
   async function openDynamicCordisCard(chatId: number): Promise<void> {
     const rows = listDynamicCordis(requireCtx());
-    const lines = [`\u{1F9F0} Dynamic plugins (${rows.length})`, ""];
+    const lines = [headerLine("\u{1F9F0}", "Dynamic plugins", `${rows.length}`), ""];
     const pluginRows: PluginRow[] = [];
     for (const row of rows.slice(0, 15)) {
       const pluginId = String(row.pluginId);
       const running = row.activeRun !== undefined && row.activeRun !== null;
       const current = row.currentPackageId === undefined || row.currentPackageId === null ? undefined : String(row.currentPackageId);
       const versions = Array.isArray(row.packages) ? row.packages.length : 0;
-      lines.push(`\u2022 ${plain(pluginId)} \u00B7 ${versions} pkg${current === undefined ? "" : ` \u00B7 @ ${plain(truncate(current, 18))}`}${running ? " \u00B7 \u25B6 running" : ""}`);
+      lines.push(
+        metaJoin(
+          `\u2022 ${bold(pluginId)}`,
+          `${versions} pkg`,
+          current !== undefined ? `@ ${mono(truncate(current, 18))}` : undefined,
+          running ? "\u25B6\uFE0F running" : undefined,
+        ),
+      );
       pluginRows.push({
         pluginId,
         running,
@@ -249,9 +263,10 @@ export function createMiscCards(deps: MiscCardsDeps): {
 
   async function openCapabilitiesCard(chatId: number): Promise<void> {
     const caps = probeCapabilities(requireCtx());
-    const lines = ["\u{1F9E9} Host capabilities", ""];
+    // 🧪 probe: this card literally probes which host services answer.
+    const lines = [headerLine("\u{1F9EA}", "Host capabilities"), ""];
     for (const [key, available] of Object.entries(caps) as [string, boolean][]) {
-      lines.push(`${available ? "\u2705" : "\u274C"} ${plain(key)}`);
+      lines.push(`${available ? "\u2705" : "\u274C"} ${mono(key)}`);
     }
     const missing = missingServices(requireCtx());
     if (missing.length > 0) lines.push("", `Missing (cards degrade with hints): ${missing.map(plain).join(", ")}`);
@@ -261,7 +276,7 @@ export function createMiscCards(deps: MiscCardsDeps): {
   async function openFeedbackListCard(chatId: number, sessionId: string): Promise<void> {
     const items = await cardLoad(chatId, "feedback list", () => listFeedback(requireCtx(), sessionId));
     if (items === undefined) return;
-    const lines = [`\u{1F4CB} Feedback \u00B7 ${plain(truncate(sessionId, 24))} (${items.length})`, ""];
+    const lines = [headerLine("\u{1F4CB}", "Feedback", mono(truncate(sessionId, 24)), `${items.length}`), ""];
     const rows: { text: string; callback_data: string }[][] = [];
     for (const item of items.slice(0, 20)) {
       lines.push(`\u2022 ${item.rating === "positive" ? "\u{1F44D}" : "\u{1F44E}"} [${item.messageId.slice(0, 8)}]${item.note ? ` ${plain(truncate(item.note, 40))}` : ""}`);
@@ -281,10 +296,10 @@ export function createMiscCards(deps: MiscCardsDeps): {
     const mode = modeSummary();
     const displayName = state.config.mode?.name;
     const lines = [
-      `\u{1F3AD} Mode${displayName ? ` \u00B7 ${plain(displayName)}` : ""}`,
+      headerLine("\u{1F3AD}", "Mode", displayName !== undefined ? bold(displayName) : undefined),
       "",
       plain(mode.note),
-      `Profiles: ${mode.profiles.length > 0 ? mode.profiles.map(plain).join(", ") : "none found"}`,
+      metaJoin("Profiles", mode.profiles.length > 0 ? mode.profiles.map(plain).join(", ") : "none found"),
     ];
     lines.push("", "Switch profile by restarting dsh with `dsh --profile &lt;name&gt;`.");
     await openCard(chatId, lines.join("\n"), buildBackKeyboard());
@@ -292,8 +307,8 @@ export function createMiscCards(deps: MiscCardsDeps): {
 
   async function openAllowedCard(chatId: number): Promise<void> {
     const allowed = state.config.security.allowedChatIds;
-    const lines = [`\u{1F510} Allowed chats (${allowed.length})`, ""];
-    for (const id of allowed) lines.push(`\u2022 ${plain(String(id))}`);
+    const lines = [headerLine("\u{1F510}", "Allowed chats", `${allowed.length}`), ""];
+    for (const id of allowed) lines.push(`\u2022 ${mono(String(id))}`);
     if (allowed.length === 0) lines.push("Nobody is allowed yet \u2014 inbound messages are ignored.");
     await openCard(chatId, lines.join("\n"), {
       inline_keyboard: [
@@ -304,7 +319,10 @@ export function createMiscCards(deps: MiscCardsDeps): {
   }
 
   async function openWatchCard(chatId: number): Promise<void> {
-    const lines = [`\u{1F4E1} Watch`, "", state.watching ? "Telegram polling is ON." : "Telegram polling is OFF.", `autoStart: ${state.config.watch.autoStart}`];
+    // The icon carries the state: green while polling, red while paused.
+    const lines = [
+      headerLine(state.watching ? "\u{1F7E2}" : "\u{1F534}", "Watch", state.watching ? "polling ON" : "polling OFF", `autoStart ${state.config.watch.autoStart ? "yes" : "no"}`),
+    ];
     await openCard(chatId, lines.join("\n"), {
       inline_keyboard: [
         [{ text: state.watching ? "\u23F8 Pause polling" : "\u25B6 Start polling", callback_data: "m:watchtoggle" }],
@@ -316,12 +334,12 @@ export function createMiscCards(deps: MiscCardsDeps): {
   async function openSettingsCard(chatId: number): Promise<void> {
     const c = state.config.outbound;
     const lines = [
-      "\u2699\uFE0F Telegram settings",
+      headerLine("\u2699\uFE0F", "Telegram settings"),
       "",
-      `parseMode: ${c.parseMode}`,
-      `disableNotification: ${c.disableNotification}`,
-      `maxRetries: ${c.maxRetries} \u00B7 sendRatePerSecond: ${c.sendRatePerSecond}`,
-      `maxMessageLength: ${c.maxMessageLength}`,
+      metaJoin("parseMode", mono(c.parseMode)),
+      metaJoin("disableNotification", String(c.disableNotification)),
+      metaJoin(`maxRetries ${c.maxRetries}`, `sendRate/s ${c.sendRatePerSecond}`),
+      metaJoin("maxMessageLength", mono(String(c.maxMessageLength))),
       "",
       "Edit .pi/telegram.json in the workspace to change these values.",
       "",
@@ -335,12 +353,11 @@ export function createMiscCards(deps: MiscCardsDeps): {
   async function openAboutCard(chatId: number): Promise<void> {
     const bot = state.transport ? await state.transport.botInfo().catch(() => undefined) : undefined;
     const lines = [
-      "\u2139\uFE0F dsh-telegram",
+      headerLine("\u2139\uFE0F", "dsh-telegram", `v${version}`),
       "",
-      `version: ${version}`,
-      `bot: ${bot ? `@${plain(bot.username)} (${bot.id})` : "not connected"}`,
-      `token: ${resolveToken() ? "set" : "missing"}`,
-      `workspace: ${plain(state.workspaceRoot)}`,
+      metaJoin("bot", bot !== undefined ? mono(`@${bot.username} (${bot.id})`) : "not connected"),
+      metaJoin("token", resolveToken() !== undefined ? mono("set") : mono("missing")),
+      metaJoin("workspace", mono(truncate(state.workspaceRoot, 40))),
     ];
     await openCard(chatId, lines.join("\n"), {
       inline_keyboard: [[{ text: "\u2190 Back", callback_data: "m:back" }]],

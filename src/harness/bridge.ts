@@ -156,7 +156,17 @@ export class Bridge {
     // agent, drop that stale binding so the reverse index stays exclusive
     // and event routing can never become ambiguous.
     const owner = this.chatByAgent.get(String(agentId));
-    if (owner !== undefined && owner !== chatId) this.chatStates.delete(owner);
+    if (owner !== undefined && owner !== chatId) {
+      // Audit RE-10: eviction must not silently swallow the old owner chat's
+      // unanswered inbound. Marking it noReply keeps every reminder path from
+      // firing at that chat for a conversation that just moved elsewhere; the
+      // pending state is then dropped together with the evicted entry.
+      const evictedInbound = this.chatStates.get(owner)?.inbound;
+      if (evictedInbound !== undefined && !evictedInbound.replied && !evictedInbound.noReply) {
+        evictedInbound.noReply = true;
+      }
+      this.chatStates.delete(owner);
+    }
     const existing = this.chatStates.get(chatId) ?? { agentId, reminded: false };
     const previousId = String(existing.agentId);
     if (previousId !== String(agentId)) this.chatByAgent.delete(previousId);

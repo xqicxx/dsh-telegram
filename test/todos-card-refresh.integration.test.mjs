@@ -101,7 +101,7 @@ test('Todos card opens on the control lane, auto-refreshes every 5s, and stops w
 
     await handlers.onCallback(7, 'm:todos');
     assert.equal(sendTextControlCalls.length, 1, 'initial card goes through the UI control lane');
-    assert.match(sendTextControlCalls[0].text, /📋 Todos · 1 pending · 1 total/);
+    assert.match(sendTextControlCalls[0].text, /📌 <b>Todos<\/b> · 1 pending · 1 total/);
 
     // The periodic tick must pick up a change that arrived without any UI tap.
     agent.session.events.push({
@@ -110,7 +110,7 @@ test('Todos card opens on the control lane, auto-refreshes every 5s, and stops w
     });
     await sleep(5100);
     assert.ok(editTextControlCalls.length >= 1, 'card refreshed in place after the 5s tick');
-    assert.match(editTextControlCalls.at(-1).text, /📋 Todos · 1 pending · 2 total/);
+    assert.match(editTextControlCalls.at(-1).text, /📌 <b>Todos<\/b> · 1 pending · 2 total/);
 
     const editsAfterRefresh = editTextControlCalls.length;
     // Opening the Status panel replaces the card without going through

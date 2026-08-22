@@ -7,6 +7,7 @@
 import { mkdir, readdir, stat } from "node:fs/promises";
 import { dirname, join, parse, resolve } from "node:path";
 import type { Context } from "@deepseek-ai/cordis";
+import { assertBrowsable } from "../../config.js";
 import { fail, ok, type AdapterResult } from "./types.js";
 
 /** Node's fs.promises typings in this profile predate `signal`; the timeout
@@ -72,8 +73,14 @@ export function describeHost(
   };
 }
 
-export async function listDirectory(path: string): Promise<AdapterResult & { entries?: { name: string; kind: "file" | "directory"; size?: number }[] }> {
+export async function listDirectory(
+  path: string,
+  browseRoots?: readonly string[],
+): Promise<AdapterResult & { entries?: { name: string; kind: "file" | "directory"; size?: number }[]; totalEntries?: number }> {
   try {
+    // B-7r: optional root confinement — unset/empty roots keep the legacy
+    // unconstrained behavior byte-for-byte.
+    assertBrowsable(path, browseRoots);
     const target = resolve(path);
     // Bad disks/NFS can hang readdir/stat forever and wedge the UI lane;
     // degrade to an error card after 10s instead (LOOP_AUDIT #3).
@@ -90,7 +97,11 @@ export async function listDirectory(path: string): Promise<AdapterResult & { ent
     );
     entries.sort((a, b) => (a.kind === b.kind ? a.name.localeCompare(b.name) : a.kind === "directory" ? -1 : 1));
     const lines = entries.map((entry) => `${entry.kind === "directory" ? "\u{1F4C1}" : "\u{1F4C4}"} ${entry.name}${entry.size === undefined ? "" : ` (${entry.size} B)`}`);
-    return { ok: true, text: `\u{1F4C2} ${target}\n${lines.join("\n").slice(0, 3500)}`, entries };
+    // RG-1: when the 200-entry render cap truncated the listing, hand callers
+    // the true count so pagination text stops under-reporting. Absent = every
+    // entry is visible in `entries`.
+    const totalEntries = names.length > entries.length ? names.length : undefined;
+    return { ok: true, text: `\u{1F4C2} ${target}\n${lines.join("\n").slice(0, 3500)}`, entries, ...(totalEntries === undefined ? {} : { totalEntries }) };
   } catch (err) {
     if (err instanceof Error && err.name === "AbortError") {
       return fail(`directory listing timed out after 10s: ${path}`);
@@ -123,8 +134,9 @@ export async function isDirectory(path: string): Promise<boolean> {
   }
 }
 
-export async function createDirectory(path: string): Promise<AdapterResult> {
+export async function createDirectory(path: string, browseRoots?: readonly string[]): Promise<AdapterResult> {
   try {
+    assertBrowsable(path, browseRoots); // B-7r: enforced only when roots are configured
     await withFsTimeout(mkdir(resolve(path), { recursive: false }));
     return ok(`\u{1F4C1} Created ${path}`);
   } catch (err) {
@@ -134,8 +146,9 @@ export async function createDirectory(path: string): Promise<AdapterResult> {
 }
 
 /** host.openPath: a phone cannot open a host file — return the resolved path. */
-export function openPath(path: string): AdapterResult {
+export function openPath(path: string, browseRoots?: readonly string[]): AdapterResult {
   try {
+    assertBrowsable(path, browseRoots); // B-7r: enforced only when roots are configured
     return ok(`\u{1F4C2} ${resolve(path)} \u2014 open it on the host (a phone client cannot launch host apps).`);
   } catch (err) {
     return fail(err instanceof Error ? err.message : String(err));

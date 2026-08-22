@@ -36,8 +36,9 @@ import { GoalProgressFeed, type ProgressSnapshot } from "./telegram/goal-progres
 import { Ephemeral } from "./telegram/ephemeral.js";
 import { plain, truncate } from "./telegram/html.js";
 import { buildBarKeyboard, buildCollapsedBarKeyboard, buildMenuPage, queueBarLabel, type MenuItem } from "./telegram/keyboard.js";
-import { SendQueue } from "./telegram/queue.js";
+import { SendQueue, DEFAULT_RETRY_BASE_DELAY_MS } from "./telegram/queue.js";
 import { safeWrap } from "./telegram/safe.js";
+import { serializePerKey } from "./telegram/serialize-per-key.js";
 import { TokenRegistry } from "./telegram/tokens.js";
 import { attachRouter } from "./telegram/router.js";
 import { StatusPanel } from "./telegram/status-panel.js";
@@ -48,6 +49,17 @@ import { attachSessionEvents } from "./core/events.js";
 import { createChatHub } from "./core/chat-hub.js";
 import { registerTelegramTools } from "./core/tools.js";
 import { createDispatchers } from "./core/dispatch.js";
+// R3-1: TWO withTimeout shapes exist on purpose — do not merge them blindly.
+// 1) src/telegram/transport.ts keeps an UNLABELED, self-contained copy
+//    (`telegram api timeout after ${ms}ms`): the telegram layer must stay
+//    dependency-free below the plugin root (layering boundary), so it cannot
+//    import a shared helper from core/.
+// 2) src/core/cards.ts exports the LABELED copy used here (`${label} timed
+//    out after ${ms}ms`, Promise.race + finally-clear): card loads name their
+//    callee so timeouts are actionable. index.ts is assembly-layer code and
+//    may import across layers; telegram/ may not.
+// Both copies point at each other in their headers; keep semantics in sync
+// when touching either.
 import { createCardRegistry, withTimeout, widenCard } from "./core/cards.js";
 import { createModelCards } from "./cards/models.js";
 import { createSessionCards } from "./cards/sessions.js";
@@ -80,6 +92,10 @@ interface State {
   barTodoCounts: Map<number, number>;
   /** Dedicated carrier message carrying the live bar, deletable on refresh. */
   barCarriers: Map<number, number>;
+  /** RH-6: monotonic swap generation per chat — collapse/restore/sync chains
+   * are fire-and-forget and race on barCarriers; each await re-checks that no
+   * newer swap has started before touching shared state again. */
+  barSwapGen: Map<number, number>;
   /** Per-chat debounce timers for bar refreshes. */
   barTimers: Map<number, ReturnType<typeof setTimeout>>;
   /** Last project key shown on the per-chat Sessions card (back navigation). */
@@ -114,6 +130,7 @@ const state: State = {
   barCounts: new Map(),
   barTodoCounts: new Map(),
   barCarriers: new Map(),
+  barSwapGen: new Map(),
   barTimers: new Map(),
   lastSessionsProject: new Map(),
   barCollapsed: new Map(),
@@ -185,6 +202,7 @@ function teardownMount(): void {
   state.barCounts.clear();
   state.barTodoCounts.clear();
   state.barCarriers.clear();
+  state.barSwapGen.clear();
   releaseAllModelSelections();
   releaseSavedAttachments();
   tokens.reset();
@@ -231,7 +249,9 @@ function applyConfigLive(changed: readonly ConfigSection[]): void {
   if (changed.includes("outbound")) {
     state.transport?.applyLimits({
       maxPerWindow: state.config.outbound.sendRatePerSecond,
-      retry: { attempts: state.config.outbound.maxRetries, baseDelayMs: 500 },
+      // R3-3: shared default constant (telegram/queue.ts) instead of a
+      // third literal copy of the retry base delay.
+      retry: { attempts: state.config.outbound.maxRetries, baseDelayMs: DEFAULT_RETRY_BASE_DELAY_MS },
       maxMessageLength: state.config.outbound.maxMessageLength,
     });
   }
@@ -262,10 +282,14 @@ const statusPanel = new StatusPanel();
 const sessionLifecycle = new SessionLifecycle();
 
 /** Callback payload registry: keeps long ids out of the 64-byte data limit.
- * Tokens are single-use so a button can never execute twice. */
+ * Tokens are single-use so a button can never execute twice. The optional
+ * chatId tags the MINTING chat (RF-1-half, pairs with TokenRegistry's owner
+ * map in telegram/tokens.ts): take() then rejects taps from any other chat,
+ * so an enumerated token cannot replay into someone else's private chat.
+ * Mint sites that do not know a chat stay unowned and world-usable. */
 const tokens = new TokenRegistry();
-function token(payload: Record<string, string>): string {
-  return tokens.mint(payload);
+function token(payload: Record<string, string>, chatId?: number): string {
+  return tokens.mint(payload, chatId);
 }
 
 /** Registered domain extensions. Core only dispatches to them; it owns no
@@ -397,7 +421,17 @@ function uiOps(t: TelegramTransport) {
 /** Critical UI ack: control lane first, one raw Bot API attempt as fallback.
  * Command results (including /goal) must always reach the user (#11). */
 async function uiSend(chatId: number, text: string, options: Parameters<TelegramTransport["sendText"]>[2] = {}): Promise<number | undefined> {
-  const t = requireTransport();
+  // RF-2: requireTransport() used to sit OUTSIDE the try, so a missing
+  // transport (teardown/hot-reload window) made uiSend return a rejected
+  // promise — and notifyDispatchFailure's fire-and-forget `void uiSend(...)`
+  // is the dispatch chain's last hop, turning the error-report path itself
+  // into an unhandledRejection. uiSend therefore never throws: without a
+  // transport it logs and reports "not delivered" like any other failure.
+  const t = state.transport;
+  if (!t) {
+    log(`uiSend skipped (no transport) chatId=${chatId}`);
+    return undefined;
+  }
   try {
     return await t.sendTextControl(chatId, text, options);
   } catch (err) {
@@ -410,6 +444,16 @@ async function uiSend(chatId: number, text: string, options: Parameters<Telegram
 function notifyDispatchFailure(chatId: number, label: string, err: unknown): void {
   log(`${label} failed`, err instanceof Error ? `${err.message}\n${err.stack ?? ""}` : String(err));
   void uiSend(chatId, `\u274C ${label} failed \u2014 please retry.`, { parse_mode: "HTML" });
+}
+
+/** RH-7 broadcast result: the delivered list itself stays the return value
+ * (backward compatible for every existing consumer); per-target failures are
+ * appended as an optional trailing field so a partial broadcast is visible
+ * instead of silently truncated at the first throwing chat. */
+type BroadcastDelivery = { chatId: number; messageId: number };
+function markBroadcastFailures(delivered: BroadcastDelivery[], failures: { chatId: number; error: string }[]): BroadcastDelivery[] & { failures?: { chatId: number; error: string }[] } {
+  if (failures.length > 0) (delivered as BroadcastDelivery[] & { failures?: { chatId: number; error: string }[] }).failures = failures;
+  return delivered as BroadcastDelivery[] & { failures?: { chatId: number; error: string }[] };
 }
 
 /** Keepalive decision (#48): a live agent's own status is authoritative —
@@ -550,49 +594,40 @@ async function createSessionForChat(
   agentPreset?: string,
   onlyIfUnbound = false,
 ): Promise<ReturnType<SessionLifecycle["create"]>> {
-  const previous = sessionCreateChains.get(chatId) ?? Promise.resolve();
-  const run = previous
-    .catch(() => {})
-    .then(async () => {
-      // A fast UI tap (Models auto-create) may reach the gate after the first
-      // inbound message already created and bound this chat's session. Reuse
-      // that session instead of replacing it out from under the chat.
-      if (onlyIfUnbound) {
-        const boundId = state.bridge?.agentIdForChat(chatId);
-        if (boundId !== undefined) {
-          const live = requireCtx().agents?.get(boundId as never);
-          if (live) return { result: { ok: true, text: "Session is already live." }, agentId: boundId, reusedLive: true };
-        }
+  // R3-2-part: the previously hand-rolled per-chat serialization (swallowed
+  // settled twin stored in the map + identity-checked self-removal) now
+  // delegates to the shared helper — identical semantics, one copy fewer.
+  return serializePerKey(sessionCreateChains, chatId, async () => {
+    // A fast UI tap (Models auto-create) may reach the gate after the first
+    // inbound message already created and bound this chat's session. Reuse
+    // that session instead of replacing it out from under the chat.
+    if (onlyIfUnbound) {
+      const boundId = state.bridge?.agentIdForChat(chatId);
+      if (boundId !== undefined) {
+        const live = requireCtx().agents?.get(boundId as never);
+        if (live) return { result: { ok: true, text: "Session is already live." }, agentId: boundId, reusedLive: true };
       }
-      const requested = model ?? state.config.model ?? {};
-      const selectedModel = requested.provider !== undefined && requested.model !== undefined
-        ? normalizeOpencodeGoModel(requested.provider, requested.model)
-        : requested;
-      if (opencodeGoModelUsesResponses(requested.provider, requested.model)) {
-        const ready = await ensureOpencodeGoResponsesRoute(requireCtx(), log);
-        if (!ready) {
-          return {
-            result: {
-              ok: false,
-              text: "opencode-go-responses route is not registered in the llm registry \u2014 restart dsh once more, then create the session again",
-            },
-          };
-        }
+    }
+    const requested = model ?? state.config.model ?? {};
+    const selectedModel = requested.provider !== undefined && requested.model !== undefined
+      ? normalizeOpencodeGoModel(requested.provider, requested.model)
+      : requested;
+    if (opencodeGoModelUsesResponses(requested.provider, requested.model)) {
+      const ready = await ensureOpencodeGoResponsesRoute(requireCtx(), log);
+      if (!ready) {
+        return {
+          result: {
+            ok: false,
+            text: "opencode-go-responses route is not registered in the llm registry \u2014 restart dsh once more, then create the session again",
+          },
+        };
       }
-      return sessionLifecycle.create(requireCtx(), state.workspaceRoot, selectedModel, {
-        ...(agentPreset === undefined ? {} : { agentPreset }),
-        replaceSessionId: state.bridge?.agentIdForChat(chatId),
-      });
+    }
+    return sessionLifecycle.create(requireCtx(), state.workspaceRoot, selectedModel, {
+      ...(agentPreset === undefined ? {} : { agentPreset }),
+      replaceSessionId: state.bridge?.agentIdForChat(chatId),
     });
-  const settled = run.then(
-    () => undefined,
-    () => undefined,
-  );
-  sessionCreateChains.set(chatId, settled);
-  void settled.then(() => {
-    if (sessionCreateChains.get(chatId) === settled) sessionCreateChains.delete(chatId);
   });
-  return run;
 }
 
 /** Bind a freshly created agent to its chat and diagnose a missed binding
@@ -1036,15 +1071,41 @@ function scheduleBarSync(chatId: number, delayMs = 1500): void {
   state.barTimers.set(chatId, timer);
 }
 
+/** RH-6: mint a fresh bar-swap generation for one chat. Collapse, restore and
+ * debounced sync are independent fire-and-forget chains; without a generation
+ * the later-finishing loser of an interleaved collapse→restore (rapid taps)
+ * overwrote `barCarriers` and stranded the earlier carrier — an orphan message
+ * with a full reply keyboard that nothing tracked or deleted any more. */
+function beginBarSwap(chatId: number): number {
+  const gen = (state.barSwapGen.get(chatId) ?? 0) + 1;
+  state.barSwapGen.set(chatId, gen);
+  return gen;
+}
+
+/** True when a newer swap has started since `gen` was minted: the caller must
+ * abandon its remaining chain instead of touching shared carrier state. */
+function barSwapStale(chatId: number, gen: number): boolean {
+  return state.barSwapGen.get(chatId) !== gen;
+}
+
 /** Delete the current carrier and pin one fresh native bar message. */
 async function replaceBarCarrier(chatId: number, t: TelegramTransport, count: number): Promise<void> {
+  const gen = beginBarSwap(chatId);
   await dropBarCarrier(chatId, t);
+  if (barSwapStale(chatId, gen)) return;
   const id = await t.sendTextControl(chatId, queueBarLabel(count), {
     parse_mode: "HTML",
     disable_notification: true,
     reply_markup: buildBarKeyboard(count, currentTodoCount(chatId)),
   });
-  if (id !== undefined) state.barCarriers.set(chatId, id);
+  if (id === undefined) return;
+  if (barSwapStale(chatId, gen)) {
+    // The send raced a newer swap and already hit the wire: retract our
+    // candidate so no untracked carrier keyboard survives (best effort).
+    try { await t.deleteMessageControl(chatId, id); } catch { /* best effort */ }
+    return;
+  }
+  state.barCarriers.set(chatId, id);
 }
 
 /** Collapse/restore the bar. The state flips synchronously and the carrier
@@ -1056,7 +1117,11 @@ function setBarCollapsed(chatId: number, collapsed: boolean): void {
   if (collapsed) {
     state.barCollapsed.set(chatId, true);
     void safeWrap(`bar-collapse(${chatId})`, async () => {
+      // RH-6: this chain races restore/sync swaps on the same carrier map —
+      // every await re-checks its generation before touching shared state.
+      const gen = beginBarSwap(chatId);
       await dropBarCarrier(chatId, t);
+      if (barSwapStale(chatId, gen)) return;
       // A persistent reply keyboard survives the carrier deletion; Telegram
       // only replaces it when another keyboard message lands. Send the
       // collapsed one-button keyboard as the new carrier (#17).
@@ -1065,7 +1130,14 @@ function setBarCollapsed(chatId: number, collapsed: boolean): void {
         disable_notification: true,
         reply_markup: buildCollapsedBarKeyboard(),
       });
-      if (id !== undefined) state.barCarriers.set(chatId, id);
+      if (id === undefined) return;
+      if (barSwapStale(chatId, gen)) {
+        // A restore/sync won the race while our send was in flight: retract
+        // the stale collapsed carrier instead of orphaning it (best effort).
+        try { await t.deleteMessageControl(chatId, id); } catch { /* best effort */ }
+        return;
+      }
+      state.barCarriers.set(chatId, id);
     }, log);
     return;
   }
@@ -1106,7 +1178,9 @@ async function mountTransport(ctx: Context): Promise<void> {
     log,
     queue: new SendQueue({
       maxPerWindow: state.config.outbound.sendRatePerSecond,
-      retry: { attempts: state.config.outbound.maxRetries, baseDelayMs: 500 },
+      // R3-3: shared default constant (telegram/queue.ts) instead of a
+      // literal copy of the retry base delay.
+      retry: { attempts: state.config.outbound.maxRetries, baseDelayMs: DEFAULT_RETRY_BASE_DELAY_MS },
     }),
     maxMessageLength: state.config.outbound.maxMessageLength,
   });
@@ -1157,9 +1231,13 @@ async function mountTransport(ctx: Context): Promise<void> {
         parse_mode: "HTML",
         reply_markup: {
           inline_keyboard: [[
-            { text: "\u2705 \u81EA\u52A8\u538B\u7F29", callback_data: token({ action: "compact-auto", sessionId }) },
-            { text: "\u{1F4DD} \u6211\u6765\u624B\u52A8", callback_data: token({ action: "compact-manual", sessionId }) },
-            { text: "\u{1F7E2} \u538B\u7F29\u5E76\u7EE7\u7EED", callback_data: token({ action: "compact-auto", sessionId }) },
+            { text: "\u2705 \u81EA\u52A8\u538B\u7F29", callback_data: token({ action: "compact-auto", sessionId }, chatId) },
+            { text: "\u{1F4DD} \u6211\u6765\u624B\u52A8", callback_data: token({ action: "compact-manual", sessionId }, chatId) },
+            // RH-10: a third button ("🟢 压缩并继续") used to mint the SAME
+            // compact-auto action as the first — a copy-paste remnant with no
+            // independent semantic (compaction-watch.ts has only approve /
+            // snooze). Removed; the card now has exactly one button per
+            // behavior.
           ]],
         },
       });
@@ -1190,15 +1268,26 @@ async function mountTransport(ctx: Context): Promise<void> {
     {
       broadcast: async (text, keyboard, chatId) => {
         const delivered: { chatId: number; messageId: number }[] = [];
+        // RH-7: one failing chat used to abort the loop and silently drop
+        // every later target. Isolate per target and aggregate; the optional
+        // trailing `failures` field is additive — the array itself remains
+        // the backward-compatible delivered list (mirrors the per-target
+        // isolation the telegram_broadcast tool already demonstrates).
+        const failures: { chatId: number; error: string }[] = [];
         const targets = chatId === undefined ? [...state.chats] : state.chats.has(chatId) ? [chatId] : [];
         for (const target of targets) {
-          const id = await uiSend(target, plain(text), {
-            parse_mode: "HTML",
-            ...(keyboard === undefined ? {} : { reply_markup: keyboard as never }),
-          });
-          if (id !== undefined) delivered.push({ chatId: target, messageId: id });
+          try {
+            const id = await uiSend(target, plain(text), {
+              parse_mode: "HTML",
+              ...(keyboard === undefined ? {} : { reply_markup: keyboard as never }),
+            });
+            if (id !== undefined) delivered.push({ chatId: target, messageId: id });
+          } catch (err) {
+            log(`interactive broadcast failed chatId=${target}`, err);
+            failures.push({ chatId: target, error: err instanceof Error ? err.message : String(err) });
+          }
         }
-        return delivered;
+        return markBroadcastFailures(delivered, failures);
       },
       chatForSession: (sessionId) => state.bridge?.chatIdForAgent(sessionId),
       edit: async (chatId, messageId, text, keyboard) => {
@@ -1267,6 +1356,15 @@ async function mountTransport(ctx: Context): Promise<void> {
       });
     },
     onUserText: async (chatId, text, messageId) => {
+      // RH-9: the contract-declared extension seam (TelegramExtension.onUserText,
+      // extensions/types.ts) was never dispatched to — a third-party inline
+      // flow implementing it silently fell through to plain session delivery.
+      // Purely additive wiring: no builtin extension implements the hook yet,
+      // `=== true` consumes the text, and buildExtensionHost() is only
+      // evaluated when a hook actually exists (optional-call short-circuit).
+      for (const ext of extensions) {
+        if (ext.onUserText?.(chatId, text, buildExtensionHost()) === true) return;
+      }
       if (state.transport) void safeWrap(`typing(${chatId})`, () => state.transport!.sendChatActionControl(chatId, "typing"), log);
       if (pending.search && pending.search.chatId === chatId) {
         pending.search = undefined;
@@ -1435,11 +1533,20 @@ export function apply(ctx: Context, loaderConfig?: unknown): void | Promise<void
     sendText: (chatId: number, text: string) => requireTransport().sendText(chatId, plain(text), { parse_mode: "HTML" }),
     broadcast: async (text: string) => {
       const delivered: { chatId: number; messageId: number }[] = [];
+      // RH-7: per-target isolation — a single rejected sendText used to abort
+      // the loop and strand every remaining chat unnotified. Failures are
+      // aggregated on the optional `failures` field (backward compatible).
+      const failures: { chatId: number; error: string }[] = [];
       for (const chatId of [...state.chats]) {
-        const id = await state.transport?.sendText(chatId, plain(text), { parse_mode: "HTML" });
-        if (id !== undefined) delivered.push({ chatId, messageId: id });
+        try {
+          const id = await state.transport?.sendText(chatId, plain(text), { parse_mode: "HTML" });
+          if (id !== undefined) delivered.push({ chatId, messageId: id });
+        } catch (err) {
+          log(`broadcast delivery failed chatId=${chatId}`, err);
+          failures.push({ chatId, error: err instanceof Error ? err.message : String(err) });
+        }
       }
-      return delivered;
+      return markBroadcastFailures(delivered, failures);
     },
     start: () => startWatching(),
     stop: () => stopWatching(),
@@ -1537,8 +1644,18 @@ export function apply(ctx: Context, loaderConfig?: unknown): void | Promise<void
         }
         if (sub === "disallow" && arg) {
           const chatId = Number(arg);
-          state.config.security.allowedChatIds = state.config.security.allowedChatIds.filter((id) => id !== chatId);
-          writeConfig(state.configRoot, state.config);
+          // RH-11: validate exactly like the allow branch — Number("abc") is
+          // NaN, which used to compare unequal against every entry and still
+          // rewrite the config plus report a fake success.
+          if (!Number.isInteger(chatId)) return failCmd("chatId must be an integer");
+          const before = state.config.security.allowedChatIds;
+          const after = before.filter((id) => id !== chatId);
+          // Idempotent re-run: when the filter removed nothing, keep memory
+          // and disk untouched instead of rewriting an identical config.
+          if (after.length !== before.length) {
+            state.config.security.allowedChatIds = after;
+            writeConfig(state.configRoot, state.config);
+          }
           ejectChat(chatId);
           return okCmd(`Disallowed chat ${chatId}.`);
         }
@@ -1556,7 +1673,19 @@ export function apply(ctx: Context, loaderConfig?: unknown): void | Promise<void
           return okCmd(JSON.stringify(getConfigPath(state.config, parts[2])));
         }
         if (sub === "config" && arg === "set" && parts[2]) {
-          const value = JSON.parse(parts.slice(3).join(" "));
+          // RH-1-half mirror of the `/config set` fix in core/commands.ts:
+          // `parts` comes from a \s+ split, so rejoining with " " folded every
+          // run of spaces inside a JSON string value ("a  b" was persisted as
+          // "a b") — silent data corruption. Split off only the three leading
+          // tokens ("config", "set", <path>) by index from the RAW input and
+          // hand the remainder to JSON.parse verbatim.
+          const raw = invocation.rawInput.trim();
+          let cursor = 0;
+          for (let skipped = 0; skipped < 3 && cursor < raw.length; skipped += 1) {
+            while (cursor < raw.length && /\s/.test(raw[cursor]!)) cursor += 1;
+            while (cursor < raw.length && !/\s/.test(raw[cursor]!)) cursor += 1;
+          }
+          const value = JSON.parse(raw.slice(cursor));
           const { config, changed } = overlayConfig(state.config, patchFromPath(parts[2], value));
           if (changed.length === 0) return failCmd(`unknown config path ${parts[2]}`);
           state.config = config;

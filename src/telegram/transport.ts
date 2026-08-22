@@ -400,15 +400,21 @@ export class TelegramTransport {
   private sendTextLane(chatId: number, text: string, options: SendOptions, lane: number | string): Promise<number | undefined> {
     const parts = splitText(text, this.maxMessageLength);
     const markup = (options as { reply_markup?: unknown }).reply_markup;
+    // Resume, not retry (audit RE-4): the queue re-INVOKES the queued callback
+    // on every transient-failure attempt, so progress counters must live out
+    // here — in the scope the callback closes over — or they would reset and
+    // parts already delivered would be sent again.
+    let first: number | undefined;
+    let sent = 0;
     return this.queue.push(lane, async () => {
       try {
-        let first: number | undefined;
-        for (let index = 0; index < parts.length; index += 1) {
+        for (let index = sent; index < parts.length; index += 1) {
           // Reply quoting and reply keyboards are per-message Telegram state:
           // only the FIRST part carries them; later parts must be plain text.
           const partOptions = index === 0 ? options : { ...options, reply_markup: undefined, reply_parameters: undefined };
           const msg = await withTimeout(this.api.sendMessage(chatId, parts[index]!, partOptions), 20_000);
           first ??= msg.message_id;
+          sent = index + 1;
         }
         this.log(`sendText ok chatId=${chatId} parts=${parts.length} reply_markup=${markup === undefined ? "null" : "set"}`);
         return first;
@@ -434,6 +440,14 @@ export class TelegramTransport {
   }
 
   private editTextLane(chatId: number, messageId: number, text: string, options: EditOptions, lane: number | string): Promise<boolean> {
+    // An overlong payload is a guaranteed non-retryable 400 ("message is too
+    // long"); fail fast BEFORE the API call instead of burning the attempt,
+    // the log noise and a queue slot. `false` shares the "card gone"
+    // semantics callers already handle with a fresh-send fallback (RE-7).
+    if (text.length > this.maxMessageLength) {
+      this.log(`editText skipped chatId=${chatId} messageId=${messageId} len=${text.length} > max=${this.maxMessageLength}`);
+      return Promise.resolve(false);
+    }
     return this.queue.push(lane, async () => {
       try {
         await withTimeout(this.api.editMessageText(chatId, messageId, text, options), 20_000);

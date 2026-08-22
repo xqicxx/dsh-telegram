@@ -107,6 +107,7 @@ test('goal turn completion pushes a fresh receipt message (#18)', async (t) => {
   ctx.emit('agent-1', ev('turn/end', { turn: 1, reason: { kind: 'completed' } }));
   await Promise.resolve();
   assert.equal(host.sends.length, 2, 'completion receipt is a fresh push');
-  assert.match(host.sends[1].text, /✅ process the dataset/);
+  // (markup-tolerant: the objective renders bold in the receipt header)
+  assert.match(host.sends[1].text, /✅ (?:<b>)?process the dataset(?:<\/b>)?/);
   assert.equal(host.sends[1].options.disable_notification, false);
 });

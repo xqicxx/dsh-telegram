@@ -14,6 +14,7 @@ import type { Context } from "@deepseek-ai/cordis";
 import type { Agent } from "@deepseek-ai/dsh-agent";
 import { listAgentPresets } from "../harness/adapters/presets.js";
 import { plain, truncate } from "../telegram/html.js";
+import { bold, headerLine, metaJoin } from "../telegram/ui.js";
 import { buildNewSessionKeyboard, buildPresetDetailKeyboard, buildPresetsKeyboard } from "../telegram/keyboard.js";
 import type { CardLoad, OpenCard } from "../core/cards.js";
 
@@ -43,13 +44,13 @@ export function createPresetCards(deps: PresetCardsDeps): {
     if (presetsView === undefined) return;
     const { presets } = presetsView;
     const lines = [
-      "\u2728 New session",
+      headerLine("\u2728", "New session"),
       "",
       presets.length > 0
         ? "Compose the session from a preset, or use the roster default:"
         : "This profile composes no agent presets \u2014 the new session uses the profile default.",
       "",
-      ...presets.slice(0, 12).map((preset) => `${preset.isDefault ? "\u2B50" : "\u2022"} ${plain(preset.id)}${preset.isDefault ? " (default)" : ""}`),
+      ...presets.slice(0, 12).map((preset) => `${preset.isDefault ? "\u2B50" : "\u2022"} ${bold(preset.id)}${preset.isDefault ? " \u00B7 default" : ""}`),
     ];
     await openCard(chatId, lines.join("\n"), buildNewSessionKeyboard(
       token({ action: "new-default" }),
@@ -61,9 +62,13 @@ export function createPresetCards(deps: PresetCardsDeps): {
     const presetsView = await cardLoad(chatId, "agent presets", () => listAgentPresets(requireCtx()));
     if (presetsView === undefined) return;
     const { presets, authorable, hasDocument } = presetsView;
-    const lines = [`\u{1F3AD} Agent presets (${presets.length}) \u00B7 authorable: ${authorable} \u00B7 document: ${hasDocument ? "yes" : "no"}`, ""];
+    const lines = [
+      headerLine("\u{1F3AD}", "Agent presets", `${presets.length}`, `authorable ${authorable ? "yes" : "no"}`, `document ${hasDocument ? "yes" : "no"}`),
+      "",
+    ];
     for (const preset of presets.slice(0, 20)) {
-      lines.push(`${preset.isDefault ? "\u2B50" : "\u2022"} ${plain(preset.id)} \u00B7 ${preset.trust}${preset.broken ? " \u00B7 broken" : ""}`);
+      const flags = [preset.trust, ...(preset.broken ? ["\u26A0\uFE0F broken"] : [])];
+      lines.push(metaJoin(`${preset.isDefault ? "\u2B50" : "\u2022"} ${bold(preset.id)}`, ...flags));
       if (preset.description) lines.push(`  ${plain(truncate(preset.description, 60))}`);
     }
     if (presets.length === 0) lines.push("This profile composes no agent presets.");
@@ -74,7 +79,7 @@ export function createPresetCards(deps: PresetCardsDeps): {
   async function openPresetDetailCard(chatId: number, presetId: string): Promise<void> {
     const agent = currentAgent(chatId);
     const lines = [
-      `\u{1F3AD} ${plain(truncate(presetId, 40))}`,
+      headerLine("\u{1F3AD}", truncate(presetId, 40)),
       "",
       "Blank session: applies in place. Started session: forks it, applies the preset to the fork, and closes the original.",
     ];

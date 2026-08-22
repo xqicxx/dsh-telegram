@@ -17,7 +17,11 @@ export function detectProfile(argv: readonly string[] = process.argv): string | 
 }
 
 export function dshHome(): string {
-  return process.env.DSH_HOME ?? join(homedir(), ".dsh");
+  // RG-3: `??` only catches undefined/null — an empty DSH_HOME would turn
+  // join("", "sessions", …) into a cwd-relative path that drifts with the
+  // process working directory. Treat "" like unset, matching downloads.ts.
+  const home = process.env.DSH_HOME;
+  return home !== undefined && home !== "" ? home : join(homedir(), ".dsh");
 }
 
 const IGNORED_PROFILE_DIRS = new Set(["node_modules"]);

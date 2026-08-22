@@ -630,24 +630,33 @@ test('searchSessions stops opening cold logs once the hit limit is full', async 
 
 test('deleteSession recognizes directories named by the pinned encodeSegment vectors', async () => {
   const { deleteSession } = await import('../dist/harness/adapters/sessions.js');
+  // Legal ids (no separators, ≤200 chars) still delete their encoded
+  // directory; hostile shapes (separators, oversized — audit D-1) are
+  // rejected at the entry before any filesystem work, so their candidate
+  // directory must remain untouched.
   const vectors = [
-    ['session-abc-123', '--~session-abc-123--'], // initial separator run emits the leading ~
-    ['a/b\\c', '--~a~b~c--'], // separator runs fold to a single ~ each
-    ['a b', '--~a~0020b--'], // space escapes as uppercase hex
-    ['café', '--~caf~00E9--'], // non-ASCII escapes by code point
-    ['a~b', '--~a~007Eb--'], // literal ~ always escapes
-    ['x'.repeat(300), `--~${'x'.repeat(250)}--`], // inner bound: 251 chars between the -- wrappers
+    ['session-abc-123', '--~session-abc-123--', true], // initial separator run emits the leading ~
+    ['a b', '--~a~0020b--', true], // space escapes as uppercase hex
+    ['café', '--~caf~00E9--', true], // non-ASCII escapes by code point
+    ['a~b', '--~a~007Eb--', true], // literal ~ always escapes
+    ['a/b\\c', '--~a~b~c--', false], // D-1: forged separator id is rejected outright
+    ['x'.repeat(300), `--~${'x'.repeat(250)}--`, false], // D-1: oversized id is rejected outright
   ];
   const home = mkdtempSync(join(tmpdir(), 'dsh-encode-segment-'));
   const oldHome = process.env.DSH_HOME;
   process.env.DSH_HOME = home;
   try {
-    for (const [id, expectedDir] of vectors) {
+    for (const [id, expectedDir, shouldDelete] of vectors) {
       const dir = join(home, 'sessions', '--proj--', expectedDir);
       mkdirSync(dir, { recursive: true });
       try {
-        await deleteSession({ agents: { get: () => undefined } }, id);
-        assert.equal(existsSync(dir), false, `encodeSegment(${JSON.stringify(id.slice(0, 16))}) must produce ${expectedDir}`);
+        const result = await deleteSession({ agents: { get: () => undefined } }, id);
+        if (shouldDelete) {
+          assert.equal(existsSync(dir), false, `encodeSegment(${JSON.stringify(id.slice(0, 16))}) must produce ${expectedDir}`);
+        } else {
+          assert.equal(result.ok, false, `hostile id ${JSON.stringify(id.slice(0, 16))} must be rejected`);
+          assert.equal(existsSync(dir), true, 'rejected ids must not touch the filesystem');
+        }
       } finally {
         rmSync(dir, { recursive: true, force: true });
       }

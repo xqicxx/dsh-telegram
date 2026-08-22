@@ -6,6 +6,7 @@
  * network errors keep the id for a later sweep so no permanent ghost cards.
  */
 import { GrammyError } from "grammy";
+import { serializePerKey } from "./serialize-per-key.js";
 
 export interface ChatOps {
   sendText(chatId: number, text: string, options?: Record<string, unknown>): Promise<number | undefined>;
@@ -27,10 +28,7 @@ export class Ephemeral {
   }
 
   private serialize<T>(chatId: number, fn: () => Promise<T>): Promise<T> {
-    const prev = this.locks.get(chatId) ?? Promise.resolve();
-    const run = prev.then(fn, fn);
-    this.locks.set(chatId, run.then(noop, noop));
-    return run;
+    return serializePerKey(this.locks, chatId, fn);
   }
 
   /** Delete every tracked surface for a chat (best effort). */
@@ -124,8 +122,4 @@ export class Ephemeral {
     this.last.clear();
     this.locks.clear();
   }
-}
-
-function noop(): void {
-  /* swallow chain errors */
 }

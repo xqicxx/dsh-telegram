@@ -18,7 +18,7 @@
  *   separate clean message by the bridge.
  */
 import type { Context } from "@deepseek-ai/cordis";
-import { escapeHtml } from "../telegram/html.js";
+import { escapeHtml, truncate } from "../telegram/html.js";
 import { markdownTablePreBlock, markdownToHtml } from "../telegram/markdown.js";
 import { type StatusStats } from "../harness/adapters/status.js";
 import { safeWrap } from "../telegram/safe.js";
@@ -411,7 +411,7 @@ export function apply(ctx: Context, _config?: unknown): void {
         ? `\u2699\uFE0F Working \u00B7 \u23F1\uFE0F ${Math.max(1, Math.round((Date.now() - draft.startedAt) / 1000))}s`
         : "\u2699\uFE0F Working\u2026";
     }
-    const base = `\u{1F4CA} ${goal.objective.slice(0, 48)} \u00B7 step ${draft.step}`;
+    const base = `\u{1F4CA} ${escapeHtml(truncate(goal.objective, 48))} \u00B7 step ${draft.step}`;
     return liveness
       ? `${base} \u00B7 \u23F1\uFE0F ${Math.max(1, Math.round((Date.now() - draft.startedAt) / 1000))}s`
       : base;
@@ -675,7 +675,7 @@ export function apply(ctx: Context, _config?: unknown): void {
         const hasContent = draft.reasoningSteps > 0 || draft.toolCalls > 0;
         const summary = hasContent ? buildSummary(draft, sessionStats, goal?.objective) : undefined;
         if (goal !== undefined && !failed) {
-          goalReceipt = summary ?? `\u2705 ${goal.objective.slice(0, 60)} \u00B7 \u23F1\uFE0F ${Math.max(1, Math.round((Date.now() - draft.startedAt) / 1000))}s`;
+          goalReceipt = summary ?? `\u2705 ${escapeHtml(truncate(goal.objective, 60))} \u00B7 \u23F1\uFE0F ${Math.max(1, Math.round((Date.now() - draft.startedAt) / 1000))}s`;
         }
         if (!failed && answer === undefined && summary === undefined && goalReceipt === undefined) {
           // The notice rides on the placeholder (falling back to a fresh

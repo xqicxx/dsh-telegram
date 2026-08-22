@@ -87,29 +87,38 @@ function parseTags(text: string): ParsedTag[] {
   return tags;
 }
 
-/** Opening tags still pending at the end of `prefix` (innermost last). */
-function openStackFor(prefix: string): string[] {
-  const stack: string[] = [];
+/** Opening tags still pending at the end of `prefix` (innermost last), kept
+ * as their raw source text: a tag reopened after a split must replay its
+ * attributes, because Telegram rejects a bare `<a>` (no href) with a
+ * non-retryable 400 that loses that part and everything after it (RE-2). */
+function openStackFor(prefix: string): ParsedTag[] {
+  const stack: ParsedTag[] = [];
   for (const tag of parseTags(prefix)) {
     if (tag.selfClosing || VOID_TAGS.has(tag.name)) continue;
     if (tag.closing) {
-      const at = stack.lastIndexOf(tag.name);
+      let at = -1;
+      for (let index = stack.length - 1; index >= 0; index -= 1) {
+        if (stack[index]!.name === tag.name) {
+          at = index;
+          break;
+        }
+      }
       if (at !== -1) stack.splice(at, 1);
       continue;
     }
-    stack.push(tag.name);
+    stack.push(tag);
   }
   return stack;
 }
 
-function closersFor(stack: readonly string[]): string {
+function closersFor(stack: readonly ParsedTag[]): string {
   let out = "";
-  for (let index = stack.length - 1; index >= 0; index -= 1) out += `</${stack[index]}>`;
+  for (let index = stack.length - 1; index >= 0; index -= 1) out += `</${stack[index]!.name}>`;
   return out;
 }
 
-function reopenFor(stack: readonly string[]): string {
-  return stack.map((name) => `<${name}>`).join("");
+function reopenFor(stack: readonly ParsedTag[]): string {
+  return stack.map((tag) => tag.raw).join("");
 }
 
 /** A cut may never land inside a tag (or an HTML entity); Telegram's HTML

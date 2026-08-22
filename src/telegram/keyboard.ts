@@ -77,15 +77,30 @@ export function todoBarLabel(todoCount: number): string {
 
 const callbackBytes = (value: string): number => new TextEncoder().encode(value).length;
 
-/** Build `<prefix><url-encoded value>` bounded to Telegram's 64-byte
+/** Build `<prefix><url-encoded value><suffix>` bounded to Telegram's 64-BYTE
  * callback_data limit by trimming the raw value before encoding, so the
- * result is always valid percent-encoding (never truncated mid-sequence). */
-export function encodedCallback(prefix: string, value: string): string {
+ * result is always valid percent-encoding (never truncated mid-sequence).
+ * `suffix` (e.g. `:use`) is appended verbatim after its bytes are reserved
+ * from the budget, so action-bearing payloads stay byte-safe too. */
+export function encodedCallback(prefix: string, value: string, suffix = ""): string {
+  const fixed = callbackBytes(prefix) + callbackBytes(suffix);
   let trimmed = value;
-  while (trimmed.length > 0 && callbackBytes(prefix + encodeURIComponent(trimmed)) > 64) {
+  while (trimmed.length > 0 && fixed + callbackBytes(encodeURIComponent(trimmed)) > 64) {
     trimmed = trimmed.slice(0, -1);
   }
-  return prefix + encodeURIComponent(trimmed);
+  return prefix + encodeURIComponent(trimmed) + suffix;
+}
+
+/** Byte-safe callback_data for ids read back VERBATIM by colon-splitting
+ * parsers (`s:`, `w:`): a value that already fits Telegram's 64-byte cap
+ * passes through unchanged — colons included, so `data.split(":")` keeps
+ * resolving ids exactly as before — and only an oversized value falls back
+ * to the percent-encoded trimmed form (audit RE-9: a UTF-16 code-unit slice
+ * could still exceed the byte budget and 400 the whole card). */
+export function boundedCallback(prefix: string, value: string, suffix = ""): string {
+  const fixed = callbackBytes(prefix) + callbackBytes(suffix);
+  if (fixed + callbackBytes(value) <= 64) return `${prefix}${value}${suffix}`;
+  return encodedCallback(prefix, value, suffix);
 }
 
 /** Decode a callback payload that should be percent-encoded. Legacy cards or
@@ -284,7 +299,7 @@ export function buildPagingKeyboard(callbacks: { previous?: string; next?: strin
 export function buildSearchKeyboard(ids: readonly string[], paging?: SessionsPaging): InlineKeyboard {
   const rows: { text: string; callback_data: string }[][] = [];
   for (const id of ids.slice(0, 8)) {
-    rows.push([{ text: `\u{1F9ED} ${id.slice(0, 30)}`, callback_data: `s:${id}`.slice(0, 64) }]);
+    rows.push([{ text: `\u{1F9ED} ${id.slice(0, 30)}`, callback_data: boundedCallback("s:", id) }]);
   }
   if (paging !== undefined && (paging.previous !== undefined || paging.next !== undefined)) {
     const nav: { text: string; callback_data: string }[] = [];
@@ -321,7 +336,7 @@ export function buildSessionsKeyboard(
     const suffix = item.title && item.title.trim() !== "" ? ` \u00B7 ${item.id.slice(0, 10)}` : "";
     const marker = item.running === true ? "\u25B6 " : "";
     const row: { text: string; callback_data: string }[] = [
-      { text: `\u{1F9ED} ${marker}${label.slice(0, 22)}${suffix}`.slice(0, 48), callback_data: `s:${item.id}`.slice(0, 64) },
+      { text: `\u{1F9ED} ${marker}${label.slice(0, 22)}${suffix}`.slice(0, 48), callback_data: boundedCallback("s:", item.id) },
     ];
     if (item.archiveCb !== undefined) row.push({ text: "\u5F52\u6863", callback_data: item.archiveCb });
     if (item.deleteCb !== undefined) row.push({ text: "\u5220\u9664", callback_data: item.deleteCb });
@@ -379,26 +394,29 @@ export function buildSessionProjectsKeyboard(
 export function buildHistoryKeyboard(sessionId: string, older?: string): InlineKeyboard {
   const rows: { text: string; callback_data: string }[][] = [];
   if (older !== undefined) rows.push([{ text: "\u23EA Load older", callback_data: older }]);
-  rows.push([{ text: "\u2190 Session", callback_data: `s:${sessionId}`.slice(0, 64) }]);
+  rows.push([{ text: "\u2190 Session", callback_data: boundedCallback("s:", sessionId) }]);
   return InlineKeyboard.from(rows);
 }
 
 export function buildSessionDetailKeyboard(id: string, archived: boolean, back = "m:sessions"): InlineKeyboard {
-  const prefix = `s:${id}`.slice(0, 52);
+  // Byte-safe action payloads (audit RE-9): the id is percent-encoded and
+  // trimmed so every `s:<id>:<action>` button fits Telegram's 64-BYTE
+  // callback_data cap — a UTF-16 code-unit slice could still exceed it.
+  const cb = (action: string) => boundedCallback("s:", id, `:${action}`);
   const kb = new InlineKeyboard();
-  kb.row().text("\u{1F3AF} Use", `${prefix}:use`.slice(0, 64));
-  kb.row().text("\u{1F4DC} History", `${prefix}:history`.slice(0, 64)).text("\u270F Rename", `${prefix}:rename`.slice(0, 64));
-  kb.row().text("\u{1F500} Fork", `${prefix}:fork`.slice(0, 64)).text(archived ? "\u{1F4E5} Archived" : "\u{1F5C4} Archive", `${prefix}:archive`.slice(0, 64));
-  kb.row().text("\u{1F4CE} Model", `${prefix}:model`.slice(0, 64)).text("\u231B Queue", `${prefix}:queue`.slice(0, 64));
-  kb.row().text("\u{1F3AF} Steer", `${prefix}:steer`.slice(0, 64)).text("\u{1F4E6} Log", `${prefix}:log`.slice(0, 64));
-  kb.row().text("\u23F9 Stop", `${prefix}:stop`.slice(0, 64)).text("\u{1F5D1} Delete", `${prefix}:delete`.slice(0, 64));
+  kb.row().text("\u{1F3AF} Use", cb("use"));
+  kb.row().text("\u{1F4DC} History", cb("history")).text("\u270F Rename", cb("rename"));
+  kb.row().text("\u{1F500} Fork", cb("fork")).text(archived ? "\u{1F4E5} Archived" : "\u{1F5C4} Archive", cb("archive"));
+  kb.row().text("\u{1F4CE} Model", cb("model")).text("\u231B Queue", cb("queue"));
+  kb.row().text("\u{1F3AF} Steer", cb("steer")).text("\u{1F4E6} Log", cb("log"));
+  kb.row().text("\u23F9 Stop", cb("stop")).text("\u{1F5D1} Delete", cb("delete"));
   return kb.row().text("\u2190 Sessions", back);
 }
 
 export function buildWorkspaceKeyboard(items: readonly { id: string; title: string }[]): InlineKeyboard {
   const kb = new InlineKeyboard();
   for (const item of items.slice(0, 20)) {
-    kb.text(`\u{1F5C2} ${item.title.slice(0, 30)}`, `w:${item.id}`.slice(0, 64)).row();
+    kb.text(`\u{1F5C2} ${item.title.slice(0, 30)}`, boundedCallback("w:", item.id)).row();
   }
   return kb.row().text("\u2795 Create", "w:create").text("\u2190 Back", "m:back");
 }
@@ -407,13 +425,15 @@ export function buildWorkspaceDetailKeyboard(
   id: string,
   actions?: { use?: string; sessions?: string },
 ): InlineKeyboard {
-  const prefix = `w:${id}`.slice(0, 52);
+  // Byte-safe action payloads (audit RE-9), same convention as the session
+  // detail card.
+  const cb = (action: string) => boundedCallback("w:", id, `:${action}`);
   const kb = new InlineKeyboard();
   if (actions?.use !== undefined) kb.row().text("\u2705 \u4F7F\u7528\u6B64\u9879\u76EE", actions.use);
   if (actions?.sessions !== undefined) kb.row().text("\u{1F9ED} \u4F1A\u8BDD", actions.sessions);
-  kb.row().text("\u270F Rename", `${prefix}:rename`.slice(0, 64)).text("\u{1F5D1} Delete", `${prefix}:delete`.slice(0, 64));
-  kb.row().text("\u2B06 Move up", `${prefix}:up`.slice(0, 64)).text("\u2193 Move down", `${prefix}:down`.slice(0, 64));
-  kb.row().text("\u{1F4CC} Pin session first", `${prefix}:pin`.slice(0, 64));
+  kb.row().text("\u270F Rename", cb("rename")).text("\u{1F5D1} Delete", cb("delete"));
+  kb.row().text("\u2B06 Move up", cb("up")).text("\u2193 Move down", cb("down"));
+  kb.row().text("\u{1F4CC} Pin session first", cb("pin"));
   return kb.row().text("\u2190 Workspaces", "m:workspaces");
 }
 
@@ -434,16 +454,19 @@ export function inputPromptKeyboard(placeholder: string): { force_reply: true; i
 export function buildQueueKeyboard(items: readonly QueueRow[]): InlineKeyboard {
   const rows: { text: string; callback_data: string }[][] = [];
   for (const item of items.slice(0, 24)) {
-    const prefix = `q:${item.itemId}`.slice(0, 52);
     const label = item.index === undefined ? item.itemId.slice(0, 8) : `#${item.index + 1}`;
     const kind = item.kind === "next-turn" ? "turn" : "step";
+    // Byte-safe action payloads (audit RE-9): the q: parser is decode-aware
+    // (composite `session:item` ids ride through percent-encoded), so these
+    // go through the encoder unconditionally; ids without escapable
+    // characters come out byte-identical to raw.
     // Editing text on a phone is the worst part of the queue UX. Instead of
     // asking for a reply-edited replacement, this card only offers delete
     // (then resend your message) and, for next-turn items, run-now.
     const row: { text: string; callback_data: string }[] = [
-      { text: `\u{1F5D1} Delete ${label} \u00B7 ${kind}`, callback_data: `${prefix}:r`.slice(0, 64) },
+      { text: `\u{1F5D1} Delete ${label} \u00B7 ${kind}`, callback_data: encodedCallback("q:", item.itemId, ":r") },
     ];
-    if (item.kind === "next-turn") row.push({ text: `\u26A1 Run ${label} now`, callback_data: `${prefix}:s`.slice(0, 64) });
+    if (item.kind === "next-turn") row.push({ text: `\u26A1 Run ${label} now`, callback_data: encodedCallback("q:", item.itemId, ":s") });
     rows.push(row);
   }
   rows.push([{ text: "\u2190 Back", callback_data: "m:back" }]);

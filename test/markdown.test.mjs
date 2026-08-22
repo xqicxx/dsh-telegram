@@ -221,10 +221,36 @@ test('a long model-styled separator does not inflate column width (#31)', () => 
   assert.match(html, /\| --- \| --- \|/, 'separator reflects data width, not its own dashes');
 });
 
-test('ragged body rows wider than the header render without padding NaNs (#31 hardening)', () => {
+test('ragged body rows fold overflow cells into the last column (RE-11)', () => {
   const html = markdownToHtml(['| a | b |', '|---|---|', '| 1 | 2 | extra | cells |'].join('\n'));
-  assert.match(html, /<pre><code>\| a   \| b   \|/);
-  assert.match(html, /\| 1   \| 2   \|/, 'rows are truncated to the header column count, unpadded extras dropped');
+  assert.match(html, /<pre><code>\| a   \| b                 \|/);
+  assert.match(html, /\| 1   \| 2 \| extra \| cells \|/, 'overflow cells are kept, merged into the last column');
   assert.equal(html.includes('undefined'), false);
   assert.equal(html.includes('NaN'), false);
+});
+
+test('a GFM escaped pipe (\\|) stays inside its cell instead of splitting the row (RE-11)', () => {
+  const html = markdownToHtml(['| name | value |', '|---|---|', '| a \\| b | c |'].join('\n'));
+  const block = /<pre><code>([\s\S]*?)<\/code><\/pre>/.exec(html)?.[1] ?? '';
+  const lines = block.split('\n');
+  // Two columns only: the escaped pipe renders as a literal pipe inside
+  // cell one instead of creating a phantom third column.
+  assert.equal((lines[0].match(/\|/g) ?? []).length, 3, 'header still has exactly two columns');
+  assert.match(lines[2], /^\| a \| b\s+\| c\s+\|$/, `body row: ${JSON.stringify(lines[2])}`);
+});
+
+test('nested link labels hit the recursion guard instead of overflowing the stack (RE-5)', () => {
+  // Links and emphasis alternate so every wrap level genuinely nests inside
+  // the previous label/content. Before RE-5 the link hop reset the effective
+  // depth to its paren-counter (~1-2), so MAX_INLINE_DEPTH never tripped and
+  // 50k wraps blew the stack with an uncaught RangeError.
+  let nested = 'core';
+  for (let i = 0; i < 50_000; i += 1) nested = `[**${nested}**](https://e.test/)`;
+  let html;
+  assert.doesNotThrow(() => {
+    html = markdownToHtml(nested);
+  }, 'deep mixed nesting must degrade, not RangeError');
+  assert.ok(html.includes('core'), 'innermost content survives as text');
+  // Normal (shallow) link rendering is unchanged.
+  assert.equal(markdownToHtml('[label](https://e.test/x)'), '<a href="https://e.test/x">label</a>');
 });

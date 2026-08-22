@@ -42,10 +42,12 @@ test('priority and icons are display-only derivations from content tags', () => 
   assert.equal(todoIcon(todo('x', 'in_progress')), '\u23F3');
 });
 
-test('renderTodos keeps the card one readable line per todo', () => {
-  const text = renderTodos([todo('a', 'completed'), todo('b')]);
-  assert.match(text, /✅ a .* \[completed\]/);
-  assert.match(text, /b .* \[pending\]/);
+test('renderTodos keeps the card one readable line per todo (strike-through done, no tag noise)', () => {
+  const text = renderTodos([todo('a', 'completed'), todo('b <cfg>'), todo('c', 'in_progress')]);
+  assert.match(text, /✅ <s>a<\/s>/);
+  assert.match(text, /⏳ c/);
+  assert.match(text, /🟢 b &lt;cfg&gt;/, 'content is HTML-escaped');
+  assert.doesNotMatch(text, /\[(completed|pending|in_progress)\]/, 'status tags are gone — icons carry state');
 });
 
 test('listTodos caches the scanned end and only walks newly appended events', () => {

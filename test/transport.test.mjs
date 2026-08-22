@@ -348,3 +348,60 @@ test('editText logs the benign "not modified" case at noop level, never FAILED (
   assert.equal(await transport.editText(7, 5, 'x'), false);
   assert.equal(lines.filter((line) => line.includes('FAILED')).length, 1);
 });
+
+// ---------------------------------------------------------------------------
+// RE-4 / RE-7
+// ---------------------------------------------------------------------------
+
+test('sendTextLane resumes after a transient failure instead of re-sending delivered parts (RE-4)', async () => {
+  const { SendQueue } = await import('../dist/telegram/queue.js');
+  const transport = new TelegramTransport({
+    token: '123456:resume',
+    log: () => {},
+    queue: new SendQueue({ retry: { attempts: 2, baseDelayMs: 1 }, sleep: async () => {} }),
+  });
+  transport.applyLimits({ maxMessageLength: 10 });
+  const sent = [];
+  let calls = 0;
+  transport.api.sendMessage = async (_chatId, text) => {
+    calls += 1;
+    if (calls === 2) {
+      // Second part hits a 429 on its first attempt only.
+      const err = new Error('Too Many Requests: retry after 0');
+      err.error_code = 429;
+      err.parameters = { retry_after: 0 };
+      throw err;
+    }
+    sent.push(text);
+    return { message_id: sent.length };
+  };
+  const first = await transport.sendText(7, 'a'.repeat(25)); // parts: 10+10+5
+  assert.equal(first, 1, 'the returned message id is the FIRST part (delivered before the failure)');
+  assert.equal(calls, 4, 'part1 x1, part2 x2 (one 429 retry), part3 x1');
+  assert.deepEqual(
+    sent,
+    ['a'.repeat(10), 'a'.repeat(10), 'a'.repeat(5)],
+    'delivered parts are never repeated; order stays intact',
+  );
+});
+
+test('editText refuses overlong payloads without calling the API and reports false (RE-7)', async () => {
+  const logs = [];
+  const transport = new TelegramTransport({
+    token: '123456:len-guard',
+    log: (message) => logs.push(message),
+    queue: { push: async (_key, fn) => fn(), pendingCount: () => 0, configure: () => {} },
+  });
+  let apiCalls = 0;
+  transport.api.editMessageText = async () => {
+    apiCalls += 1;
+    return { message_id: 5 };
+  };
+  assert.equal(await transport.editText(7, 5, 'x'.repeat(5000)), false, 'overlong edit fails fast as "card gone"');
+  assert.equal(apiCalls, 0, 'the doomed API call never happens');
+  assert.ok(logs.some((line) => line.includes('editText skipped') && line.includes('len=5000')), logs.join(' | '));
+
+  // Within the limit the edit still flows normally.
+  assert.equal(await transport.editText(7, 5, 'x'.repeat(100)), true);
+  assert.equal(apiCalls, 1);
+});

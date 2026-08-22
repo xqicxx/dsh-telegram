@@ -26,7 +26,8 @@ import {
 } from "../harness/adapters/sessions.js";
 import { listWorkspaces } from "../harness/adapters/workspace.js";
 import type { TelegramTransport } from "../telegram/transport.js";
-import { plain, truncate } from "../telegram/html.js";
+import { escapeHtml, plain, truncate } from "../telegram/html.js";
+import { bold, headerLine, metaJoin, mono, relTime } from "../telegram/ui.js";
 import { renderTrajectoryLines } from "../telegram/trajectory.js";
 import {
   buildHistoryKeyboard,
@@ -101,19 +102,30 @@ export function createSessionCards(deps: SessionCardsDeps): {
     const runningCount = sessions.filter((session) => session.running).length;
     const label = group?.label ?? "\u5168\u90E8\u4F1A\u8BDD";
     state.lastSessionsProject.set(chatId, key);
+    // Design language: bold card title, a quiet meta strip, then one bold row
+    // per session with its recency/id beneath — scannable on a phone.
     const lines = [
-      `\u{1F9ED} Sessions \u00B7 ${plain(truncate(label, 26))} \u00B7 \u25B6${runningCount}/${sessions.length}${archivedCount > 0 ? ` \u00B7 \u{1F5C4}${archivedCount}` : ""} \u00B7 page ${safe + 1}/${totalPages}`,
+      headerLine("\u{1F9ED}", "Sessions", plain(truncate(label, 26))),
+      metaJoin(
+        runningCount > 0 ? `\u25B6\uFE0F ${runningCount} running` : undefined,
+        `${sessions.length} \u4F1A\u8BDD`,
+        archivedCount > 0 ? `\u{1F5C4}${archivedCount}` : undefined,
+        `page ${safe + 1}/${totalPages}`,
+      ),
       "",
     ];
     if (sessions.length === 0) lines.push("(\u8BE5\u9879\u76EE\u6682\u65E0\u4F1A\u8BDD)", "");
     for (const session of pageItems) {
-      const flags = [session.live ? "live" : "cold", session.running ? "running" : "idle"];
       const title = displayTitleFor(session.title, session.cwd, session.id);
       const hasTitle = session.title !== undefined && session.title.trim() !== "";
-      lines.push(
-        `${session.id === bound ? "\u25B8" : "\u2022"} ${session.running ? "\u25B6 " : ""}${plain(truncate(title, 32))} \u00B7 ${flags.join("/")}${hasTitle ? ` \u00B7 ${plain(truncate(session.id, 14))}` : ""}`,
-      );
-      if (session.lastPromptAt !== undefined) lines.push(`   last prompt: ${plain(new Date(session.lastPromptAt).toLocaleString())}`);
+      const marker = session.id === bound ? "\u25B8" : "\u2022";
+      const state_ = session.running ? " \u25B6\uFE0F" : session.live ? "" : " \u00B7 cold";
+      lines.push(`${marker} ${bold(truncate(title, 32))}${state_}`);
+      if (session.lastPromptAt !== undefined) {
+        lines.push(`   ${metaJoin(`\u23F1\uFE0F ${relTime(session.lastPromptAt)}`, hasTitle ? mono(truncate(session.id, 14)) : undefined)}`);
+      } else if (hasTitle) {
+        lines.push(`   ${mono(truncate(session.id, 14))}`);
+      }
     }
     lines.push("", "\u4F1A\u8BDD\u6309\u94AE\u6253\u5F00\u8BE6\u60C5 \u00B7 \u5F52\u6863 / \u5220\u9664 \u76F4\u63A5\u64CD\u4F5C\u3002");
     await openCard(chatId, lines.join("\n"), buildSessionsKeyboard(pageItems.map((session) => ({
@@ -138,11 +150,15 @@ export function createSessionCards(deps: SessionCardsDeps): {
     const totalPages = Math.max(1, Math.ceil(groups.length / SESSION_PROJECTS_PAGE_SIZE));
     const safe = Math.max(0, Math.min(page, totalPages - 1));
     const pageGroups = groups.slice(safe * SESSION_PROJECTS_PAGE_SIZE, (safe + 1) * SESSION_PROJECTS_PAGE_SIZE);
-    const lines = [`\u{1F504} \u9879\u76EE (${groups.length}) \u00B7 page ${safe + 1}/${totalPages}`, ""];
+    const lines = [headerLine("\u{1F504}", "\u9879\u76EE", `${groups.length}`, `page ${safe + 1}/${totalPages}`), ""];
     for (const group of pageGroups) {
       const current = bound !== undefined && group.sessions.some((session) => session.id === bound);
       lines.push(
-        `${current ? "\u25B8" : "\u2022"} ${plain(truncate(group.label, 30))} \u00B7 \u25B6${group.runningCount} \u00B7 \u5171${group.sessions.length}`,
+        metaJoin(
+          `${current ? "\u25B8" : "\u2022"} ${bold(truncate(group.label, 30))}`,
+          group.runningCount > 0 ? `\u25B6\uFE0F${group.runningCount}` : undefined,
+          `\u5171${group.sessions.length}`,
+        ),
       );
     }
     lines.push("", "Tap a project to switch its Sessions page.");
@@ -171,14 +187,21 @@ export function createSessionCards(deps: SessionCardsDeps): {
       return openSessionsCard(chatId, lastProjectKey(chatId));
     }
     const title = displayTitleFor(session.title, session.cwd, session.id);
-    const hasTitle = session.title !== undefined && session.title.trim() !== "";
+    // Design language: bold title header, full id as monospace subtitle, then
+    // quiet key-value rows. Only the non-default states are spelled out.
+    const statusWords = [
+      session.live ? "live" : "cold",
+      session.running ? "\u25B6\uFE0F running" : "idle",
+      ...(session.blank ? ["blank"] : []),
+      ...(session.archived ? ["archived"] : []),
+    ];
     const lines = [
-      `\u{1F9ED} ${plain(truncate(title, 40))}${hasTitle ? ` \u00B7 ${plain(truncate(session.id, 16))}` : ""}`,
+      headerLine("\u{1F9ED}", truncate(title, 40)),
+      mono(session.id),
       "",
-      `live: ${session.live} \u00B7 running: ${session.running} \u00B7 blank: ${session.blank} \u00B7 archived: ${session.archived}`,
-      `events: ${session.eventCount}${session.cwd ? ` \u00B7 cwd: ${plain(truncate(session.cwd, 28))}` : ""}`,
-      hasTitle ? `id: ${plain(session.id)}` : "",
-      session.lastPromptAt !== undefined ? `last prompt: ${plain(new Date(session.lastPromptAt).toLocaleString())}` : "",
+      metaJoin(...statusWords),
+      metaJoin(`events ${session.eventCount}`, session.cwd ? `cwd ${mono(truncate(session.cwd, 28))}` : undefined),
+      session.lastPromptAt !== undefined ? `\u23F1\uFE0F last prompt ${relTime(session.lastPromptAt)}` : "",
     ].filter((line) => line !== "");
     await openCard(chatId, lines.join("\n"), buildSessionDetailKeyboard(session.id, session.archived, token({ action: "sessions-open" })));
   }
@@ -204,9 +227,9 @@ export function createSessionCards(deps: SessionCardsDeps): {
     const totalPages = Math.max(1, Math.ceil(hits.length / SEARCH_PAGE_SIZE));
     const safe = Math.max(0, Math.min(page, totalPages - 1));
     const pageHits = hits.slice(safe * SEARCH_PAGE_SIZE, (safe + 1) * SEARCH_PAGE_SIZE);
-    const lines = [`\u{1F50D} Search "${plain(truncate(query, 40))}" \u2014 ${hits.length} hit(s) \u00B7 page ${safe + 1}/${totalPages}`, ""];
+    const lines = [headerLine("\u{1F50D}", "Search", `\u201C${plain(truncate(query, 40))}\u201D`, `${hits.length} hit(s)`, `page ${safe + 1}/${totalPages}`), ""];
     for (const hit of pageHits) {
-      lines.push(`\u2022 ${plain(truncate(hit.sessionId, 24))} [${hit.seq}] ${hit.type}${hit.live ? "" : " (cold)"}`);
+      lines.push(`\u2022 ${mono(truncate(hit.sessionId, 24))} #${hit.seq} ${escapeHtml(hit.type)}${hit.live ? "" : " (cold)"}`);
       lines.push(`  ${plain(truncate(hit.snippet, 80))}`);
     }
     if (hits.length === 0) lines.push("(no hits)");
