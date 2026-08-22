@@ -461,3 +461,200 @@ test('resumeSession fails cleanly when the named inherit source is not live', as
   assert.match(res.text, /no live agent/);
   assert.deepEqual(ctx.resumeCalls, []);
 });
+
+// ---------------------------------------------------------------------------
+// Review 🔵-3: listSessionDetails reads cold logs with bounded concurrency
+// and a per-id cache keyed by header mtime/id, invalidated on roster change.
+// ---------------------------------------------------------------------------
+
+function coldRosterCtx({ roster, mtimes, reads, inFlightBox }) {
+  const persistence = {
+    list: async () => roster.ids.map((id) => ({ id, cwd: '/proj/cold-roster', mtimeMs: mtimes.get(id) ?? 100 })),
+    readRaw: async (id) => {
+      inFlightBox.inFlight += 1;
+      inFlightBox.max = Math.max(inFlightBox.max, inFlightBox.inFlight);
+      await new Promise((resolve) => setTimeout(resolve, (Number(String(id).split('-')[1]) % 3) * 5));
+      inFlightBox.inFlight -= 1;
+      reads.push(String(id));
+      const suffix = String(id).split('-')[1];
+      const n = /^\d+$/.test(suffix) ? Number(suffix) : 999; // non-numeric ids (roster-change probe) sort newest
+      const events = [{ seq: 0, type: 'user/message', at: n, data: { content: [{ type: 'text', text: `prompt ${suffix}` }] } }];
+      // A bumped mtime means the log grew: append work that only a fresh
+      // read can see, so stale-cache bugs cannot pass as fresh content.
+      if ((mtimes.get(id) ?? 100) >= 500) {
+        events.push({ seq: 1, type: 'user/message', at: 900 + n, data: { content: [{ type: 'text', text: 'work while resident' }] } });
+      }
+      return { meta: {}, filename: 'session.jsonl', events };
+    },
+  };
+  return {
+    persistence,
+    ctx: {
+      agents: { list: () => [], get: () => undefined },
+      get: (name) => (name === 'sessionPersistence' ? persistence : undefined),
+    },
+  };
+}
+
+test('listSessionDetails reads cold logs concurrently (≤4 in flight) and keeps the sorted order stable', async () => {
+  const ids = Array.from({ length: 12 }, (_, i) => `cold-${String(i).padStart(2, '0')}`);
+  const reads = [];
+  const inFlightBox = { inFlight: 0, max: 0 };
+  const { ctx } = coldRosterCtx({ roster: { ids: [...ids] }, mtimes: new Map(), reads, inFlightBox });
+  const details = await listSessionDetails(ctx);
+  assert.equal(details.length, 12, 'every cold log lands in the roster');
+  assert.ok(inFlightBox.max <= 4, `cold reads stay within the 4-way pool (observed ${inFlightBox.max})`);
+  assert.ok(inFlightBox.max > 1, `reads actually overlap instead of serializing (observed ${inFlightBox.max})`);
+  assert.equal(reads.length, 12, 'each log read exactly once');
+  // Staggered completion times must not disturb the web order: most recent
+  // prompt first.
+  assert.deepEqual(details.map((d) => d.id), [...ids].reverse());
+  assert.equal(details[0].lastPromptAt, 11);
+  assert.equal(details[0].cwd, '/proj/cold-roster');
+  assert.equal(details[0].eventCount, 1);
+});
+
+test('listSessionDetails caches cold logs across refreshes; mtime bumps re-read one log, roster changes invalidate all', async () => {
+  const ids = ['cold-0', 'cold-1', 'cold-2'];
+  const roster = { ids: [...ids] };
+  const mtimes = new Map(ids.map((id) => [id, 100]));
+  const reads = [];
+  const inFlightBox = { inFlight: 0, max: 0 };
+  const { ctx, persistence } = coldRosterCtx({ roster, mtimes, reads, inFlightBox });
+
+  const first = await listSessionDetails(ctx);
+  assert.equal(reads.length, 3);
+  const second = await listSessionDetails(ctx);
+  assert.equal(reads.length, 3, 'unchanged roster + unchanged mtime serves entirely from cache');
+  assert.deepEqual(second, first, 'cached refresh returns the identical roster');
+
+  mtimes.set('cold-1', 200);
+  await listSessionDetails(ctx);
+  assert.deepEqual(reads.slice(3), ['cold-1'], 'an mtime bump re-reads exactly the changed log');
+
+  reads.length = 0;
+  roster.ids = [...ids, 'cold-new'];
+  await listSessionDetails(ctx);
+  assert.equal(reads.length, 4, 'a roster change drops the cache: every log is re-read once');
+  const refreshed = await listSessionDetails(ctx);
+  assert.deepEqual(refreshed.map((d) => d.id), ['cold-new', 'cold-2', 'cold-1', 'cold-0']);
+  assert.equal(reads.length, 4, 'the refilled cache serves the next refresh again');
+
+  // A cached cold session that goes LIVE (resume), logs more work, and is
+  // disposed again must be re-read after disposal — never serve the pre-live
+  // snapshot just because the roster itself did not change.
+  let liveIds = [];
+  const mixedCtx = {
+    agents: { list: () => [], get: () => undefined },
+    get: (name) => {
+      if (name === 'sessionPersistence') return persistence;
+      if (name === 'sessions') return { list: () => liveIds.map((id) => ({ id, events: [], header: {} })), get: (id) => undefined };
+      return undefined;
+    },
+  };
+  await listSessionDetails(mixedCtx); // warm cache for cold-0/1/2
+  reads.length = 0;
+  liveIds = ['cold-0'];
+  const whileLive = await listSessionDetails(mixedCtx);
+  assert.equal(whileLive.find((d) => d.id === 'cold-0').live, true, 'live roster wins over the cold cache');
+  mtimes.set('cold-0', 500); // "work happened while resident"
+  reads.length = 0;
+  liveIds = [];
+  const afterDispose = await listSessionDetails(mixedCtx);
+  assert.deepEqual(reads, ['cold-0'], 'only the re-disposed session is re-read');
+  assert.equal(afterDispose.find((d) => d.id === 'cold-0').lastPromptAt, 900, 'the post-live work is visible (fresh read, not the stale snapshot)');
+});
+
+// ---------------------------------------------------------------------------
+// Review 🔵-4: searchSessions stops scanning at the hit limit (the check used
+// to sit outside the loops, so a full hit list still walked every remaining
+// session — and could even push past the limit).
+// ---------------------------------------------------------------------------
+
+function searchHitEvent(id) {
+  return [{ seq: 0, type: 'user/message', data: { content: [{ type: 'text', text: `needle ${id}` }] } }];
+}
+
+test('searchSessions returns exactly limit hits even with many more live matches', async () => {
+  const sessions = Array.from({ length: 10 }, (_, i) => ({
+    id: `live-${i}`,
+    events: searchHitEvent(i),
+    header: {},
+  }));
+  const ctx = {
+    sessions: { list: () => sessions, get: (id) => sessions.find((s) => s.id === id) },
+    agents: { list: () => [], get: () => undefined },
+    get: (name) => (name === 'sessions' ? ctx.sessions : undefined),
+  };
+  const hits = await searchSessions(ctx, 'needle', 3);
+  assert.equal(hits.length, 3, 'the scan stops at the limit instead of overflowing');
+  assert.ok(hits.every((hit) => hit.live && hit.snippet.includes('needle')));
+});
+
+test('searchSessions stops opening cold logs once the hit limit is full', async () => {
+  const coldReads = [];
+  const persistence = {
+    list: async () => Array.from({ length: 8 }, (_, i) => ({ id: `cold-${i}` })),
+    readRaw: async (id) => {
+      coldReads.push(String(id));
+      return { events: searchHitEvent(String(id)) };
+    },
+  };
+  const ctx = {
+    sessions: { list: () => [], get: () => undefined },
+    agents: { list: () => [], get: () => undefined },
+    get: (name) => (name === 'sessionPersistence' ? persistence : undefined),
+  };
+  const hits = await searchSessions(ctx, 'needle', 3);
+  assert.equal(hits.length, 3);
+  assert.deepEqual(coldReads, ['cold-0', 'cold-1', 'cold-2'], 'log #4 onward is never read');
+});
+
+// ---------------------------------------------------------------------------
+// Review 四 (encodeSegment): the private encoder in session-lifecycle.ts
+// hand-mirrors the dsh JSONL persistence backend's path-segment encoder:
+// safe chars [A-Za-z0-9._-] kept verbatim, everything else escaped as `~XXXX`
+// uppercase hex, filesystem separator runs folded into one `~`, wrapped in
+// `--…--`, inner run bounded at 251 chars ("root" when empty).
+//
+// DRIFT RISK: the mirror is hand-copied, NOT imported from the backend (the
+// current harness encoder has already diverged — it neither wraps in `--` nor
+// folds separators), and it cannot be pinned by a decode round-trip either:
+// separator folding is lossy and `/1234` collides with the escape syntax.
+// The only exported surface that observes the mirror is deleteSession's
+// directory-candidate list, so the known vectors below are pinned through it:
+// if the private encoder ever drifts, deleteSession stops recognizing the
+// directories created here and fails loudly instead of silently leaving
+// wrapped directories behind on /del.
+// ---------------------------------------------------------------------------
+
+test('deleteSession recognizes directories named by the pinned encodeSegment vectors', async () => {
+  const { deleteSession } = await import('../dist/harness/adapters/sessions.js');
+  const vectors = [
+    ['session-abc-123', '--~session-abc-123--'], // initial separator run emits the leading ~
+    ['a/b\\c', '--~a~b~c--'], // separator runs fold to a single ~ each
+    ['a b', '--~a~0020b--'], // space escapes as uppercase hex
+    ['café', '--~caf~00E9--'], // non-ASCII escapes by code point
+    ['a~b', '--~a~007Eb--'], // literal ~ always escapes
+    ['x'.repeat(300), `--~${'x'.repeat(250)}--`], // inner bound: 251 chars between the -- wrappers
+  ];
+  const home = mkdtempSync(join(tmpdir(), 'dsh-encode-segment-'));
+  const oldHome = process.env.DSH_HOME;
+  process.env.DSH_HOME = home;
+  try {
+    for (const [id, expectedDir] of vectors) {
+      const dir = join(home, 'sessions', '--proj--', expectedDir);
+      mkdirSync(dir, { recursive: true });
+      try {
+        await deleteSession({ agents: { get: () => undefined } }, id);
+        assert.equal(existsSync(dir), false, `encodeSegment(${JSON.stringify(id.slice(0, 16))}) must produce ${expectedDir}`);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    }
+  } finally {
+    if (oldHome === undefined) delete process.env.DSH_HOME;
+    else process.env.DSH_HOME = oldHome;
+    rmSync(home, { recursive: true, force: true });
+  }
+});

@@ -178,6 +178,64 @@ function scanMeta(session: SessionLike): { blank: boolean; lastPromptAt?: number
   return { blank, lastPromptAt, eventCount: session.events.length };
 }
 
+/** Expensive derivations of one cold log (parsed events → summary metadata +
+ * durable title). Only these are cached per session id between panel
+ * refreshes; everything assembled around them (cwd from the fresh header,
+ * archived flag from the registry, live/running constants) is recomputed so
+ * registry changes still show up immediately. */
+interface ColdDetailCore {
+  title?: string;
+  blank: boolean;
+  lastPromptAt?: number;
+  eventCount: number;
+}
+
+interface ColdDetailCache {
+  /** Roster signature the entries were filled under: any list change drops
+   * the whole cache (the documented invalidation rule). */
+  signature: string;
+  byId: Map<string, { key: string | undefined; core: ColdDetailCore }>;
+}
+
+/**
+ * Per-ctx cache over parsed cold logs (review 🔵-3): every Sessions-card open
+ * AND every panel refresh used to pay N sequential file reads + full JSONL
+ * parses for the whole persisted roster. Cache validity per id is keyed by
+ * the header's mtime when a backend exposes one (`mtimeMs`/`mtime`), else by
+ * id alone — then correctness rides on the roster signature above. That is
+ * safe because cold logs are append-only files with no live writer: a session
+ * only stops being live through agent disposal, and while it IS live its
+ * detail comes from the in-memory branch (never cached). The real JSONL
+ * backend's `list()` headers carry no mtime today, so the id+signature path
+ * is the production one; the mtime hook keeps backends that expose it exact.
+ */
+const coldDetailCaches = new WeakMap<object, ColdDetailCache>();
+
+/** Content key for one cold header: mtime string when available, else `undefined`. */
+function coldCacheKey(header: PersistenceHeaderLike): string | undefined {
+  const mutable = header as { mtimeMs?: unknown; mtime?: unknown };
+  const mtime = mutable.mtimeMs ?? mutable.mtime;
+  return typeof mtime === "number" ? String(mtime) : undefined;
+}
+
+/** Assemble the cold {@link SessionDetail} from a (possibly cached) core. */
+function coldDetail(id: string, header: PersistenceHeaderLike, core: ColdDetailCore, archived: ReadonlySet<string>): SessionDetail {
+  return {
+    id,
+    cwd: typeof header.cwd === "string" ? header.cwd : undefined,
+    live: false,
+    running: false,
+    title: core.title,
+    blank: core.blank,
+    lastPromptAt: core.lastPromptAt,
+    eventCount: core.eventCount,
+    archived: archived.has(id),
+  };
+}
+
+/** Max cold-log reads in flight during one roster build (review 🔵-3). */
+const COLD_READ_CONCURRENCY = 4;
+
 /** session.list: live + persisted sessions with web-style summary metadata. */
 export async function listSessionDetails(ctx: Context): Promise<SessionDetail[]> {
   const live = liveSessions(ctx);
@@ -200,33 +258,72 @@ export async function listSessionDetails(ctx: Context): Promise<SessionDetail[]>
   const persistence = persistenceOf(ctx);
   if (persistence) {
     try {
-      for (const header of await persistence.list()) {
+      const headers = await persistence.list();
+      // Cache scope: per ctx, invalidated wholesale whenever the persisted
+      // roster changes (see ColdDetailCache).
+      const signature = headers.map((header) => String(header.id)).join("\n");
+      const previous = coldDetailCaches.get(ctx);
+      const cache = previous !== undefined && previous.signature === signature
+        ? previous
+        : { signature, byId: new Map<string, { key: string | undefined; core: ColdDetailCore }>() };
+      coldDetailCaches.set(ctx, cache);
+      // A session that is live NOW must not keep a cold-cache entry: its log
+      // may have grown while resident (resume → work → dispose), and once it
+      // goes cold again the next build must re-read instead of serving the
+      // pre-live snapshot. Per-id drop only — never fold live ids into the
+      // roster signature, or a permanently-live session would keep the whole
+      // cache evicted.
+      for (const id of live.keys()) cache.byId.delete(id);
+      const pending: PersistenceHeaderLike[] = [];
+      for (const header of headers) {
         const id = String(header.id);
         if (entries.has(id)) continue;
-        let session: SessionLike | undefined;
-        try {
-          const raw = await persistence.readRaw(header.id);
-          if (raw !== undefined) {
-            const events = raw.events ?? (typeof raw.content === "string" ? parseRawEvents(raw.content) : []);
-            session = { id: header.id, events } as SessionLike;
-          }
-        } catch {
-          /* a broken cold log must not hide the rest of the roster */
+        const key = coldCacheKey(header);
+        const cached = cache.byId.get(id);
+        if (cached !== undefined && cached.key === key) {
+          entries.set(id, coldDetail(id, header, cached.core, archived));
+          continue;
         }
-        if (!session) continue;
-        const meta = scanMeta(session);
-        entries.set(id, {
-          id,
-          cwd: typeof header.cwd === "string" ? header.cwd : undefined,
-          live: false,
-          running: false,
-          title: titleFor(ctx, session),
-          blank: meta.blank,
-          lastPromptAt: meta.lastPromptAt,
-          eventCount: meta.eventCount,
-          archived: archived.has(id),
-        });
+        pending.push(header);
       }
+      let cursor = 0;
+      const loadCold = async (header: PersistenceHeaderLike): Promise<void> => {
+        const id = String(header.id);
+        try {
+          let session: SessionLike | undefined;
+          try {
+            const raw = await persistence.readRaw(header.id);
+            if (raw !== undefined) {
+              const events = raw.events ?? (typeof raw.content === "string" ? parseRawEvents(raw.content) : []);
+              session = { id: header.id, events } as SessionLike;
+            }
+          } catch {
+            /* a broken cold log must not hide the rest of the roster */
+          }
+          if (!session) return;
+          const meta = scanMeta(session);
+          const core: ColdDetailCore = {
+            title: titleFor(ctx, session),
+            blank: meta.blank,
+            lastPromptAt: meta.lastPromptAt,
+            eventCount: meta.eventCount,
+          };
+          cache.byId.set(id, { key: coldCacheKey(header), core });
+          entries.set(id, coldDetail(id, header, core, archived));
+        } catch {
+          /* defensive: one broken entry must not fail the whole roster */
+        }
+      };
+      // Bounded-concurrency cold reads instead of N sequential read+parse
+      // passes. Completion order cannot affect output: the sort below is a
+      // total order (unique ids), so the roster comes out byte-identical.
+      await Promise.all(Array.from({ length: Math.min(COLD_READ_CONCURRENCY, pending.length) }, async () => {
+        while (cursor < pending.length) {
+          const header = pending[cursor]!;
+          cursor += 1;
+          await loadCold(header);
+        }
+      }));
     } catch {
       /* persistence listing failure degrades to the live roster */
     }
@@ -292,13 +389,17 @@ export async function searchSessions(ctx: Context, query: string, limit = 20): P
       if (hits.length >= limit) return;
     }
   };
-  for (const [id, session] of liveSessions(ctx)) pushHits(id, session.events, true);
+  const live = liveSessions(ctx); // one roster snapshot for both scan phases (was computed twice)
+  for (const [id, session] of live) {
+    if (hits.length >= limit) break; // stop scanning once full — the check used to sit OUTSIDE the live loop
+    pushHits(id, session.events, true);
+  }
   if (hits.length >= limit) return hits;
   const persistence = persistenceOf(ctx);
-  const live = liveSessions(ctx);
   if (persistence) {
     try {
       for (const header of await persistence.list()) {
+        if (hits.length >= limit) break; // hoisted BEFORE the read so a full hit list skips the next log entirely
         const id = String(header.id);
         if (live.has(id)) continue;
         try {
@@ -307,7 +408,6 @@ export async function searchSessions(ctx: Context, query: string, limit = 20): P
         } catch {
           /* skip unreadable logs */
         }
-        if (hits.length >= limit) break;
       }
     } catch {
       /* degrade to live hits */
@@ -420,7 +520,16 @@ export async function readTrajectory(
     let outcome: string | undefined;
     let seconds: number | undefined;
     const startAt = events[raw.start]?.at;
-    const endAt = raw.endSeq !== undefined ? events.find((e) => e.seq === raw.endSeq)?.at : undefined;
+    // rawTurns records the closing turn/end index whenever endSeq is set
+    // (`end: i + 1` beside `endSeq: events[i].seq`), so the end timestamp
+    // reads by index — the old events.find() was an O(n) seq scan per turn
+    // (review 🔵-5). The find() fallback only fires if that invariant above
+    // ever changes, keeping the old behavior as a safety net.
+    let endAt: number | undefined;
+    if (raw.endSeq !== undefined) {
+      const closed = events[raw.end - 1];
+      endAt = closed !== undefined && closed.seq === raw.endSeq ? closed.at : events.find((e) => e.seq === raw.endSeq)?.at;
+    }
     if (startAt !== undefined && endAt !== undefined) seconds = Math.round((endAt - startAt) / 1000);
 
     for (let i = raw.start; i < raw.end; i += 1) {

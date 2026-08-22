@@ -80,6 +80,41 @@ test('readTrajectory returns empty for an unknown session without persistence', 
   assert.deepEqual(result, { turns: [], hasMore: false });
 });
 
+test('readTrajectory derives seconds from the closing turn/end event (#endSeq index reuse)', async () => {
+  // Review 🔵-5: endAt must come from the turn/end INDEX recorded in
+  // rawTurns, not a fresh O(n) seq scan per turn. This pins that the closing
+  // event's own timestamp (9700 vs start 1000) still drives the duration.
+  const events = [
+    { seq: 0, type: 'turn/start', at: 1000, data: {} },
+    { seq: 1, type: 'user/message', at: 1100, data: { content: [{ type: 'text', text: 'timed' }] } },
+    { seq: 2, type: 'tool/call', at: 1200, data: { name: 'bash', arguments: '{"command":"ls"}' } },
+    { seq: 3, type: 'turn/end', at: 9700, data: { reason: { kind: 'completed' } } },
+  ];
+  const result = await readTrajectory(trajectoryCtx(events), 's1', 10);
+  assert.equal(result.turns.length, 1);
+  assert.equal(result.turns[0].endSeq, 3);
+  assert.equal(result.turns[0].seconds, 9);
+});
+
+test('readTrajectory leaves seconds/endSeq undefined for turns never closed by turn/end', async () => {
+  // Turns closed by the NEXT turn/start (or truncated by the log's end) have
+  // no endSeq and must stay seconds-less rather than picking up a bogus
+  // duration — the index fast path must not invent one.
+  const events = [
+    { seq: 0, type: 'turn/start', at: 1000, data: {} },
+    { seq: 1, type: 'user/message', at: 1100, data: { content: [{ type: 'text', text: 'cut short' }] } },
+    { seq: 2, type: 'turn/start', at: 5000, data: {} }, // closes turn 1 WITHOUT a turn/end
+    { seq: 3, type: 'user/message', at: 5100, data: { content: [{ type: 'text', text: 'still open' }] } },
+  ];
+  const result = await readTrajectory(trajectoryCtx(events), 's1', 10);
+  assert.equal(result.turns.length, 2);
+  for (const turn of result.turns) {
+    assert.equal(turn.endSeq, undefined, 'no turn/end → no endSeq');
+    assert.equal(turn.seconds, undefined, 'no turn/end → no duration');
+    assert.equal(turn.outcome, undefined);
+  }
+});
+
 test('readTrajectory parses the real readRaw JSONL content shape for a cold session', async () => {
   // Production `readRaw` returns `{ meta, filename, content }` — verbatim
   // JSONL text with no `events` field. Cold trajectory paging must parse
