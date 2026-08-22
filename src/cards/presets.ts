@@ -23,7 +23,7 @@ export interface PresetCardsDeps {
   currentAgent(chatId?: number): Agent | undefined;
   cardLoad: CardLoad;
   openCard: OpenCard;
-  token(payload: Record<string, string>): string;
+  token(payload: Record<string, string>, chatId?: number): string;
 }
 
 /** Build the preset-domain cards. Called once by index.ts; every card closes
@@ -53,8 +53,8 @@ export function createPresetCards(deps: PresetCardsDeps): {
       ...presets.slice(0, 12).map((preset) => `${preset.isDefault ? "\u2B50" : "\u2022"} ${bold(preset.id)}${preset.isDefault ? " \u00B7 default" : ""}`),
     ];
     await openCard(chatId, lines.join("\n"), buildNewSessionKeyboard(
-      token({ action: "new-default" }),
-      presets.slice(0, 12).map((preset) => ({ id: preset.id, isDefault: preset.isDefault, cb: token({ action: "preset-new", presetId: preset.id }) })),
+      token({ action: "new-default" }, chatId),
+      presets.slice(0, 12).map((preset) => ({ id: preset.id, isDefault: preset.isDefault, cb: token({ action: "preset-new", presetId: preset.id }, chatId) })),
     ));
   }
 
@@ -72,7 +72,7 @@ export function createPresetCards(deps: PresetCardsDeps): {
       if (preset.description) lines.push(`  ${plain(truncate(preset.description, 60))}`);
     }
     if (presets.length === 0) lines.push("This profile composes no agent presets.");
-    const rows = presets.slice(0, 12).map((preset) => ({ id: preset.id, cb: token({ action: "preset", presetId: preset.id }) }));
+    const rows = presets.slice(0, 12).map((preset) => ({ id: preset.id, cb: token({ action: "preset", presetId: preset.id }, chatId) }));
     await openCard(chatId, lines.join("\n"), buildPresetsKeyboard(rows), () => openPresetsCard(chatId));
   }
 
@@ -84,13 +84,13 @@ export function createPresetCards(deps: PresetCardsDeps): {
       "Blank session: applies in place. Started session: forks it, applies the preset to the fork, and closes the original.",
     ];
     const callbacks = {
-      select: token({ action: "preset-select", presetId, sessionId: agent?.id ?? "" }),
-      read: token({ action: "preset-read", presetId }),
-      create: token({ action: "preset-new", presetId }),
-      copy: token({ action: "preset-copy", presetId }),
-      remove: token({ action: "preset-remove", presetId }),
-      open: token({ action: "preset-open", presetId }),
-      default: token({ action: "preset-default", presetId }),
+      select: token({ action: "preset-select", presetId, sessionId: agent?.id ?? "" }, chatId),
+      read: token({ action: "preset-read", presetId }, chatId),
+      create: token({ action: "preset-new", presetId }, chatId),
+      copy: token({ action: "preset-copy", presetId }, chatId),
+      remove: token({ action: "preset-remove", presetId }, chatId),
+      open: token({ action: "preset-open", presetId }, chatId),
+      default: token({ action: "preset-default", presetId }, chatId),
     };
     await openCard(chatId, lines.join("\n"), buildPresetDetailKeyboard(callbacks));
   }

@@ -34,7 +34,7 @@ export interface HostCardsDeps {
   state: HostCardsStateSlice;
   requireCtx(): Context;
   openCard: OpenCard;
-  token(payload: Record<string, string>): string;
+  token(payload: Record<string, string>, chatId?: number): string;
 }
 
 /** Build the host-domain cards. Called once by index.ts; every card closes
@@ -97,7 +97,7 @@ export function createHostCards(deps: HostCardsDeps): {
       "",
       "The secret value never rides back \u2014 same as the web form.",
     ].filter((line) => line !== "");
-    await openCard(chatId, lines.join("\n"), buildCredentialsKeyboard(refs.slice(0, 12).map((ref) => ({ ref, cb: token({ action: "credential-show", ref }) }))));
+    await openCard(chatId, lines.join("\n"), buildCredentialsKeyboard(refs.slice(0, 12).map((ref) => ({ ref, cb: token({ action: "credential-show", ref }, chatId) }))));
   }
 
   async function openHostCard(chatId: number): Promise<void> {
@@ -146,19 +146,19 @@ export function createHostCards(deps: HostCardsDeps): {
       lines.splice(2, 0, shown.map((crumb) => plain(crumb.label)).join(" \u203A "));
     }
     await openCard(chatId, lines.join("\n"), buildProjectKeyboard(
-      pageDirs.map((entry) => ({ label: entry.name, cb: token({ action: "host-open", path: join(target, entry.name) }) })),
+      pageDirs.map((entry) => ({ label: entry.name, cb: token({ action: "host-open", path: join(target, entry.name) }, chatId) })),
       {
-        up: token({ action: "host-open", path: parentOf(target) }),
-        home: token({ action: "host-open", path: homedir() }),
-        root: token({ action: "host-open", path: parse(target).root }),
+        up: token({ action: "host-open", path: parentOf(target) }, chatId),
+        home: token({ action: "host-open", path: homedir() }, chatId),
+        root: token({ action: "host-open", path: parse(target).root }, chatId),
         breadcrumb: (res.ok && crumbs.length > 1 ? (crumbs.length > 3 ? [{ label: "\u2026", path: crumbs[crumbs.length - 3]!.path }, ...crumbs.slice(-2)] : crumbs.slice(0, -1)) : []).map(
-          (crumb) => ({ label: crumb.label, cb: token({ action: "host-open", path: crumb.path }) }),
+          (crumb) => ({ label: crumb.label, cb: token({ action: "host-open", path: crumb.path }, chatId) }),
         ),
         paging: [
-          ...(safe > 0 ? [{ text: "\u2039 Prev", cb: token({ action: "host-page", path: target, page: String(safe - 1) }) }] : []),
-          ...(safe + 1 < totalPages ? [{ text: "More \u203A", cb: token({ action: "host-page", path: target, page: String(safe + 1) }) }] : []),
+          ...(safe > 0 ? [{ text: "\u2039 Prev", cb: token({ action: "host-page", path: target, page: String(safe - 1) }, chatId) }] : []),
+          ...(safe + 1 < totalPages ? [{ text: "More \u203A", cb: token({ action: "host-page", path: target, page: String(safe + 1) }, chatId) }] : []),
         ],
-        newFolder: token({ action: "host-mkdir-prompt", path: target }),
+        newFolder: token({ action: "host-mkdir-prompt", path: target }, chatId),
         close: "m:host",
       },
     ));

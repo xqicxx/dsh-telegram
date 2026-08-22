@@ -42,7 +42,7 @@ export interface WorkspaceCardsDeps {
   requireCtx(): Context;
   uiSend(chatId: number, text: string, options?: Parameters<TelegramTransport["sendText"]>[2]): Promise<number | undefined>;
   openCard: OpenCard;
-  token(payload: Record<string, string>): string;
+  token(payload: Record<string, string>, chatId?: number): string;
   log(message: string, error?: unknown): void;
   openMenuAt(chatId: number, page: number): Promise<void>;
 }
@@ -117,8 +117,8 @@ export function createWorkspaceCards(deps: WorkspaceCardsDeps): {
       workspace.updatedAt !== undefined ? `updated ${relTime(workspace.updatedAt, "unknown")}` : "",
     ].filter((line) => line !== "");
     await openCard(chatId, lines.join("\n"), buildWorkspaceDetailKeyboard(workspaceId, {
-      use: token({ action: "workspace-use", workspaceId }),
-      sessions: token({ action: "sessions-project", projectKey: workspaceId }),
+      use: token({ action: "workspace-use", workspaceId }, chatId),
+      sessions: token({ action: "sessions-project", projectKey: workspaceId }, chatId),
     }));
   }
 
@@ -132,13 +132,13 @@ export function createWorkspaceCards(deps: WorkspaceCardsDeps): {
     const workspacePaths = listWorkspaces(requireCtx()).items.map((workspace) => workspace.path);
     const quick = [...new Set(workspacePaths.filter((candidate) => candidate !== path))].slice(0, 3).map((candidate) => ({
       label: `\u{1F5C2} ${basename(candidate)}`,
-      cb: token({ action: "project-open", path: candidate }),
+      cb: token({ action: "project-open", path: candidate }, chatId),
     }));
 
     const baseActions = {
-        up: path === "/" ? undefined : token({ action: "project-up", path }),
-        home: path === homedir() ? undefined : token({ action: "project-open", path: homedir() }),
-        root: path === "/" ? undefined : token({ action: "project-open", path: "/" }),
+        up: path === "/" ? undefined : token({ action: "project-up", path }, chatId),
+        home: path === homedir() ? undefined : token({ action: "project-open", path: homedir() }, chatId),
+        root: path === "/" ? undefined : token({ action: "project-open", path: "/" }, chatId),
         menu: "m:back",
         close: "m:close",
         quick,
@@ -153,7 +153,7 @@ export function createWorkspaceCards(deps: WorkspaceCardsDeps): {
     const listing = await listDirectory(path, state.config.security.browseRoots);
     if (!listing.ok) {
       const lines = [headerLine("\u{1F4C1}", truncate(path, 60)), "", `\u274C ${plain(listing.text)}`, "", "The folder itself is valid \u2014 use it as the project, or go up."];
-      await openCard(chatId, lines.join("\n"), buildProjectKeyboard([], { ...baseActions, use: token({ action: "project-select", path }) }));
+      await openCard(chatId, lines.join("\n"), buildProjectKeyboard([], { ...baseActions, use: token({ action: "project-select", path }, chatId) }));
       return;
     }
 
@@ -168,17 +168,17 @@ export function createWorkspaceCards(deps: WorkspaceCardsDeps): {
       "",
       "Pick a folder to open it, or use this one as the project.",
     ];
-    const page = dirs.slice(offset, offset + PROJECT_PAGE_SIZE).map((entry) => ({ label: entry.name, cb: token({ action: "project-open", path: joinPath(path, entry.name) }) }));
+    const page = dirs.slice(offset, offset + PROJECT_PAGE_SIZE).map((entry) => ({ label: entry.name, cb: token({ action: "project-open", path: joinPath(path, entry.name) }, chatId) }));
     const paging: { text: string; cb: string }[] = [];
-    if (offset > 0) paging.push({ text: "\u2B05\uFE0F Prev", cb: token({ action: "project-open", path, offset: String(Math.max(0, offset - PROJECT_PAGE_SIZE)) }) });
-    if (offset + PROJECT_PAGE_SIZE < dirs.length) paging.push({ text: "Next \u27A1\uFE0F", cb: token({ action: "project-open", path, offset: String(offset + PROJECT_PAGE_SIZE) }) });
+    if (offset > 0) paging.push({ text: "\u2B05\uFE0F Prev", cb: token({ action: "project-open", path, offset: String(Math.max(0, offset - PROJECT_PAGE_SIZE)) }, chatId) });
+    if (offset + PROJECT_PAGE_SIZE < dirs.length) paging.push({ text: "Next \u27A1\uFE0F", cb: token({ action: "project-open", path, offset: String(offset + PROJECT_PAGE_SIZE) }, chatId) });
     await openCard(
       chatId,
       lines.join("\n"),
       buildProjectKeyboard(page, {
         ...baseActions,
         paging,
-        use: token({ action: "project-select", path }),
+        use: token({ action: "project-select", path }, chatId),
       }),
     );
   }
@@ -226,17 +226,17 @@ export function createWorkspaceCards(deps: WorkspaceCardsDeps): {
     const safe = Math.max(0, Math.min(offset, Math.max(0, Math.ceil(dirs.length / WORKSPACE_PICK_PAGE_SIZE) - 1)));
     const pageDirs = dirs.slice(safe * WORKSPACE_PICK_PAGE_SIZE, (safe + 1) * WORKSPACE_PICK_PAGE_SIZE);
     const paging: { text: string; cb: string }[] = [];
-    if (safe > 0) paging.push({ text: "\u2B05\uFE0F Prev", cb: token({ action: "ws-pick-page", path: target, page: String(safe - 1) }) });
-    if ((safe + 1) * WORKSPACE_PICK_PAGE_SIZE < dirs.length) paging.push({ text: "Next \u27A1\uFE0F", cb: token({ action: "ws-pick-page", path: target, page: String(safe + 1) }) });
+    if (safe > 0) paging.push({ text: "\u2B05\uFE0F Prev", cb: token({ action: "ws-pick-page", path: target, page: String(safe - 1) }, chatId) });
+    if ((safe + 1) * WORKSPACE_PICK_PAGE_SIZE < dirs.length) paging.push({ text: "Next \u27A1\uFE0F", cb: token({ action: "ws-pick-page", path: target, page: String(safe + 1) }, chatId) });
     const lines = [headerLine("\u{1F5C2}\uFE0F", "Create workspace"), mono(truncate(target, 60)), "", metaJoin(`folders ${dirs.length}`), "", "Browse to a folder, then tap \u2705 Create here."];
     await openCard(chatId, lines.join("\n"), buildProjectKeyboard(
-      pageDirs.map((entry) => ({ label: entry.name, cb: token({ action: "ws-pick-open", path: joinPath(target, entry.name) }) })),
+      pageDirs.map((entry) => ({ label: entry.name, cb: token({ action: "ws-pick-open", path: joinPath(target, entry.name) }, chatId) })),
       {
-        up: target === "/" ? undefined : token({ action: "ws-pick-open", path: parentOf(target) }),
-        home: target === homedir() ? undefined : token({ action: "ws-pick-open", path: homedir() }),
-        root: target === "/" ? undefined : token({ action: "ws-pick-open", path: "/" }),
+        up: target === "/" ? undefined : token({ action: "ws-pick-open", path: parentOf(target) }, chatId),
+        home: target === homedir() ? undefined : token({ action: "ws-pick-open", path: homedir() }, chatId),
+        root: target === "/" ? undefined : token({ action: "ws-pick-open", path: "/" }, chatId),
         paging,
-        use: token({ action: "ws-create-here", path: target }),
+        use: token({ action: "ws-create-here", path: target }, chatId),
         close: "m:workspaces",
       },
     ));

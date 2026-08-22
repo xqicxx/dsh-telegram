@@ -35,7 +35,7 @@ export interface GoalCardsDeps {
   /** Active-card renderer map owned by core/cards.ts (loop liveness check). */
   activeCardRenderers: Map<number, () => Promise<void>>;
   openCard: OpenCard;
-  token(payload: Record<string, string>): string;
+  token(payload: Record<string, string>, chatId?: number): string;
   log(message: string, error?: unknown): void;
   uiSend(chatId: number, text: string, options?: Parameters<TelegramTransport["sendText"]>[2]): Promise<number | undefined>;
 }
@@ -140,9 +140,9 @@ export function createGoalCards(deps: GoalCardsDeps): {
     const goalPayload = agent ? { action: "goal", agentId: agent.id } : { action: "goal", agentId: "" };
     const callbacks = {
       ...(hasGoal ? {
-        edit: token({ ...goalPayload, op: "edit" }),
-        toggle: token({ ...goalPayload, op: paused ? "resume" : "pause" }),
-        clear: token({ ...goalPayload, op: "clear" }),
+        edit: token({ ...goalPayload, op: "edit" }, chatId),
+        toggle: token({ ...goalPayload, op: paused ? "resume" : "pause" }, chatId),
+        clear: token({ ...goalPayload, op: "clear" }, chatId),
       } : {}),
     };
     lines.push("", "Start: /goal &lt;objective&gt; [maxRounds]");

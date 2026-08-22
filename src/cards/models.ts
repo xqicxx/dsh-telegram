@@ -34,7 +34,7 @@ export interface ModelCardsDeps {
   currentAgent(chatId?: number): Agent | undefined;
   cardLoad: CardLoad;
   openCard: OpenCard;
-  token(payload: Record<string, string>): string;
+  token(payload: Record<string, string>, chatId?: number): string;
   log(message: string, error?: unknown): void;
 }
 
@@ -106,7 +106,7 @@ export function createModelCards(deps: ModelCardsDeps): {
     await openCard(chatId, lines.join("\n"), buildProvidersKeyboard(
       catalog.providers.slice(0, 20).map((provider) => ({
         label: `\u{1F4E1} ${provider.name}`,
-        cb: token({ action: "provider", provider: provider.id }),
+        cb: token({ action: "provider", provider: provider.id }, chatId),
       })),
     ));
   }
@@ -135,7 +135,7 @@ export function createModelCards(deps: ModelCardsDeps): {
     const models = pageModels.map((model) => ({
       id: model.id,
       name: model.name,
-      cb: token({ action: "model-select", provider: providerId, model: model.id }),
+      cb: token({ action: "model-select", provider: providerId, model: model.id }, chatId),
     }));
     for (const model of models) {
       const selected = current.provider === providerId && current.model === model.id;
@@ -149,11 +149,11 @@ export function createModelCards(deps: ModelCardsDeps): {
         ? undefined
         : {
             label: reasoningLabel(isReasoningEffort(current.reasoningEffort) ? current.reasoningEffort : currentReasoningEffort()),
-            cb: token({ action: "model-thinking", provider: providerId, model: selectedModel }),
+            cb: token({ action: "model-thinking", provider: providerId, model: selectedModel }, chatId),
           },
       {
-        ...(safe > 0 ? { previous: token({ action: "model-page", provider: providerId, page: String(safe - 1) }) } : {}),
-        ...(safe + 1 < totalPages ? { next: token({ action: "model-page", provider: providerId, page: String(safe + 1) }) } : {}),
+        ...(safe > 0 ? { previous: token({ action: "model-page", provider: providerId, page: String(safe - 1) }, chatId) } : {}),
+        ...(safe + 1 < totalPages ? { next: token({ action: "model-page", provider: providerId, page: String(safe + 1) }, chatId) } : {}),
       },
     ));
   }
@@ -172,7 +172,7 @@ export function createModelCards(deps: ModelCardsDeps): {
     const options = REASONING_EFFORTS.map((effort) => ({
       id: effort,
       name: reasoningLabel(effort),
-      cb: token({ action: "model-effort", provider: providerId, model: modelId, effort }),
+      cb: token({ action: "model-effort", provider: providerId, model: modelId, effort }, chatId),
     }));
     await openCard(chatId, headerLine("\u{1F9E0}", "Thinking effort", mono(`${providerId}/${modelId}`)), buildThinkingKeyboard(options, active));
   }

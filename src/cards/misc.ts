@@ -68,7 +68,7 @@ export interface MiscCardsDeps {
   boundSessionCwd(ctx: Context, agentId: string | undefined): string | undefined;
   cardLoad: CardLoad;
   openCard: OpenCard;
-  token(payload: Record<string, string>): string;
+  token(payload: Record<string, string>, chatId?: number): string;
   log(message: string, error?: unknown): void;
 }
 
@@ -113,8 +113,8 @@ export function createMiscCards(deps: MiscCardsDeps): {
     }
     lines.push("", "Toggle: /pluginenable &lt;name&gt; \u00B7 /plugindisable &lt;name&gt;");
     await openCard(chatId, lines.join("\n"), buildPagingKeyboard({
-      ...(safe > 0 ? { previous: token({ action: "plugins-page", page: String(safe - 1) }) } : {}),
-      ...(safe + 1 < totalPages ? { next: token({ action: "plugins-page", page: String(safe + 1) }) } : {}),
+      ...(safe > 0 ? { previous: token({ action: "plugins-page", page: String(safe - 1) }, chatId) } : {}),
+      ...(safe + 1 < totalPages ? { next: token({ action: "plugins-page", page: String(safe + 1) }, chatId) } : {}),
       back: "m:back",
     }));
   }
@@ -160,7 +160,7 @@ export function createMiscCards(deps: MiscCardsDeps): {
       if (entry.kind === "diagnostic") lines.push(`  reason: ${plain(entry.reason ?? "unavailable")}`);
     }
     if (entries.length === 0) lines.push("(none)");
-    const rows = entries.slice(0, 12).map((entry) => ({ id: entry.id, cb: token({ action: "subagent", parentId: agent.id, childId: entry.id }) }));
+    const rows = entries.slice(0, 12).map((entry) => ({ id: entry.id, cb: token({ action: "subagent", parentId: agent.id, childId: entry.id }, chatId) }));
     await openCard(chatId, lines.join("\n"), buildSubagentsKeyboard(rows));
   }
 
@@ -197,11 +197,11 @@ export function createMiscCards(deps: MiscCardsDeps): {
     const callbacks = {
       ...(continuable
         ? {
-            prompt: token({ action: "subagent-prompt", parentId, childId }),
-            interrupt: token({ action: "subagent-interrupt", parentId, childId }),
+            prompt: token({ action: "subagent-prompt", parentId, childId }, chatId),
+            interrupt: token({ action: "subagent-interrupt", parentId, childId }, chatId),
           }
         : {}),
-      history: token({ action: "subagent-history", parentId, childId }),
+      history: token({ action: "subagent-history", parentId, childId }, chatId),
     };
     if (!continuable) lines.push("", "This subagent is not continuable \u2014 history is read-only.");
     await openCard(chatId, lines.join("\n"), buildSubagentDetailKeyboard(callbacks));
@@ -222,14 +222,20 @@ export function createMiscCards(deps: MiscCardsDeps): {
     }
     if (jobs.length === 0) lines.push("(none)");
     await openCard(chatId, lines.join("\n"), buildPagingKeyboard({
-      ...(safe > 0 ? { previous: token({ action: "jobs-page", page: String(safe - 1) }) } : {}),
-      ...(safe + 1 < totalPages ? { next: token({ action: "jobs-page", page: String(safe + 1) }) } : {}),
+      ...(safe > 0 ? { previous: token({ action: "jobs-page", page: String(safe - 1) }, chatId) } : {}),
+      ...(safe + 1 < totalPages ? { next: token({ action: "jobs-page", page: String(safe + 1) }, chatId) } : {}),
       back: "m:back",
     }));
   }
 
   async function openDynamicCordisCard(chatId: number): Promise<void> {
     const rows = listDynamicCordis(requireCtx());
+    // B-5r mint side: stamp the chat's currently bound session into the
+    // lifecycle tokens so plugin-run/stop/remove-confirm act on that session
+    // even after a rebind; with no live agent the field is omitted exactly as
+    // before and the consumer falls back to its current resolution.
+    const agent = currentAgent(chatId);
+    const agentStamp: Record<string, string> = agent?.id !== undefined ? { agentId: agent.id } : {};
     const lines = [headerLine("\u{1F9F0}", "Dynamic plugins", `${rows.length}`), ""];
     const pluginRows: PluginRow[] = [];
     for (const row of rows.slice(0, 15)) {
@@ -249,9 +255,9 @@ export function createMiscCards(deps: MiscCardsDeps): {
         pluginId,
         running,
         callbacks: {
-          run: token({ action: "plugin-run", pluginId }),
-          stop: token({ action: "plugin-stop", pluginId }),
-          remove: token({ action: "plugin-remove", pluginId }),
+          run: token({ action: "plugin-run", pluginId, ...agentStamp }, chatId),
+          stop: token({ action: "plugin-stop", pluginId, ...agentStamp }, chatId),
+          remove: token({ action: "plugin-remove", pluginId, ...agentStamp }, chatId),
         },
       });
     }
@@ -283,7 +289,7 @@ export function createMiscCards(deps: MiscCardsDeps): {
       rows.push([
         {
           text: `\u{1F5D1} Delete [${item.messageId.slice(0, 8)}]`,
-          callback_data: token({ action: "feedback-delete", sessionId, messageId: item.messageId, ifVersion: item.version }),
+          callback_data: token({ action: "feedback-delete", sessionId, messageId: item.messageId, ifVersion: item.version }, chatId),
         },
       ]);
     }

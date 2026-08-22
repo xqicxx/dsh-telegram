@@ -52,7 +52,7 @@ export interface SessionCardsDeps {
   cardLoad: CardLoad;
   openCard: OpenCard;
   uiSend(chatId: number, text: string, options?: Parameters<TelegramTransport["sendText"]>[2]): Promise<number | undefined>;
-  token(payload: Record<string, string>): string;
+  token(payload: Record<string, string>, chatId?: number): string;
 }
 
 /** Build the session-domain cards. Called once by index.ts; every card closes
@@ -135,14 +135,14 @@ export function createSessionCards(deps: SessionCardsDeps): {
       id: session.id,
       title: displayTitleFor(session.title, session.cwd, session.id),
       running: session.running,
-      archiveCb: token({ action: "session-archive", sessionId: session.id }),
-      deleteCb: token({ action: "session-delete", sessionId: session.id }),
+      archiveCb: token({ action: "session-archive", sessionId: session.id }, chatId),
+      deleteCb: token({ action: "session-delete", sessionId: session.id }, chatId),
     })), {
       projectCount: groups.length,
-      projectsCb: token({ action: "sessions-projects" }),
+      projectsCb: token({ action: "sessions-projects" }, chatId),
       paging: {
-        ...(safe > 0 ? { previous: token({ action: "sessions-page", projectKey: key, page: String(safe - 1) }) } : {}),
-        ...(safe + 1 < totalPages ? { next: token({ action: "sessions-page", projectKey: key, page: String(safe + 1) }) } : {}),
+        ...(safe > 0 ? { previous: token({ action: "sessions-page", projectKey: key, page: String(safe - 1) }, chatId) } : {}),
+        ...(safe + 1 < totalPages ? { next: token({ action: "sessions-page", projectKey: key, page: String(safe + 1) }, chatId) } : {}),
       },
     }), () => openSessionsCard(chatId, key, safe));
   }
@@ -169,14 +169,14 @@ export function createSessionCards(deps: SessionCardsDeps): {
       label: group.label,
       running: group.runningCount,
       total: group.sessions.length,
-      cb: token({ action: "sessions-project", projectKey: group.key }),
+      cb: token({ action: "sessions-project", projectKey: group.key }, chatId),
     })), {
-      all: token({ action: "sessions-project", projectKey: ALL_PROJECTS_KEY }),
+      all: token({ action: "sessions-project", projectKey: ALL_PROJECTS_KEY }, chatId),
       paging: {
-        ...(safe > 0 ? { previous: token({ action: "sessions-projects-page", page: String(safe - 1) }) } : {}),
-        ...(safe + 1 < totalPages ? { next: token({ action: "sessions-projects-page", page: String(safe + 1) }) } : {}),
+        ...(safe > 0 ? { previous: token({ action: "sessions-projects-page", page: String(safe - 1) }, chatId) } : {}),
+        ...(safe + 1 < totalPages ? { next: token({ action: "sessions-projects-page", page: String(safe + 1) }, chatId) } : {}),
       },
-      back: token({ action: "sessions-open" }),
+      back: token({ action: "sessions-open" }, chatId),
     }), () => openSessionProjectsCard(chatId, safe));
   }
 
@@ -206,7 +206,7 @@ export function createSessionCards(deps: SessionCardsDeps): {
       metaJoin(`events ${session.eventCount}`, session.cwd ? `cwd ${mono(truncate(session.cwd, 28))}` : undefined),
       session.lastPromptAt !== undefined ? `\u23F1\uFE0F last prompt ${relTime(session.lastPromptAt, "unknown")}` : "",
     ].filter((line) => line !== "");
-    await openCard(chatId, lines.join("\n"), buildSessionDetailKeyboard(session.id, session.archived, token({ action: "sessions-open" })));
+    await openCard(chatId, lines.join("\n"), buildSessionDetailKeyboard(session.id, session.archived, token({ action: "sessions-open" }, chatId)));
   }
 
   async function openHistoryCard(chatId: number, sessionId: string, beforeSeq?: number): Promise<void> {
@@ -217,7 +217,7 @@ export function createSessionCards(deps: SessionCardsDeps): {
     await openCard(chatId, renderTrajectoryLines(sessionId, result).join("\n"), buildHistoryKeyboard(
       sessionId,
       result.hasMore && result.nextBefore !== undefined
-        ? token({ action: "history-older", sessionId, beforeSeq: String(result.nextBefore) })
+        ? token({ action: "history-older", sessionId, beforeSeq: String(result.nextBefore) }, chatId)
         : undefined,
     ));
   }
@@ -237,8 +237,8 @@ export function createSessionCards(deps: SessionCardsDeps): {
     }
     if (hits.length === 0) lines.push("(no hits)");
     await openCard(chatId, lines.join("\n"), buildSearchKeyboard(pageHits.map((hit) => hit.sessionId), {
-      ...(safe > 0 ? { previous: token({ action: "search-page", query, page: String(safe - 1) }) } : {}),
-      ...(safe + 1 < totalPages ? { next: token({ action: "search-page", query, page: String(safe + 1) }) } : {}),
+      ...(safe > 0 ? { previous: token({ action: "search-page", query, page: String(safe - 1) }, chatId) } : {}),
+      ...(safe + 1 < totalPages ? { next: token({ action: "search-page", query, page: String(safe + 1) }, chatId) } : {}),
     }));
   }
 
