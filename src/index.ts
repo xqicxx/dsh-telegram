@@ -154,7 +154,9 @@ const {
   statusSubagentCounts,
   todoSnapshots,
   pendingStartAfterAllow,
-  pending,
+  armPending,
+  takePending,
+  cancelPending,
   disposeChat,
   disposeAll,
 } = createChatHub({
@@ -858,7 +860,9 @@ const { dispatchToken, dispatchCallback, dispatchBarButton, dispatchCommand } = 
   // Chat-hub containers + loops.
   menuPageIndex,
   cardOrigins,
-  pending,
+  armPending,
+  takePending,
+  cancelPending,
   pendingStartAfterAllow,
   abortChatLoops,
   stopTodoCardRefresh,
@@ -1366,104 +1370,108 @@ async function mountTransport(ctx: Context): Promise<void> {
         if (ext.onUserText?.(chatId, text, buildExtensionHost()) === true) return;
       }
       if (state.transport) void safeWrap(`typing(${chatId})`, () => state.transport!.sendChatActionControl(chatId, "typing"), log);
-      if (pending.search && pending.search.chatId === chatId) {
-        pending.search = undefined;
-        void openSearchCard(chatId, text);
-        return;
-      }
-      if (pending.mkdir && pending.mkdir.chatId === chatId) {
-        const { path } = pending.mkdir;
-        pending.mkdir = undefined;
-        const name = text.trim();
-        if (!name || name.includes("/") || name.includes("\\")) {
-          void uiSend(chatId, "\u274C Folder name must be a single path segment (no / or \\).", { parse_mode: "HTML" });
-          return openHostDirectoryCard(chatId, path);
-        }
-        void (async () => {
-          const res = await createDirectory(join(path, name));
-          void uiSend(chatId, res.ok ? plain(res.text) : `\u274C ${plain(res.text)}`, { parse_mode: "HTML" });
-          return openHostDirectoryCard(chatId, path);
-        })().catch((err) => log("new folder failed", err));
-        return;
-      }
-      if (pending.steer && pending.steer.chatId === chatId) {
-        const { sessionId } = pending.steer;
-        pending.steer = undefined;
-        const res = promptSession(requireCtx(), sessionId, text, "steer");
-        void uiSend(chatId, res.ok ? plain(res.text) : `\u274C ${plain(res.text)}`, { parse_mode: "HTML" });
-        return;
-      }
-      if (pending.rename && pending.rename.chatId === chatId) {
-        const sessionId = pending.rename.sessionId;
-        pending.rename = undefined;
-        const res = renameSession(requireCtx(), sessionId, text);
-        void uiSend(chatId, res.ok ? plain(res.text) : `\u274C ${plain(res.text)}`, { parse_mode: "HTML" });
-        return;
-      }
-      if (pending.subagentPrompt && pending.subagentPrompt.chatId === chatId) {
-        const { parentId, childId } = pending.subagentPrompt;
-        pending.subagentPrompt = undefined;
-        void safeWrap("subagent-prompt", () =>
-          promptSubagent(requireCtx(), parentId, childId, text).then((res) =>
-            uiSend(chatId, res.ok ? plain(res.text) : `\u274C ${plain(res.text)}`, { parse_mode: "HTML" }),
-          ),
-        log).then((sent) => {
-          if (sent === undefined) void uiSend(chatId, "\u274C Subagent prompt failed.", { parse_mode: "HTML" });
-        });
-        return;
-      }
-      if (pending.presetCopy && pending.presetCopy.chatId === chatId) {
-        const { sourceId } = pending.presetCopy;
-        pending.presetCopy = undefined;
-        const newId = text.trim();
-        if (!newId) {
-          void uiSend(chatId, "\u274C Preset id must not be blank.", { parse_mode: "HTML" });
-          return;
-        }
-        void safeWrap("preset-copy", () =>
-          copyAgentPreset(requireCtx(), sourceId, newId).then((res) => {
+      // B-4r: one per-chat pending-input store replaces the seven global
+      // single slots. takePending lazily expires stale entries, so an
+      // abandoned flow falls through to normal delivery below instead of
+      // hijacking the chat's next ordinary message, and the Map key makes
+      // the old cross-chat slot overwrite impossible. Branch bodies are
+      // verbatim moves of the former `if (pending.x && …)` ladder arms.
+      const input = takePending(chatId);
+      if (input !== undefined) {
+        switch (input.kind) {
+          case "search": {
+            void openSearchCard(chatId, text);
+            return;
+          }
+          case "mkdir": {
+            const { path } = input;
+            const name = text.trim();
+            if (!name || name.includes("/") || name.includes("\\")) {
+              void uiSend(chatId, "\u274C Folder name must be a single path segment (no / or \\).", { parse_mode: "HTML" });
+              return openHostDirectoryCard(chatId, path);
+            }
+            void (async () => {
+              const res = await createDirectory(join(path, name));
+              void uiSend(chatId, res.ok ? plain(res.text) : `\u274C ${plain(res.text)}`, { parse_mode: "HTML" });
+              return openHostDirectoryCard(chatId, path);
+            })().catch((err) => log("new folder failed", err));
+            return;
+          }
+          case "steer": {
+            const { sessionId } = input;
+            const res = promptSession(requireCtx(), sessionId, text, "steer");
             void uiSend(chatId, res.ok ? plain(res.text) : `\u274C ${plain(res.text)}`, { parse_mode: "HTML" });
-            if (res.ok) void openPresetsCard(chatId);
-          }),
-        log).then((done) => {
-          if (done === undefined) void uiSend(chatId, "\u274C Preset copy failed.", { parse_mode: "HTML" });
-        });
-        return;
-      }
-      if (pending.pluginAdd && pending.pluginAdd.chatId === chatId) {
-        pending.pluginAdd = undefined;
-        const agentId = boundAgentId(chatId);
-        if (agentId === undefined) {
-          void uiSend(chatId, "\u274C No live session in this chat \u2014 send a message first to create one, then /pluginadd.", { parse_mode: "HTML" });
-          return;
+            return;
+          }
+          case "rename": {
+            const sessionId = input.sessionId;
+            const res = renameSession(requireCtx(), sessionId, text);
+            void uiSend(chatId, res.ok ? plain(res.text) : `\u274C ${plain(res.text)}`, { parse_mode: "HTML" });
+            return;
+          }
+          case "subagentPrompt": {
+            const { parentId, childId } = input;
+            void safeWrap("subagent-prompt", () =>
+              promptSubagent(requireCtx(), parentId, childId, text).then((res) =>
+                uiSend(chatId, res.ok ? plain(res.text) : `\u274C ${plain(res.text)}`, { parse_mode: "HTML" }),
+              ),
+            log).then((sent) => {
+              if (sent === undefined) void uiSend(chatId, "\u274C Subagent prompt failed.", { parse_mode: "HTML" });
+            });
+            return;
+          }
+          case "presetCopy": {
+            const { sourceId } = input;
+            const newId = text.trim();
+            if (!newId) {
+              void uiSend(chatId, "\u274C Preset id must not be blank.", { parse_mode: "HTML" });
+              return;
+            }
+            void safeWrap("preset-copy", () =>
+              copyAgentPreset(requireCtx(), sourceId, newId).then((res) => {
+                void uiSend(chatId, res.ok ? plain(res.text) : `\u274C ${plain(res.text)}`, { parse_mode: "HTML" });
+                if (res.ok) void openPresetsCard(chatId);
+              }),
+            log).then((done) => {
+              if (done === undefined) void uiSend(chatId, "\u274C Preset copy failed.", { parse_mode: "HTML" });
+            });
+            return;
+          }
+          case "pluginAdd": {
+            const agentId = boundAgentId(chatId);
+            if (agentId === undefined) {
+              void uiSend(chatId, "\u274C No live session in this chat \u2014 send a message first to create one, then /pluginadd.", { parse_mode: "HTML" });
+              return;
+            }
+            // Tolerate ```json fences and leading labels around the payload.
+            const raw = text.trim().replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "");
+            let parsed: Record<string, unknown>;
+            try {
+              const value: unknown = JSON.parse(raw);
+              if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("not an object");
+              parsed = value as Record<string, unknown>;
+            } catch {
+              void uiSend(chatId, '\u274C That is not a JSON object. Expected {"name", "purpose", "host"/"client"} — try again or /cancel.', { parse_mode: "HTML" });
+              armPending(chatId, { kind: "pluginAdd" });
+              return;
+            }
+            const str = (key: string): string | undefined => (typeof parsed[key] === "string" ? (parsed[key] as string) : undefined);
+            void safeWrap("plugin-add", () =>
+              defineDynamicCordis(requireCtx(), agentId, {
+                name: str("name") ?? "",
+                purpose: str("purpose") ?? "",
+                host: str("host"),
+                client: str("client"),
+              }, typeof parsed["pluginId"] === "string" ? (parsed["pluginId"] as string) : undefined).then((res) => {
+                void uiSend(chatId, res.ok ? `\u2705 ${plain(res.text)}\nTap \u25B6 Run on the Dynamic card to activate it.` : `\u274C ${plain(res.text)}`, { parse_mode: "HTML" });
+                if (res.ok) refreshAllPanels();
+              }),
+            log).then((done) => {
+              if (done === undefined) void uiSend(chatId, "\u274C Plugin definition failed.", { parse_mode: "HTML" });
+            });
+            return;
+          }
         }
-        // Tolerate ```json fences and leading labels around the payload.
-        const raw = text.trim().replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/, "");
-        let parsed: Record<string, unknown>;
-        try {
-          const value: unknown = JSON.parse(raw);
-          if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("not an object");
-          parsed = value as Record<string, unknown>;
-        } catch {
-          void uiSend(chatId, '\u274C That is not a JSON object. Expected {"name", "purpose", "host"/"client"} — try again or /cancel.', { parse_mode: "HTML" });
-          pending.pluginAdd = { chatId };
-          return;
-        }
-        const str = (key: string): string | undefined => (typeof parsed[key] === "string" ? (parsed[key] as string) : undefined);
-        void safeWrap("plugin-add", () =>
-          defineDynamicCordis(requireCtx(), agentId, {
-            name: str("name") ?? "",
-            purpose: str("purpose") ?? "",
-            host: str("host"),
-            client: str("client"),
-          }, typeof parsed["pluginId"] === "string" ? (parsed["pluginId"] as string) : undefined).then((res) => {
-            void uiSend(chatId, res.ok ? `\u2705 ${plain(res.text)}\nTap \u25B6 Run on the Dynamic card to activate it.` : `\u274C ${plain(res.text)}`, { parse_mode: "HTML" });
-            if (res.ok) refreshAllPanels();
-          }),
-        log).then((done) => {
-          if (done === undefined) void uiSend(chatId, "\u274C Plugin definition failed.", { parse_mode: "HTML" });
-        });
-        return;
       }
       // Per-chat binding: this chat's first message creates its own
       // session. Other chats keep their own agent and never share it.

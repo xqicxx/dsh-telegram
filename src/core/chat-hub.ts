@@ -5,7 +5,8 @@
  * `ejectChat()` used to hand-enumerate — and twice leaked (review 2026-08-21
  * 🔴-8): the typing keepalive loops, the sticky turn flags and their rearm
  * budgets, the remembered menu page + card origin, the per-chat session-create
- * serialization chains, the pending single-slot prompt inputs, the
+ * serialization chains, the per-chat pending prompt inputs (audit B-4r:
+ * one `Map<chatId, PendingInput>` with a lazy 5-minute TTL), the
  * start-after-allow replay set, per-agent subagent counts and per-chat todo
  * snapshots. Teardown delegates to `disposeAll()` and per-chat ejection to
  * `disposeChat()`, so adding a container can no longer be forgotten at a
@@ -33,6 +34,8 @@ export interface ChatHubDeps {
   currentAgent(chatId?: number): Agent | undefined;
   /** Live-feed seam (#48); a no-op until the `telegram` service mounts. */
   stopLiveFeed(chatId: number): void;
+  /** Injectable clock for the pending-input TTL (tests); defaults to Date.now. */
+  now?(): number;
   log(message: string, error?: unknown): void;
 }
 
@@ -168,24 +171,76 @@ const todoSnapshots = new Map<number, TodoView[]>();
 const sessionCreateChains = new Map<number, Promise<unknown>>();
 
 // ---------------------------------------------------------------------------
-// Pending single-slot prompt inputs
+// Pending prompt inputs (per-chat store, B-4r)
 // ---------------------------------------------------------------------------
 
-/** The one armed free-text prompt per intent (issue 🟠-4 keeps them
- * single-slot on purpose for now: two chats arming the same intent overwrite
- * each other, and the chatId guard prevents cross-chat consumption). Hub
- * ownership only adds: ejection/teardown now reliably unarm them. */
-export interface ChatPendingSlots {
-  rename?: { chatId: number; sessionId: string };
-  steer?: { chatId: number; sessionId: string };
-  search?: { chatId: number };
-  presetCopy?: { chatId: number; sourceId: string };
-  mkdir?: { chatId: number; path: string };
+/** How long an armed free-text prompt stays valid (audit B-4r). Expiry is
+ * lazy — checked on the next take/cancel for that chat — so an abandoned
+ * flow can no longer hijack the chat's next ordinary message, and no timer
+ * bookkeeping is needed. */
+export const PENDING_INPUT_TTL_MS = 5 * 60_000;
+
+/** One armed free-text prompt. The owning chat is the `pendingInputs` Map
+ * key (the former slots carried a redundant `chatId` field), so two chats
+ * arming the same kind never clobber each other and arming a different kind
+ * in one chat replaces that chat's previous input. */
+export type PendingInput =
+  | { kind: "rename"; expiresAt: number; sessionId: string }
+  | { kind: "steer"; expiresAt: number; sessionId: string }
+  | { kind: "search"; expiresAt: number }
+  | { kind: "presetCopy"; expiresAt: number; sourceId: string }
+  | { kind: "mkdir"; expiresAt: number; path: string }
   /** Issue #50: awaiting the plugin-definition JSON reply. */
-  pluginAdd?: { chatId: number };
-  subagentPrompt?: { chatId: number; parentId: string; childId: string };
+  | { kind: "pluginAdd"; expiresAt: number }
+  | { kind: "subagentPrompt"; expiresAt: number; parentId: string; childId: string };
+
+/** What an arming call site provides: the kind-specific payload without
+ * `expiresAt`, which `armPending` stamps (`now() + PENDING_INPUT_TTL_MS`). */
+type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
+export type PendingInputSpec = DistributiveOmit<PendingInput, "expiresAt">;
+
+/** Per-chat pending inputs: at most one armed flow per chat (arming a new
+ * kind supersedes the old one instead of leaving both behind). */
+const pendingInputs = new Map<number, PendingInput>();
+
+function hubNow(deps: ChatHubDeps): number {
+  return (deps.now ?? Date.now)();
 }
-const pending: ChatPendingSlots = {};
+
+/** Drop the entry when it has passed its TTL; absent and expired look
+ * identical to consumers ("no pending input"). */
+function livePending(chatId: number, deps: ChatHubDeps): PendingInput | undefined {
+  const input = pendingInputs.get(chatId);
+  if (input === undefined) return undefined;
+  if (hubNow(deps) >= input.expiresAt) {
+    pendingInputs.delete(chatId);
+    return undefined;
+  }
+  return input;
+}
+
+/** Arm one pending input for this chat with a fresh TTL window. */
+function armPending(chatId: number, input: PendingInputSpec, deps: ChatHubDeps): void {
+  pendingInputs.set(chatId, { ...input, expiresAt: hubNow(deps) + PENDING_INPUT_TTL_MS } as PendingInput);
+}
+
+/** Consume this chat's armed input (lazily expiring it first); absent or
+ * expired → undefined, which callers treat exactly like "nothing armed".
+ * With `kind`, a non-matching entry stays armed instead of being swallowed
+ * (/subagentprompt must not eat an armed rename). */
+function takePending(chatId: number, kind: PendingInput["kind"] | undefined, deps: ChatHubDeps): PendingInput | undefined {
+  const input = livePending(chatId, deps);
+  if (input === undefined) return undefined;
+  if (kind !== undefined && input.kind !== kind) return undefined;
+  pendingInputs.delete(chatId);
+  return input;
+}
+
+/** Cancel this chat's armed input whatever its kind; returns the removed
+ * input's kind so /cancel can name what it cancelled, or undefined. */
+function cancelPending(chatId: number, deps: ChatHubDeps): PendingInput["kind"] | undefined {
+  return takePending(chatId, undefined, deps)?.kind;
+}
 
 /** Chats whose first touch was `/start` while unauthorized: once they tap
  * Allow, replay the welcome instead of making them resend the command. */
@@ -197,8 +252,8 @@ const pendingStartAfterAllow = new Set<number>();
 
 /** Drop one chat's slice of every chat-keyed hub container: typing loop
  * (clearTimer semantics), sticky turn flag, rearm budget, remembered menu
- * page, card origin, session-create chain, every pending input slot armed by
- * this chat, the start-after-allow replay flag and the last todo snapshot.
+ * page, card origin, session-create chain, the chat's armed pending input,
+ * the start-after-allow replay flag and the last todo snapshot.
  * Deliberately NOT covered: the live-feed seam (eject must not touch it, see
  * abortChatLoops) and the agent-keyed statusSubagentCounts (no chat key;
  * dropped on session/disposed by core/events.ts). */
@@ -209,20 +264,14 @@ function disposeChat(chatId: number): void {
   menuPageIndex.delete(chatId);
   cardOrigins.delete(chatId);
   sessionCreateChains.delete(chatId);
-  if (pending.rename?.chatId === chatId) pending.rename = undefined;
-  if (pending.steer?.chatId === chatId) pending.steer = undefined;
-  if (pending.search?.chatId === chatId) pending.search = undefined;
-  if (pending.mkdir?.chatId === chatId) pending.mkdir = undefined;
-  if (pending.presetCopy?.chatId === chatId) pending.presetCopy = undefined;
-  if (pending.pluginAdd?.chatId === chatId) pending.pluginAdd = undefined;
-  if (pending.subagentPrompt?.chatId === chatId) pending.subagentPrompt = undefined;
+  pendingInputs.delete(chatId);
   pendingStartAfterAllow.delete(chatId);
   todoSnapshots.delete(chatId);
 }
 
 /** Reverse every hub-owned per-chat container (hot unplug / HMR / config
  * restart). Timers get clearInterval, maps/sets clear wholesale, pending
- * inputs reset to unarmed. */
+ * inputs drop with them. */
 function disposeAll(): void {
   for (const timer of typingLoops.values()) clearInterval(timer);
   typingLoops.clear();
@@ -233,13 +282,7 @@ function disposeAll(): void {
   menuPageIndex.clear();
   cardOrigins.clear();
   sessionCreateChains.clear();
-  pending.rename = undefined;
-  pending.steer = undefined;
-  pending.search = undefined;
-  pending.mkdir = undefined;
-  pending.presetCopy = undefined;
-  pending.pluginAdd = undefined;
-  pending.subagentPrompt = undefined;
+  pendingInputs.clear();
   pendingStartAfterAllow.clear();
   statusSubagentCounts.clear();
   todoSnapshots.clear();
@@ -258,7 +301,11 @@ export function createChatHub(deps: ChatHubDeps): {
   menuPageIndex: Map<number, number>;
   cardOrigins: Map<number, "menu" | "bar">;
   pendingStartAfterAllow: Set<number>;
-  pending: ChatPendingSlots;
+  /** Arm/consume/cancel the chat's pending free-text input (B-4r per-chat
+   * store; `PENDING_INPUT_TTL_MS` expiry is evaluated lazily on take). */
+  armPending(chatId: number, input: PendingInputSpec): void;
+  takePending(chatId: number, kind?: PendingInput["kind"]): PendingInput | undefined;
+  cancelPending(chatId: number): PendingInput["kind"] | undefined;
   // Typing cluster (typingKeepaliveActive is also a module-level export so
   // dist/index.js can re-export it for the test suite).
   typingKeepaliveActive: typeof typingKeepaliveActive;
@@ -277,7 +324,9 @@ export function createChatHub(deps: ChatHubDeps): {
     menuPageIndex,
     cardOrigins,
     pendingStartAfterAllow,
-    pending,
+    armPending: (chatId, input) => armPending(chatId, input, deps),
+    takePending: (chatId, kind) => takePending(chatId, kind, deps),
+    cancelPending: (chatId) => cancelPending(chatId, deps),
     typingKeepaliveActive,
     setTurnRunning: (chatId, running) => setTurnRunning(chatId, running, deps),
     startTyping: (chatId) => startTyping(chatId, deps),

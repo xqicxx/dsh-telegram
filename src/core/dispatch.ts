@@ -105,7 +105,7 @@ import {
   commandsListCommand,
   type CommandCall,
 } from "./commands.js";
-import type { ChatPendingSlots } from "./chat-hub.js";
+import type { PendingInput, PendingInputSpec } from "./chat-hub.js";
 import { type CardLoad, type OpenCard } from "./cards.js";
 import type { createModelCards } from "../cards/models.js";
 import type { createMiscCards } from "../cards/misc.js";
@@ -237,7 +237,11 @@ export interface DispatchDeps {
   // ---- chat-hub containers + loops (core/chat-hub.ts wiring) ----
   menuPageIndex: Map<number, number>;
   cardOrigins: Map<number, "menu" | "bar">;
-  pending: ChatPendingSlots;
+  /** B-4r per-chat pending-input store: commands/dispatch arm free-text
+   * flows, onUserText consumes them, /cancel cancels them. */
+  armPending(chatId: number, input: PendingInputSpec): void;
+  takePending(chatId: number, kind?: PendingInput["kind"]): PendingInput | undefined;
+  cancelPending(chatId: number): PendingInput["kind"] | undefined;
   pendingStartAfterAllow: Set<number>;
   abortChatLoops(chatId: number): void;
   stopTodoCardRefresh(chatId: number): void;
@@ -331,7 +335,7 @@ export function createDispatchers(deps: DispatchDeps): {
     // Chat-hub containers + loops.
     menuPageIndex,
     cardOrigins,
-    pending,
+    armPending,
     pendingStartAfterAllow,
     abortChatLoops,
     stopTodoCardRefresh,
@@ -533,7 +537,7 @@ async function dispatchToken(chatId: number, payload: Record<string, string>): P
       return openHostDirectoryCard(chatId, payload["path"] ?? state.workspaceRoot);
     case "host-mkdir-prompt": {
       const path = payload["path"] ?? state.workspaceRoot;
-      pending.mkdir = { chatId, path };
+      armPending(chatId, { kind: "mkdir", path });
       await uiSend(chatId, `\u{1F4C1} Reply with the new folder name under ${plain(truncate(path, 48))} (or /cancel):`, {
         parse_mode: "HTML",
         reply_markup: inputPromptKeyboard("New folder name\u2026"),
@@ -660,7 +664,7 @@ async function dispatchToken(chatId: number, payload: Record<string, string>): P
         parse_mode: "HTML",
         reply_markup: inputPromptKeyboard("Prompt for subagent\u2026"),
       });
-      pending.subagentPrompt = { chatId, parentId, childId };
+      armPending(chatId, { kind: "subagentPrompt", parentId, childId });
       return;
     }
     case "subagent-interrupt": {
@@ -828,7 +832,7 @@ async function dispatchToken(chatId: number, payload: Record<string, string>): P
     }
     case "preset-copy": {
       const sourceId = payload["presetId"] ?? "";
-      pending.presetCopy = { chatId, sourceId };
+      armPending(chatId, { kind: "presetCopy", sourceId });
       await uiSend(chatId, `\u{1F4CB} Reply with the new preset id for a copy of ${plain(truncate(sourceId, 32))} (or /cancel):`, {
         parse_mode: "HTML",
         reply_markup: inputPromptKeyboard("New preset id\u2026"),
@@ -1060,7 +1064,7 @@ async function dispatchCallback(chatId: number, data: string): Promise<void> {
         parse_mode: "HTML",
         reply_markup: inputPromptKeyboard("New session title\u2026"),
       });
-      pending.rename = { chatId, sessionId: id };
+      armPending(chatId, { kind: "rename", sessionId: id });
       return;
     }
     if (sub === "fork") {
@@ -1090,7 +1094,7 @@ async function dispatchCallback(chatId: number, data: string): Promise<void> {
       );
     }
     if (sub === "steer") {
-      pending.steer = { chatId, sessionId: id };
+      armPending(chatId, { kind: "steer", sessionId: id });
       await uiSend(chatId, `\u{1F3AF} Steer ${plain(truncate(id, 24))} \u2014 send the steer text:`, {
         parse_mode: "HTML",
         reply_markup: inputPromptKeyboard("Steer text\u2026"),
@@ -1246,7 +1250,7 @@ async function dispatchCallback(chatId: number, data: string): Promise<void> {
   if (data.startsWith("p:")) {
     const sub = data.slice(2);
     if (sub === "add") {
-      pending.pluginAdd = { chatId };
+      armPending(chatId, { kind: "pluginAdd" });
       await uiSend(
         chatId,
         [
@@ -1315,7 +1319,7 @@ async function dispatchCallback(chatId: number, data: string): Promise<void> {
     case "sessions":
       return actions["sessions"](actionCtx);
     case "search": {
-      pending.search = { chatId };
+      armPending(chatId, { kind: "search" });
       await uiSend(chatId, "\u{1F50D} Reply with the search query:", {
         parse_mode: "HTML",
         reply_markup: inputPromptKeyboard("Search query\u2026"),
@@ -1427,9 +1431,10 @@ async function dispatchCallback(chatId: number, data: string): Promise<void> {
   }
 }
 
-// Pending single-slot prompt inputs + the start-after-allow replay set live
-// in core/chat-hub.ts (yellow-1 step 3) and are destructured from the hub
-// above (`pending.rename`, `pending.steer`, …).
+// The per-chat pending-input store lives in core/chat-hub.ts (audit B-4r):
+// dispatch surfaces arm free-text flows via `armPending`, index.ts's
+// onUserText consumes them with `takePending` and /cancel clears them with
+// `cancelPending` — expiry and per-chat isolation are the hub's job.
 
 // ---------------------------------------------------------------------------
 // Bar + command dispatch

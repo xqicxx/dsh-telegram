@@ -201,21 +201,29 @@ export async function answerCommand(deps: DispatchDeps, c: CommandCall): Promise
 
 
 /** /cancel — body moved verbatim from the former
- * dispatchCommand switch case. */
+ * dispatchCommand switch case. B-4r: cancels the chat's armed pending input
+ * whatever its kind; the four kinds that previously had no cancel path now
+ * answer with consistent texts instead of "Nothing to cancel.". */
 export async function cancelCommand(deps: DispatchDeps, c: CommandCall): Promise<void> {
   const { chatId, send } = c;
-  const { pending } = deps;
-      if (pending.presetCopy && pending.presetCopy.chatId === chatId) {
-        pending.presetCopy = undefined;
+  const { cancelPending } = deps;
+      const kind = cancelPending(chatId);
+      if (kind === "presetCopy") {
         await send("Preset copy cancelled.");
-      } else if (pending.mkdir && pending.mkdir.chatId === chatId) {
-        pending.mkdir = undefined;
+      } else if (kind === "mkdir") {
         await send("New-folder cancelled.");
-      } else if (pending.pluginAdd && pending.pluginAdd.chatId === chatId) {
-        pending.pluginAdd = undefined;
+      } else if (kind === "pluginAdd") {
         await send("Plugin add cancelled.");
+      } else if (kind === "rename") {
+        await send("Rename cancelled.");
+      } else if (kind === "steer") {
+        await send("Steer cancelled.");
+      } else if (kind === "search") {
+        await send("Search cancelled.");
+      } else if (kind === "subagentPrompt") {
+        await send("Subagent prompt cancelled.");
       } else {
-        await send("Nothing to cancel.");
+        await send("Nothing to cancel.", false);
       }
       return;
 }
@@ -225,7 +233,7 @@ export async function cancelCommand(deps: DispatchDeps, c: CommandCall): Promise
  * dispatchCommand switch case. */
 export async function pluginAddCommand(deps: DispatchDeps, c: CommandCall): Promise<void> {
   const { chatId, args, ctx, send } = c;
-  const { boundAgentId, pending, refreshAllPanels } = deps;
+  const { boundAgentId, armPending, refreshAllPanels } = deps;
       const agentId = boundAgentId(chatId);
       if (agentId === undefined) {
         await send("\u274C No live session in this chat \u2014 send a message first to create one, then /pluginadd.");
@@ -233,7 +241,7 @@ export async function pluginAddCommand(deps: DispatchDeps, c: CommandCall): Prom
       }
       const json = args.trim();
       if (json === "") {
-        pending.pluginAdd = { chatId };
+        armPending(chatId, { kind: "pluginAdd" });
         await send(
           [
             "\u{1F9E9} Reply with the plugin JSON (or /cancel):",
@@ -434,7 +442,7 @@ export async function searchCommand(deps: DispatchDeps, c: CommandCall): Promise
  * dispatchCommand switch case. */
 export async function renameCommand(deps: DispatchDeps, c: CommandCall): Promise<void> {
   const { chatId, args, ctx, send } = c;
-  const { boundAgentId, pending } = deps;
+  const { boundAgentId, armPending } = deps;
       const title = args.trim();
       const sessionId = boundAgentId(chatId);
       if (!sessionId) {
@@ -442,7 +450,7 @@ export async function renameCommand(deps: DispatchDeps, c: CommandCall): Promise
         return;
       }
       if (!title) {
-        pending.rename = { chatId, sessionId };
+        armPending(chatId, { kind: "rename", sessionId });
         await send(`Reply with just the title to rename ${plain(truncate(sessionId, 24))}:`);
         return;
       }
@@ -886,16 +894,17 @@ export async function discoverCommand(deps: DispatchDeps, c: CommandCall): Promi
 
 
 /** /subagentprompt — body moved verbatim from the former
- * dispatchCommand switch case. */
+ * dispatchCommand switch case. B-4r: kind-filtered take so an input of
+ * another kind stays armed instead of being swallowed here. */
 export async function subagentpromptCommand(deps: DispatchDeps, c: CommandCall): Promise<void> {
   const { chatId, args, ctx, send } = c;
-  const { pending } = deps;
-      if (!pending.subagentPrompt || pending.subagentPrompt.chatId !== chatId) {
+  const { takePending } = deps;
+      const input = takePending(chatId, "subagentPrompt");
+      if (input?.kind !== "subagentPrompt") {
         await send("Open a subagent first, then reply with the prompt text.");
         return;
       }
-      const res = await promptSubagent(ctx, pending.subagentPrompt.parentId, pending.subagentPrompt.childId, args.trim());
-      pending.subagentPrompt = undefined;
+      const res = await promptSubagent(ctx, input.parentId, input.childId, args.trim());
       await send(res.text, res.ok);
       return;
 }
