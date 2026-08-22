@@ -1,6 +1,12 @@
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { REASONING_EFFORTS } from './reasoning.js';
+import { REASONING_DEFAULT, REASONING_EFFORTS } from './reasoning.js';
+import { DEFAULT_TRANSCRIBE_MODEL } from './harness/adapters/media.js';
+
+/** Telegram Bot API hard cap for one outbound text payload; longer text is
+ * split into parts. Shared by the schema default and the validation upper
+ * bound below (review 🟡-6). */
+export const TELEGRAM_MAX_MESSAGE_LENGTH = 4096;
 
 /** How inbound chat text is treated before it ever reaches the agent. */
 export type InboundMode = 'auto-handle' | 'queue-only' | 'muted';
@@ -124,7 +130,7 @@ export const DEFAULT_CONFIG: TelegramConfig = Object.freeze({
     disableNotification: false,
     maxRetries: 3,
     sendRatePerSecond: 20,
-    maxMessageLength: 4096,
+    maxMessageLength: TELEGRAM_MAX_MESSAGE_LENGTH,
     liveFeed: true,
   },
   compact: {
@@ -134,9 +140,9 @@ export const DEFAULT_CONFIG: TelegramConfig = Object.freeze({
   },
   workspace: {},
   mode: { name: '' },
-  reasoning: { effort: 'medium' as const },
+  reasoning: { effort: REASONING_DEFAULT },
   model: {},
-  media: { transcribe: { model: 'whisper-1' } },
+  media: { transcribe: { model: DEFAULT_TRANSCRIBE_MODEL } },
   interactive: { userQuestions: 'telegram' as const, allowByTool: [] },
   notify: { onComplete: true, onLongTask: true },
 });
@@ -285,8 +291,8 @@ export function normalizeConfig(raw: unknown): TelegramConfig {
     }
     const maxLength = readNumber(outbound, 'maxMessageLength', 'outbound');
     if (maxLength !== undefined) {
-      if (!Number.isInteger(maxLength) || maxLength < 512 || maxLength > 4096) {
-        throw new ConfigError('outbound.maxMessageLength', 'must be an integer between 512 and 4096');
+      if (!Number.isInteger(maxLength) || maxLength < 512 || maxLength > TELEGRAM_MAX_MESSAGE_LENGTH) {
+        throw new ConfigError('outbound.maxMessageLength', `must be an integer between 512 and ${TELEGRAM_MAX_MESSAGE_LENGTH}`);
       }
       base.outbound.maxMessageLength = maxLength;
     }

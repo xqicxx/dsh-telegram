@@ -14,7 +14,7 @@ import type { Agent } from "@deepseek-ai/dsh-agent";
 import type { CommandInvocation, CommandResult } from "@deepseek-ai/dsh-commands";
 import { existsSync } from "node:fs";
 import { basename, join, parse, resolve } from "node:path";
-import { isChatAllowed, readConfig, resolveToken, writeConfig, overlayConfig, getConfigPath, patchFromPath, type ConfigSection, type TelegramConfig } from "./config.js";
+import { isChatAllowed, normalizeConfig, readConfig, resolveToken, writeConfig, overlayConfig, getConfigPath, patchFromPath, type ConfigSection, type TelegramConfig } from "./config.js";
 import { Bridge } from "./harness/bridge.js";
 import { modeSummary } from "./harness/adapters/mode.js";
 import { renameSession, promptSession, releaseSavedAttachments, SessionLifecycle, releaseAllModelSelections } from "./harness/adapters/sessions.js";
@@ -93,11 +93,19 @@ let goalProgress: GoalProgressFeed | undefined;
 /** Context-pressure compaction watcher (issue #8). */
 let compactionWatcher: CompactionWatcher | undefined;
 
+// Boot placeholders only (review 🟠-10): apply() is the single source of
+// truth and re-resolves all three (findWorkspaceRoot once + readConfig). The
+// old module-level initializer ran findWorkspaceRoot three times and parsed
+// `.pi/telegram.json` at import time, so a corrupt config file made the
+// plugin IMPORT fail instead of degrading diagnosably inside apply(). Nothing
+// reads these before apply() sets them: the module-scope factories receive
+// `state` but only touch workspaceRoot/configRoot/config inside late-bound
+// closures, which run post-apply.
 const state: State = {
   context: null,
-  workspaceRoot: findWorkspaceRoot(process.cwd()) ?? process.cwd(),
-  configRoot: findWorkspaceRoot(process.cwd()) ?? process.cwd(),
-  config: readConfig(findWorkspaceRoot(process.cwd()) ?? process.cwd()),
+  workspaceRoot: process.cwd(),
+  configRoot: process.cwd(),
+  config: normalizeConfig(undefined),
   transport: undefined,
   bridge: undefined,
   interactive: undefined,

@@ -1,7 +1,10 @@
 /**
  * Capability matrix: probes which web-backing host services are composed.
- * Every adapter consults this first so a headless profile degrades with a
- * readable hint instead of throwing on a missing service.
+ * This is a display matrix for the /capabilities card only (plus its
+ * missing-services hint) — adapters do NOT consult it first; each one
+ * degrades on its own via an optional `ctx.get` lookup when a headless
+ * profile lacks a service. CAPABILITY_LABELS is accordingly just an identity
+ * map that renders the matrix keys on the card.
  */
 import type { Context } from "@deepseek-ai/cordis";
 

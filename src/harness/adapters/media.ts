@@ -9,6 +9,11 @@ import { basename, join } from "node:path";
 import { dshHome } from "./mode.js";
 import { fail, type AdapterResult } from "./types.js";
 
+/** Default OpenAI-compatible voice-transcription model; also the config
+ * default in config.ts so both call sites share one source of truth
+ * (review 🟡-6). */
+export const DEFAULT_TRANSCRIBE_MODEL = "whisper-1";
+
 export interface TranscribeConfig {
   baseUrl?: string;
   apiKey?: string;
@@ -30,7 +35,7 @@ export async function transcribeVoice(
   const apiKey = config?.apiKey ?? env["OPENAI_API_KEY"] ?? env["TELEGRAM_VOICE_API_KEY"];
   if (!apiKey) return fail("voice transcription needs an api key \u2014 /config set media.transcribe.apiKey \"<OPENAI key>\" (or set OPENAI_API_KEY)");
   const baseUrl = (config?.baseUrl ?? env["TELEGRAM_VOICE_BASE_URL"] ?? "https://api.openai.com/v1").replace(/\/+$/, "");
-  const model = config?.model ?? env["TELEGRAM_VOICE_MODEL"] ?? "whisper-1";
+  const model = config?.model ?? env["TELEGRAM_VOICE_MODEL"] ?? DEFAULT_TRANSCRIBE_MODEL;
   try {
     const form = new FormData();
     form.append("model", model);
