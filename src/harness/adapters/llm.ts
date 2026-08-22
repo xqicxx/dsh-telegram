@@ -76,32 +76,39 @@ export async function modelCatalog(ctx: Context, current?: { provider?: string; 
   const llm = llmOf(ctx);
   if (!llm) return { groups: [], failures: [], current: current ?? {}, routable: true };
   const providers = llm.listProviders();
-  const groups: ModelGroup[] = [];
-  const failures: { provider: string; message: string }[] = [];
-  for (const provider of providers) {
-    try {
-      const models = await llm.listModels(provider.id);
-      const entries: ModelEntry[] = [];
-      for (const model of models) {
-        let reasoning: ModelEntry["reasoning"];
-        try {
-          const resolved = await llm.resolveModelInfo(provider.id, model.id);
-          reasoning = resolved.reasoning;
-        } catch {
-          /* offline adapter must not hide the rest of the catalog */
-        }
-        entries.push({
-          id: model.id,
-          name: model.name,
-          ...(model.description === undefined ? {} : { description: model.description }),
-          ...(reasoning === undefined ? {} : { reasoning }),
-        });
+  // Two-level fan-out (providers × models), matching models.ts: both loops
+  // used to await one entry at a time, so a slow adapter serialized the whole
+  // catalog. Promise.all gathers positionally, so group/failure order still
+  // follows listProviders() regardless of completion order.
+  const settled = await Promise.all(
+    providers.map(async (provider): Promise<{ group?: ModelGroup; failure?: { provider: string; message: string } }> => {
+      try {
+        const models = await llm.listModels(provider.id);
+        const entries = await Promise.all(
+          models.map(async (model): Promise<ModelEntry> => {
+            let reasoning: ModelEntry["reasoning"];
+            try {
+              const resolved = await llm.resolveModelInfo(provider.id, model.id);
+              reasoning = resolved.reasoning;
+            } catch {
+              /* offline adapter must not hide the rest of the catalog */
+            }
+            return {
+              id: model.id,
+              name: model.name,
+              ...(model.description === undefined ? {} : { description: model.description }),
+              ...(reasoning === undefined ? {} : { reasoning }),
+            };
+          }),
+        );
+        return { group: { id: provider.id, name: provider.name, models: entries } };
+      } catch (err) {
+        return { failure: { provider: provider.id, message: err instanceof Error ? err.message : String(err) } };
       }
-      groups.push({ id: provider.id, name: provider.name, models: entries });
-    } catch (err) {
-      failures.push({ provider: provider.id, message: err instanceof Error ? err.message : String(err) });
-    }
-  }
+    }),
+  );
+  const groups: ModelGroup[] = settled.flatMap((entry) => (entry.group === undefined ? [] : [entry.group]));
+  const failures = settled.flatMap((entry) => (entry.failure === undefined ? [] : [entry.failure]));
   return {
     groups,
     failures,

@@ -220,3 +220,11 @@ test('a long model-styled separator does not inflate column width (#31)', () => 
   const html = markdownToHtml(['| a | b |', '|-----------|-----------|', '| 1 | 2 |'].join('\n'));
   assert.match(html, /\| --- \| --- \|/, 'separator reflects data width, not its own dashes');
 });
+
+test('ragged body rows wider than the header render without padding NaNs (#31 hardening)', () => {
+  const html = markdownToHtml(['| a | b |', '|---|---|', '| 1 | 2 | extra | cells |'].join('\n'));
+  assert.match(html, /<pre><code>\| a   \| b   \|/);
+  assert.match(html, /\| 1   \| 2   \|/, 'rows are truncated to the header column count, unpadded extras dropped');
+  assert.equal(html.includes('undefined'), false);
+  assert.equal(html.includes('NaN'), false);
+});

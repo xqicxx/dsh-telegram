@@ -52,6 +52,7 @@ function makeHost() {
 
 function makeCtx(host) {
   const listeners = new Map();
+  const disposers = [];
   return {
     host,
     telegram: host,
@@ -62,8 +63,13 @@ function makeCtx(host) {
       return () => {};
     },
     effect: (fn) => {
-      fn();
-      return () => {};
+      const dispose = fn();
+      if (typeof dispose === 'function') disposers.push(dispose);
+      return dispose;
+    },
+    /** Simulate hot teardown: run every registered effect disposer. */
+    disposeAll: () => {
+      for (const dispose of disposers.splice(0)) dispose();
     },
     emit: (sessionId, event) => {
       for (const cb of listeners.get('session/event') ?? []) cb({ id: sessionId }, event);
@@ -659,4 +665,116 @@ test('turn/end after an aborted draft still finalizes without re-editing loops (
   // editing afterwards.
   await sleep(300);
   assert.ok(host.edits.length - editsAtStop <= 1, 'at most one finalize edit after abort');
+});
+
+// ---- review 2026-08-21 🟠-12/🟠-13/🔵-11: placeholder orphans, degraded final answers, teardown timers ----
+
+/** Drain pending microtasks so promise-settlement handlers run. */
+const drain = async () => {
+  for (let i = 0; i < 8; i += 1) await Promise.resolve();
+};
+
+/** Replace host.send with manually-resolved promises to control landing order. */
+function gateSend(host, queue) {
+  host.send = (chatId, text, options) => {
+    let resolveId;
+    const promise = new Promise((resolve) => {
+      resolveId = resolve;
+    });
+    queue.push({ chatId, text, options, promise, resolveId });
+    return promise;
+  };
+}
+
+test('a placeholder still in flight is adopted by the replacing turn instead of leaking (#12)', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  t.mock.timers.setTime(1_000_000);
+  const { host, ctx } = await setup();
+  const queue = [];
+  gateSend(host, queue);
+
+  ctx.emit('agent-1', ev('turn/start', { turn: 1 }));
+  await drain();
+  assert.equal(queue.length, 1, 'first turn spawns its placeholder');
+
+  // New turn while the old send has not landed yet: the replacing draft must
+  // adopt the in-flight send instead of spawning a second Working….
+  ctx.emit('agent-1', ev('turn/start', { turn: 2 }));
+  await drain();
+  assert.equal(queue.length, 1, 'no second placeholder while the first is in flight');
+
+  // The old send lands AFTER the draft was replaced: its message id must be
+  // adopted by the new draft, not guard-dropped into a permanent wreck.
+  queue[0].resolveId(101);
+  await drain();
+
+  ctx.emit('agent-1', ev('tool/call', { callId: 'c1', name: 'bash', arguments: 'ls' }));
+  await Promise.resolve();
+  t.mock.timers.tick(200);
+  await drain();
+  assert.equal(host.edits.length, 1, 'streaming content flows into the adopted message');
+  assert.equal(host.edits[0].messageId, 101);
+
+  ctx.emit('agent-1', ev('turn/end', { turn: 2, reason: { kind: 'completed' } }));
+  await drain();
+  const summary = host.edits.at(-1);
+  assert.equal(summary.messageId, 101, 'the receipt collapses the adopted placeholder');
+  assert.match(summary.text, /完成/u);
+  assert.equal(queue.length, 1, 'exactly one placeholder was ever sent');
+  assert.equal(host.deletes.length, 0, 'an adopted placeholder needs no cleanup');
+});
+
+test('teardown releases the seam, kills draft timers, and deletes a placeholder landing after disposal (#12, blue-11)', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
+  t.mock.timers.setTime(1_000_000);
+  const { host, ctx } = await setup();
+  const queue = [];
+  gateSend(host, queue);
+
+  ctx.emit('agent-1', ev('turn/start', { turn: 1 }));
+  await drain();
+  assert.equal(queue.length, 1, 'placeholder send is in flight');
+
+  ctx.emit('agent-1', ev('assistant/chunk', { chunk: { type: 'text-delta', text: 'work' } }));
+  await drain();
+  assert.equal(typeof host.stopLiveFeed, 'function');
+
+  // Hot teardown mid-send: timers must be disarmed and the seam released.
+  ctx.disposeAll();
+  await drain();
+  assert.equal(host.stopLiveFeed, undefined, 'the abort seam is released on teardown');
+
+  // Advance past throttle (200ms), max retry backoff (30s), heartbeat (30s):
+  // nothing may fire into a torn-down feed.
+  t.mock.timers.tick(35_000);
+  await drain();
+  assert.equal(host.edits.length, 0, 'no timer fires into a torn-down feed');
+
+  // The abandoned send lands after disposal: delete it instead of leaving a
+  // permanent "⚙️ Working…" wreck in the chat.
+  queue[0].resolveId(105);
+  await drain();
+  assert.deepEqual(host.deletes, [{ chatId: 7, messageId: 105 }], 'a placeholder landing after teardown is deleted, not leaked');
+});
+
+test('a failed final-answer delivery degrades to a notice and keeps the inbound pending (#13)', async () => {
+  const { host, ctx } = await setup();
+  host.inboundPending = true;
+  host.send = async (chatId, text, options) => {
+    host.sends.push({ chatId, text, options });
+    return undefined; // every transport send soft-fails
+  };
+
+  ctx.emit('agent-1', ev('turn/start', { turn: 1 }));
+  await sleep(20);
+  host.consumer(7, 'the real answer', 'assistant-message-degraded');
+  ctx.emit('agent-1', ev('turn/end', { turn: 1, reason: { kind: 'completed' } }));
+  await sleep(20);
+
+  const degraded = host.sends.find((s) => s.text.includes('could not be delivered'));
+  assert.ok(degraded, 'a one-shot degradation notice reaches the chat when the final answer fails');
+  assert.equal(degraded.options.parse_mode, 'HTML');
+  assert.equal(host.feedback.length, 0, 'no feedback keyboard on a failed delivery');
+  assert.equal(host.inboundRepliedMarks, 0, 'the inbound stays pending so the reminder machinery can fire');
+  assert.equal(host.inboundPending, true);
 });

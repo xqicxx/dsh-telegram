@@ -368,6 +368,9 @@ export function apply(ctx: Context, _config?: unknown): void {
   if (host === undefined) return;
   console.error("[dsh-telegram] openclaw streaming feed mounted");
   const chats = new Map<number, Draft>();
+  /** Set by the effect teardown: in-flight placeholder sends that land after
+   * disposal are orphans nobody will ever edit, so they get deleted (#12). */
+  let disposed = false;
   // Latest assistant text block per turn: when this plugin renders the live
   // feed, the core forwards prose here instead of spamming the chat. The
   // plugin owns final delivery at turn/end; the core reminder is suppressed
@@ -388,6 +391,11 @@ export function apply(ctx: Context, _config?: unknown): void {
   ctx.effect(() => () => {
     host.stopLiveFeed = undefined;
     host.setAssistantConsumer(undefined);
+    disposed = true;
+    // Teardown must not leave throttle/retry/heartbeat timers armed: retry
+    // backoff reaches 30s (un-unref'd) and would drag the freshly
+    // hot-reloaded process's event loop before firing into a guard.
+    for (const draft of chats.values()) clearTimers(draft);
     chats.clear();
     answers.clear();
   });
@@ -525,35 +533,63 @@ export function apply(ctx: Context, _config?: unknown): void {
     }, EDIT_THROTTLE_MS);
   };
 
-  const ensureMessage = (chatId: number, draft: Draft): void => {
-    if (draft.messageId !== undefined || draft.sending !== undefined || draft.placeholderFailed === true) return;
-    // Issue #15: the placeholder is the full card title, never a lone "…".
-    const text = titleFor(chatId, draft);
-    const pending = host.send(chatId, text, { parse_mode: "HTML" });
-    draft.sending = pending;
+  /** Settlement handling for one placeholder send. Every handler resolves the
+   * chat's CURRENT draft at settle time instead of capturing the draft that
+   * started the send: turn/start may hand an in-flight send over to its
+   * replacement draft, and teardown/turn-end may remove the draft entirely.
+   * The landed message is adopted by whoever now owns the chat (or deleted
+   * after disposal) instead of being guard-dropped into a permanent
+   * "⚙️ Working…" wreck (#12). */
+  const watchPlaceholder = (chatId: number, pending: Promise<number | undefined>, text: string): void => {
     void safeWrap("openclaw-placeholder", () =>
       pending.then((id) => {
-        if (chats.get(chatId) === draft && id !== undefined) {
-          draft.messageId = id;
-          draft.lastHtml = text;
+        const current = chats.get(chatId);
+        if (current === undefined) {
+          // The draft went away mid-send (finalized turn/end or teardown): a
+          // landed placeholder nobody owns must be removed, not leaked (#12).
+          if (disposed && id !== undefined) {
+            void safeWrap("openclaw-orphan-cleanup", () => host.deleteMessage(chatId, id));
+          }
+          return id !== undefined;
+        }
+        if (current.sending === pending) current.sending = undefined;
+        // Adopt onto whichever draft NOW owns the chat; keep the first
+        // adoption sticky so a racing duplicate can never steal the id.
+        if (id !== undefined && current.messageId === undefined) {
+          current.messageId = id;
+          current.lastHtml = text;
         }
         return id !== undefined;
       }),
     ).then((sent) => {
-      if (sent !== true && chats.get(chatId) === draft) {
-        if (draft.fallbackSent !== true) {
-          draft.fallbackSent = true;
+      const current = chats.get(chatId);
+      if (sent !== true && current !== undefined) {
+        if (current.fallbackSent !== true) {
+          current.fallbackSent = true;
           void safeWrap("openclaw-progress-fallback", () =>
             host.send(chatId, "\u26A0\uFE0F Agent is running, but live progress cannot be delivered right now \u2014 check /status or /history.", { parse_mode: "HTML" }),
           );
         }
         // Do not retry the placeholder for the rest of this turn: the next
         // chunk would otherwise spawn message after message (#15).
-        draft.placeholderFailed = true;
+        current.placeholderFailed = true;
       }
-    }).finally(() => {
-      draft.sending = undefined;
     });
+    // Release the in-flight latch even when the send rejects (mirrors the old
+    // finally): a stuck latch would block every future ensureMessage call.
+    void pending.catch(() => undefined).then(() => {
+      const current = chats.get(chatId);
+      if (current !== undefined && current.sending === pending) current.sending = undefined;
+    });
+  };
+
+  const ensureMessage = (chatId: number, draft: Draft): void => {
+    if (draft.messageId !== undefined || draft.sending !== undefined || draft.placeholderFailed === true) return;
+    // Issue #15: the placeholder is the full card title, never a lone "…".
+    const text = titleFor(chatId, draft);
+    const pending = host.send(chatId, text, { parse_mode: "HTML" });
+    draft.sending = pending;
+    watchPlaceholder(chatId, pending, text);
   };
 
   // Official harness event stream — the same session/event feed the web UI
@@ -577,10 +613,13 @@ export function apply(ctx: Context, _config?: unknown): void {
         clearTimers(previous);
         previous.dirty = false;
       }
-      // A restarted turn reuses the previous placeholder's message id and its
-      // failed-send latch instead of spawning another "Working…" (#23).
+      // A restarted turn reuses the previous placeholder's message id (or its
+      // still-in-flight send) and the failed-send latch instead of spawning
+      // another "Working…" (#23). Handing `sending` over is what keeps a
+      // landed placeholder from being orphaned by the guard (#12).
       const previousMessageId = previous?.messageId;
       const previousPlaceholderFailed = previous?.placeholderFailed;
+      const previousSending = previous?.sending;
       chats.delete(chatId);
       answers.delete(chatId);
       chats.set(chatId, {
@@ -601,6 +640,7 @@ export function apply(ctx: Context, _config?: unknown): void {
         cacheWriteTokens: 0,
         ...(previousMessageId === undefined ? {} : { messageId: previousMessageId }),
         ...(previousPlaceholderFailed === true ? { placeholderFailed: true } : {}),
+        ...(previousSending === undefined ? {} : { sending: previousSending }),
       });
       // Visible feedback starts with the turn itself, not with the first
       // tool/reasoning event (#12): the placeholder later collapses into the
@@ -697,13 +737,30 @@ export function apply(ctx: Context, _config?: unknown): void {
             ...(inboundMessageId === undefined ? {} : { reply_parameters: { message_id: inboundMessageId } }),
           })
           .then((telegramMessageId) => {
-            if (telegramMessageId !== undefined && agentId !== undefined && assistantMessageId !== undefined) {
+            // A transport that resolves without a message id is still a failed
+            // delivery: route it into the degradation path instead of ending
+            // the turn in silence (#13).
+            if (telegramMessageId === undefined) throw new Error("transport returned no message id");
+            if (agentId !== undefined && assistantMessageId !== undefined) {
               host.attachFeedback(chatId, telegramMessageId, agentId, assistantMessageId);
             }
             host.markInboundReplied(chatId);
           })
           .catch((err) => {
             console.error("[dsh-telegram] openclaw-final-answer FAILED", err instanceof Error ? `${err.message}\n${err.stack ?? ""}` : String(err));
+            // Degradation notice (#13): the answers buffer is already cleared,
+            // the core reminder channel is suppressed by the consumer
+            // registration, and the placeholder may be gone — without this the
+            // user gets zero output. One-shot notice through the direct
+            // transport send; the inbound deliberately stays un-replied so the
+            // turn/end reminder machinery can still fire.
+            void safeWrap("openclaw-final-answer-degraded", () =>
+              host.send(
+                chatId,
+                "\u26A0\uFE0F The final answer could not be delivered \u2014 the turn stays unanswered; try again or check /history.",
+                { parse_mode: "HTML" },
+              ),
+            );
           });
       } else if (goal !== undefined && goalReceipt !== undefined && (host.getConfigPath?.("notify.onComplete") ?? true) !== false) {
         // Goal turns have no inbound answer, so an in-place draft edit is the

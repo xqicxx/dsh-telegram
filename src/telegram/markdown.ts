@@ -159,25 +159,28 @@ function renderTableBlock(rows: readonly string[]): string | undefined {
   const columns = header.length;
   // Widths come from header + body cells only: the separator row's dash
   // padding is model-styled (often longer than any cell) and must not
-  // inflate the rendered column.
-  const widths = header.map((_, index) =>
-    Math.max(3, ...[header, ...body].map((row) => cellDisplayWidth(row[index] ?? ""))),
-  );
-  const rowText = (cells: string[]): string =>
+  // inflate the rendered column. Every cell's display width is measured
+  // exactly once into this matrix; padding below reads the stored value.
+  const grid = [header, ...body];
+  const cellWidths = grid.map((row) => header.map((_, index) => cellDisplayWidth(row[index] ?? "")));
+  const widths = header.map((_, index) => Math.max(3, ...cellWidths.map((row) => row[index]!)));
+  const rowText = (cells: readonly string[], measured: readonly number[]): string =>
     `| ${cells
       .map((cell, index) => {
-        // Pad by the RAW cell's display width: escapeHtml entities render as
-        // one glyph inside <pre><code>, so measuring the escaped string would
-        // under-pad columns containing & < > " characters.
-        const padding = Math.max(0, widths[index]! - cellDisplayWidth(cell));
+        // Pad by the RAW cell's display width (precomputed above): escapeHtml
+        // entities render as one glyph inside <pre><code>, so measuring the
+        // escaped string would under-pad columns containing & < > " chars.
+        const padding = Math.max(0, (widths[index] ?? 0) - (measured[index] ?? 0));
         return `${escapeHtml(cell)}${" ".repeat(padding)}`;
       })
       .join(" | ")} |`;
   const separator = `| ${header.map((_, index) => "-".repeat(widths[index]!)).join(" | ")} |`;
   return `<pre><code>${[
-    rowText(header),
+    rowText(header, cellWidths[0] ?? []),
     separator,
-    ...body.map((row) => rowText([...Array(columns)].map((_, index) => row[index] ?? ""))),
+    ...body.map((row, rowIndex) =>
+      rowText([...Array(columns)].map((_, index) => row[index] ?? ""), cellWidths[rowIndex + 1] ?? []),
+    ),
   ].join("\n")}</code></pre>`;
 }
 
