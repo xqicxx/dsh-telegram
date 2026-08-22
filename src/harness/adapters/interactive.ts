@@ -6,6 +6,11 @@
  *     answer;
  *   - questions: `ctx.userQuestions.registerProvider` owns the ask() promise
  *     and settles it with the submitted answers.
+ *
+ * Both card flows (approval cards and question cards) share ONE internal
+ * `CardSession` lifecycle — mint id -> broadcast with keyboard -> record
+ * messageIds -> settle by editing in place -> abort cleanup, including the
+ * zero-delivery / broadcast-rejection failure paths.
  */
 import type { Context } from "@deepseek-ai/cordis";
 import type { QuestionOwnership } from "../../config.js";
@@ -47,7 +52,8 @@ interface PendingApproval {
   /** Current goal id, when the chat has one — enables goal-scoped grants. */
   goalId?: string;
   resolve: (outcome: ApprovalOutcome, display?: string) => void;
-  messageIds: Map<number, number>;
+  /** The broadcast card this approval waits on (messageIds + settle). */
+  card: CardSession;
   cardText: string;
 }
 
@@ -81,10 +87,10 @@ interface PendingQuestion {
   questions: QuestionItemLike[];
   resolve: (answer: { answers: { id: string; selected: string[]; custom?: string }[] }) => void;
   reject: (err: Error) => void;
-  messageIds: Map<number, number>;
+  /** The broadcast card this question waits on (messageIds + settle). */
+  card: CardSession;
   selections: Map<string, string[]>;
   custom: Map<string, string>;
-  answerer?: number;
 }
 
 interface QuestionsServiceLike {
@@ -210,7 +216,7 @@ function mint(): number {
 }
 
 async function reRenderQuestion(ctx: Context, pending: PendingQuestion, chatId: number, delivery: InteractiveDelivery): Promise<void> {
-  const messageId = pending.messageIds.get(chatId);
+  const messageId = pending.card.messageIds.get(chatId);
   if (messageId === undefined) return;
   const text = renderQuestions(pending, chatId);
   await delivery.edit(chatId, messageId, text, questionKeyboard(pending.id, chatId)).catch(() => {});
@@ -237,6 +243,78 @@ async function settleCards(delivery: InteractiveDelivery, messageIds: ReadonlyMa
       delivery.edit(chatId, messageId, text, undefined).catch(() => {}),
     ),
   );
+}
+
+/** One interactive card's shared lifecycle, owned here exactly once
+ * (🟡-5; red-2 / LOOP_AUDIT #4): mint an id, publish the card with its
+ * inline keyboard, remember which chats it landed in, settle every landed
+ * copy in place, and unwind the abort listener. Zero delivered chats and a
+ * rejected broadcast route through the same `onDeliveryFailed` hook via a
+ * two-argument `.then`, so pending work settles instead of waiting forever
+ * on a card nobody ever received. */
+interface CardSession {
+  /** The minted pending id — registry key and callback_data prefix. */
+  readonly id: number;
+  /** chatId -> messageId for every chat the card actually reached. */
+  readonly messageIds: Map<number, number>;
+  /** Publish the card. `onDeliveryFailed` runs when the broadcast rejected
+   * or delivered nothing; by then the abort listener is already unwound. */
+  deliver(text: string, keyboard: unknown, onDeliveryFailed: () => void): void;
+  /** Edit every landed card in place (bare status fallback when none did)
+   * and unwind the abort listener. Idempotent. */
+  settle(text: string): Promise<void>;
+  /** Unwind the abort listener without touching any card. */
+  dispose(): void;
+}
+
+/** Open a card session for one dsh session's interactive card. `onAbort`
+ * fires at most once per settlement and never after `settle`/`dispose`; a
+ * signal that arrived already aborted reports through the same hook
+ * asynchronously instead of leaving the card unwatched. */
+function openCardSession(
+  delivery: InteractiveDelivery,
+  sessionId: string,
+  signal: AbortSignal | undefined,
+  onAbort: () => void,
+): CardSession {
+  const id = mint();
+  const messageIds = new Map<number, number>();
+  let unwound = false;
+  const unwind = () => {
+    if (unwound) return;
+    unwound = true;
+    signal?.removeEventListener("abort", onAbort);
+  };
+  signal?.addEventListener("abort", onAbort, { once: true });
+  if (signal?.aborted === true) Promise.resolve().then(onAbort);
+  return {
+    id,
+    messageIds,
+    deliver(text, keyboard, onDeliveryFailed) {
+      void broadcastForSession(delivery, sessionId, text, keyboard).then(
+        (delivered) => {
+          for (const entry of delivered) messageIds.set(entry.chatId, entry.messageId);
+          // Zero deliveries would leave the pending work waiting forever on
+          // a card no chat can answer (LOOP_AUDIT #4): take the failure path.
+          if (delivered.length === 0) {
+            unwind();
+            onDeliveryFailed();
+          }
+        },
+        // A rejected broadcast delivered nothing either: take the same path
+        // as zero deliveries so nothing waits on a card never sent (red-2).
+        () => {
+          unwind();
+          onDeliveryFailed();
+        },
+      );
+    },
+    settle(text) {
+      unwind();
+      return settleCards(delivery, messageIds, delivery.chatForSession?.(sessionId), text);
+    },
+    dispose: unwind,
+  };
 }
 
 export function questionIdAt(id: number, index: number): string | undefined {
@@ -378,44 +456,36 @@ function toQuestionRequest(exec: ToolExecutionLike): QuestionRequestLike | undef
 function askViaTelegram(delivery: InteractiveDelivery, request: QuestionRequestLike): Promise<{ answers: { id: string; selected: string[]; custom?: string }[] }> {
   const sessionId = request.agent?.id;
   if (sessionId === undefined) return Promise.reject(new Error("telegram user interaction requires an agent-owned session"));
+  // Same shape as assertValidRequest's abort check: a signal that arrived
+  // already aborted must fail fast, not broadcast a dead card.
+  if (request.signal?.aborted === true) {
+    return Promise.reject(new Error("ask_user_question was aborted before the user answered"));
+  }
   return new Promise((resolve, reject) => {
-    const id = mint();
+    const card = openCardSession(delivery, sessionId, request.signal, () => {
+      if (!questions.delete(card.id)) return;
+      reject(new Error("ask_user_question was aborted before the user answered"));
+    });
     const pending: PendingQuestion = {
-      id,
+      id: card.id,
       sessionId,
       questions: request.questions,
       resolve,
       reject,
-      messageIds: new Map(),
+      card,
       selections: new Map(),
       custom: new Map(),
     };
-    const onAbort = () => {
-      if (!questions.delete(id)) return;
-      reject(new Error("ask_user_question was aborted before the user answered"));
-    };
     pending.questions.forEach((question) => pending.selections.set(question.id, []));
-    questions.set(id, pending);
-    request.signal?.addEventListener("abort", onAbort, { once: true });
-    void broadcastForSession(delivery, sessionId, renderQuestions(pending, 0), questionKeyboard(id, 0)).then(
-      (delivered) => {
-        for (const entry of delivered) pending.messageIds.set(entry.chatId, entry.messageId);
-        pending.answerer = delivered[0]?.chatId;
-        // Zero deliveries would leave the tool execution waiting forever for
-        // a card nobody received (LOOP_AUDIT #4). Settle with a clear error.
-        if (delivered.length === 0 && questions.delete(id)) {
-          reject(new Error("no allowed Telegram chat is available to answer this question"));
-        }
-      },
-      // A rejected broadcast delivered nothing either: take the same path as
-      // zero deliveries so the tool execution cannot wait on a card that was
-      // never sent.
-      () => {
-        if (questions.delete(id)) {
-          reject(new Error("no allowed Telegram chat is available to answer this question"));
-        }
-      },
-    );
+    questions.set(card.id, pending);
+    card.deliver(renderQuestions(pending, 0), questionKeyboard(card.id, 0), () => {
+      // A broadcast that rejected or delivered nothing leaves no card any
+      // chat could answer: settle with a clear error instead of letting the
+      // tool execution wait forever (LOOP_AUDIT #4 / red-2).
+      if (questions.delete(card.id)) {
+        reject(new Error("no allowed Telegram chat is available to answer this question"));
+      }
+    });
   });
 }
 
@@ -424,6 +494,10 @@ export function attachInteractive(ctx: Context, delivery: InteractiveDelivery, o
   const ownership = options.userQuestions ?? "telegram";
   const log = options.log ?? ((message: string, error?: unknown) => console.error(`[dsh-telegram] ${message}`, error ?? ""));
   const goalIdForSession = options.goalIdForSession;
+  // Reset per attach (🟠-6): a re-mount must reflect exactly the current
+  // persisted allow list. Accumulating across mounts would let a hot reload
+  // leave stale permanent tool grants behind — security drift, not memory.
+  grantedTools.clear();
   for (const toolName of options.allowedTools ?? []) {
     if (toolName.trim() !== "") grantedTools.add(toolName.trim());
   }
@@ -460,38 +534,25 @@ export function attachInteractive(ctx: Context, delivery: InteractiveDelivery, o
           }
         }
         if (approvalId === undefined) return (next as () => Promise<unknown>)();
-        const id = mint();
+        const cardText = `\u{1F6E1} Approval requested \u00B7 ${req.toolName}${req.reason ? `\nReason: ${req.reason}` : ""}\nSession: ${req.agent.id}`;
         return new Promise<ApprovalOutcome>((resolve) => {
           const settle = (outcome: ApprovalOutcome, display: string = outcome) => {
-            if (!approvals.delete(id)) return;
-            req.signal?.removeEventListener("abort", onAbort);
+            if (!approvals.delete(card.id)) return;
             // Edit the requested card in place and drop its inline buttons.
             // No remove_keyboard reply: that would wipe the persistent command
             // bar for the whole chat.
-            void settleCards(
-              delivery,
-              pending.messageIds,
-              delivery.chatForSession?.(pending.sessionId),
-              `${pending.cardText}\n\n\u{1F6E1} Approval ${display} \u00B7 ${req.toolName}${req.reason ? ` \u00B7 ${req.reason}` : ""}`,
-            );
+            void card.settle(`${cardText}\n\n\u{1F6E1} Approval ${display} \u00B7 ${req.toolName}${req.reason ? ` \u00B7 ${req.reason}` : ""}`);
             resolve(outcome);
           };
-          const onAbort = () => settle("cancelled");
-          const cardText = `\u{1F6E1} Approval requested \u00B7 ${req.toolName}${req.reason ? `\nReason: ${req.reason}` : ""}\nSession: ${req.agent.id}`;
-          const pending: PendingApproval = { id, approvalId, sessionId: req.agent.id, toolName: req.toolName, ...(req.reason === undefined ? {} : { reason: req.reason }), ...(goalId === undefined ? {} : { goalId }), resolve: settle, messageIds: new Map(), cardText };
-          approvals.set(id, pending);
-          req.signal?.addEventListener("abort", onAbort, { once: true });
-          void broadcastForSession(delivery, req.agent.id, cardText, approvalKeyboard(id, goalId, req.toolName)).then(
-            (delivered) => {
-              for (const entry of delivered) pending.messageIds.set(entry.chatId, entry.messageId);
-              // Zero deliveries would block the agent forever on a card no
-              // chat can answer (LOOP_AUDIT #4): cancel instead.
-              if (delivered.length === 0) settle("cancelled");
-            },
-            // A rejected broadcast delivered nothing either: settle the same
-            // way as zero deliveries instead of blocking the agent forever.
-            () => settle("cancelled"),
-          );
+          const card = openCardSession(delivery, req.agent.id, req.signal, () => settle("cancelled"));
+          const pending: PendingApproval = { id: card.id, approvalId, sessionId: req.agent.id, toolName: req.toolName, ...(req.reason === undefined ? {} : { reason: req.reason }), ...(goalId === undefined ? {} : { goalId }), resolve: settle, card, cardText };
+          approvals.set(card.id, pending);
+          card.deliver(cardText, approvalKeyboard(card.id, goalId, req.toolName), () => {
+            // Zero deliveries and broadcast rejections both land here: cancel
+            // instead of blocking the agent forever on an unanswered card
+            // (LOOP_AUDIT #4 / red-2).
+            settle("cancelled");
+          });
         });
       }),
     );
@@ -624,14 +685,14 @@ export function attachInteractive(ctx: Context, delivery: InteractiveDelivery, o
         const selected = pending.selections.get(question.id) ?? [];
         const custom = pending.custom.get(question.id);
         if (selected.length === 0 && custom === undefined && question.options?.length) {
-          void delivery.edit(chatId, pending.messageIds.get(chatId) ?? 0, `${renderQuestions(pending, chatId)}\n\n\u26A0\uFE0F Answer every question first.`, questionKeyboard(id, chatId)).catch(() => {});
+          void delivery.edit(chatId, pending.card.messageIds.get(chatId) ?? 0, `${renderQuestions(pending, chatId)}\n\n\u26A0\uFE0F Answer every question first.`, questionKeyboard(id, chatId)).catch(() => {});
           return true;
         }
         answers.push({ id: question.id, selected, ...(custom === undefined ? {} : { custom }) });
       }
       questions.delete(id);
       pending.resolve({ answers });
-      void settleCards(delivery, pending.messageIds, delivery.chatForSession?.(pending.sessionId), `\u2705 Questions answered (id ${id}).`);
+      void pending.card.settle(`\u2705 Questions answered (id ${id}).`);
       return true;
     },
     async cancelQuestions(chatId, id) {
@@ -639,7 +700,7 @@ export function attachInteractive(ctx: Context, delivery: InteractiveDelivery, o
       if (!pending) return false;
       questions.delete(id);
       pending.reject(new Error("the user cancelled ask_user_question"));
-      void settleCards(delivery, pending.messageIds, delivery.chatForSession?.(pending.sessionId), `\u2716 Questions cancelled (id ${id}).`);
+      void pending.card.settle(`\u2716 Questions cancelled (id ${id}).`);
       void chatId;
       return true;
     },
@@ -648,7 +709,12 @@ export function attachInteractive(ctx: Context, delivery: InteractiveDelivery, o
       disposeProvider?.();
       disposeProvider = undefined;
       for (const pending of approvals.values()) pending.resolve("cancelled");
-      for (const pending of questions.values()) pending.reject(new Error("telegram interactive provider was disposed"));
+      for (const pending of questions.values()) {
+        // Unwind the abort listener too: the provider is gone, so no late
+        // abort may fire into a disposed flow.
+        pending.card.dispose();
+        pending.reject(new Error("telegram interactive provider was disposed"));
+      }
       approvals.clear();
       questions.clear();
       grantedGoals.clear();

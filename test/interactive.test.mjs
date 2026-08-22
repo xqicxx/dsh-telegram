@@ -632,3 +632,101 @@ test('question options use labels as answer values while callback tokens stay ti
   assert.deepEqual(answer.answers[0].selected, ['A very long option label that would blow the callback limit if echoed']);
   interactive.detach();
 });
+
+test('re-attaching resets forever grants so hot reload cannot leave stale allows (#6)', async () => {
+  const request = (toolName, callId) => ({
+    agent: { id: 's1', session: { events: [{ seq: 0, type: 'approval/asked', data: { id: `app-${callId}`, callId } }] } },
+    toolName,
+    callId,
+    signal: undefined,
+  });
+
+  const events1 = fakeEvents();
+  const ctx1 = { get: (name) => (name === 'approval' ? {} : undefined), on: events1.on.bind(events1) };
+  const mount1 = attachInteractive(ctx1, fakeDelivery(), { allowedTools: ['bash'] });
+  assert.equal(
+    await events1.listeners.get('approval/request')(request('bash', 'c0'), async () => 'fallback'),
+    'allowed-once',
+    'the persisted grant auto-allows on the first mount',
+  );
+
+  // Hot-reload shape: the module state survives while mount #2 arrives with
+  // a different persisted allow list and mount #1 is dropped without
+  // detach(). Accumulation left `bash` granted forever; a per-attach reset
+  // must ask again while honoring only mount #2's list.
+  const delivery2 = fakeDelivery();
+  const events2 = fakeEvents();
+  const ctx2 = { get: (name) => (name === 'approval' ? {} : undefined), on: events2.on.bind(events2) };
+  const mount2 = attachInteractive(ctx2, delivery2, { allowedTools: ['web_search'] });
+  assert.equal(
+    await events2.listeners.get('approval/request')(request('web_search', 'c1'), async () => 'fallback'),
+    'allowed-once',
+    "mount #2's own allow list still applies",
+  );
+  const reask = events2.listeners.get('approval/request')(request('bash', 'c2'), async () => 'fallback');
+  reask.catch(() => {});
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(delivery2.sent.filter((entry) => !entry.edit).length, 1, 'the stale bash grant did not survive the re-mount: bash asks again with its own card');
+  mount2.detach();
+  mount1.detach();
+});
+
+test('an abort racing a settled question cannot reject an already-answered ask', async () => {
+  const delivery = fakeDelivery();
+  let provider;
+  const ctx = {
+    get: (name) => (name === 'userQuestions' ? { provider: undefined, registerProvider(p) { provider = p; return () => {}; } } : undefined),
+  };
+  const interactive = attachInteractive(ctx, delivery);
+  const controller = new AbortController();
+  const promise = provider.ask(questionRequest('s1', [{ id: 'q1', question: 'Pick', options: [{ id: 'o1', label: 'One' }] }], controller.signal));
+  await new Promise((resolve) => setImmediate(resolve));
+  const id = Number(delivery.sent[0].keyboard.inline_keyboard[0][0].callback_data.split(':')[1]);
+  await interactive.toggleQuestionOption(111, id, 'q1', 'o1');
+  await interactive.submitQuestions(111, id);
+  controller.abort();
+  const answer = await promise;
+  assert.deepEqual(answer.answers[0].selected, ['One'], 'settle wins over a late abort');
+  interactive.detach();
+});
+
+test('aborting an unanswered approval cancels it and settles the card in place', async () => {
+  const delivery = fakeDelivery();
+  const events = fakeEvents();
+  const ctx = { get: (name) => (name === 'approval' ? {} : undefined), on: events.on.bind(events) };
+  const interactive = attachInteractive(ctx, delivery);
+  const listener = events.listeners.get('approval/request');
+  const controller = new AbortController();
+  const answer = listener({
+    agent: { id: 's1', session: { events: [{ seq: 0, type: 'approval/asked', data: { id: 'app-abort', callId: 'c-abort' } }] } },
+    toolName: 'bash',
+    callId: 'c-abort',
+    signal: controller.signal,
+  }, async () => 'fallback');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(delivery.sent.filter((entry) => !entry.edit).length, 1, 'the approval card was broadcast');
+  controller.abort();
+  assert.equal(await answer, 'cancelled');
+  const settle = delivery.sent.find((entry) => entry.edit && entry.edit.text.includes('Approval cancelled'));
+  assert.ok(settle, 'the aborted approval edits its card in place');
+  assert.equal(settle.edit.keyboard, undefined, 'the dead buttons are dropped');
+  interactive.detach();
+});
+
+test('a question whose signal arrived already aborted fails fast without broadcasting', async () => {
+  const delivery = fakeDelivery();
+  let provider;
+  const ctx = {
+    get: (name) => (name === 'userQuestions' ? { provider: undefined, registerProvider(p) { provider = p; return () => {}; } } : undefined),
+  };
+  const interactive = attachInteractive(ctx, delivery);
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(
+    provider.ask(questionRequest('s1', [{ id: 'q1', question: 'Pick' }], controller.signal)),
+    /aborted before the user answered/,
+    'a dead ask rejects instead of waiting on a card nobody can answer',
+  );
+  assert.equal(delivery.sent.length, 0, 'no card is broadcast for an already-aborted ask');
+  interactive.detach();
+});
