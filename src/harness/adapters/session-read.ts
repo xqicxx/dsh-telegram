@@ -172,7 +172,11 @@ function scanMeta(session: SessionLike): { blank: boolean; lastPromptAt?: number
     if (event.type === "turn/start") blank = false;
     if (event.type === "user/message") {
       blank = false;
-      lastPromptAt = (event.at ?? event.data?.createdAt) as number | undefined;
+      // Contract is a number, but host seams have delivered strings — a blind
+      // cast leaked NaN into relTime/<tg-time> downstream (DTL audit). Keep
+      // lastPromptAt a true number or undefined.
+      const at = (event.at ?? event.data?.createdAt) as unknown;
+      if (typeof at === "number" && Number.isFinite(at)) lastPromptAt = at;
     }
   }
   return { blank, lastPromptAt, eventCount: session.events.length };
